@@ -438,6 +438,30 @@ bool TryGetStringField(const FieldMap& fields, const std::string& key, std::stri
   return true;
 }
 
+bool TryGetIntField(const FieldMap& fields, const std::string& key, int* out_value) {
+  const auto it = fields.find(key);
+  if (it == fields.end() || out_value == nullptr) {
+    return false;
+  }
+
+  const std::string trimmed = Trim(it->second);
+  if (trimmed.empty()) {
+    return false;
+  }
+
+  try {
+    std::size_t processed = 0;
+    const int val = std::stoi(trimmed, &processed);
+    if (processed != trimmed.size()) {
+      return false;
+    }
+    *out_value = val;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 bool TryGetObjectField(
     const FieldMap& fields,
     const std::string& key,

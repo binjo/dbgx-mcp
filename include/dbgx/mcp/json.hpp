@@ -10,6 +10,7 @@ using FieldMap = std::unordered_map<std::string, std::string>;
 
 bool ParseObjectFields(std::string_view json_text, FieldMap* out_fields, std::string* error_message);
 bool TryGetStringField(const FieldMap& fields, const std::string& key, std::string* out_value);
+bool TryGetIntField(const FieldMap& fields, const std::string& key, int* out_value);
 bool TryGetObjectField(
     const FieldMap& fields,
     const std::string& key,

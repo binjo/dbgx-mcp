@@ -8,11 +8,14 @@
 
 namespace {
 
+namespace json = dbgx::json;
+
 class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
  public:
-  dbgx::windbg::CommandExecutionResult Execute(const std::string& command) override {
+  dbgx::windbg::CommandExecutionResult Execute(const std::string& command, const dbgx::windbg::CommandExecutionOptions& options) override {
     ++call_count;
     last_command = command;
+    last_options = options;
     if (should_fail) {
       return {
           false,
@@ -31,6 +34,7 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
   std::string failure_message = "failed";
   std::string output = "ok";
   std::string last_command;
+  dbgx::windbg::CommandExecutionOptions last_options;
   int call_count = 0;
 };
 
@@ -43,6 +47,21 @@ void Expect(bool condition, const std::string& message, int* failures) {
     std::cerr << "[FAIL] " << message << '\n';
     ++(*failures);
   }
+}
+
+void TestTryGetIntField(int* failures) {
+  dbgx::json::FieldMap fields;
+  fields["int_val"] = " 42 ";
+  fields["not_int"] = "\"string\"";
+  fields["empty"] = "";
+
+  int val = 0;
+  Expect(dbgx::json::TryGetIntField(fields, "int_val", &val), "TryGetIntField should succeed for integer", failures);
+  Expect(val == 42, "TryGetIntField should return correct integer", failures);
+
+  Expect(!dbgx::json::TryGetIntField(fields, "not_int", &val), "TryGetIntField should fail for string", failures);
+  Expect(!dbgx::json::TryGetIntField(fields, "empty", &val), "TryGetIntField should fail for empty", failures);
+  Expect(!dbgx::json::TryGetIntField(fields, "missing", &val), "TryGetIntField should fail for missing", failures);
 }
 
 dbgx::mcp::HttpResponse MakeNoopHttpResponse(const dbgx::mcp::HttpRequest&) {
@@ -417,15 +436,31 @@ void TestIoEchoBlockingLocatabilityStageOrder(int* failures) {
   Expect(Contains(logs[1], "trace_id=rpc:5"), "second log should include same request trace id", failures);
 }
 
+void TestToolsCallWithOptions(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"windbg.eval","arguments":{"command":"lm","max_lines":5,"pattern":"ntdll"}}})");
+
+  Expect(result.status_code == 200, "tools/call with options should return HTTP 200", failures);
+  Expect(executor.call_count == 1, "tools/call with options should execute command", failures);
+  Expect(executor.last_command == "lm", "tools/call should forward command", failures);
+  Expect(executor.last_options.max_lines == 5, "tools/call should forward max_lines", failures);
+  Expect(executor.last_options.pattern == "ntdll", "tools/call should forward pattern", failures);
+}
+
 }  // namespace
 
 int main() {
   int failures = 0;
 
+  TestTryGetIntField(&failures);
   TestInitialize(&failures);
   TestToolsList(&failures);
   TestToolsCallSuccess(&failures);
   TestToolsCallMissingCommand(&failures);
+  TestToolsCallWithOptions(&failures);
   TestUnknownMethod(&failures);
   TestInitializedNotification(&failures);
   TestParseError(&failures);

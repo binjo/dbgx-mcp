@@ -13,7 +13,7 @@ namespace {
 
 class OutputCaptureCallbacks final : public IDebugOutputCallbacks {
  public:
-  OutputCaptureCallbacks() = default;
+  explicit OutputCaptureCallbacks(const CommandExecutionOptions& options) : options_(options) {}
 
   STDMETHOD(QueryInterface)(REFIID interface_id, PVOID* out) override {
     if (out == nullptr) {
@@ -45,7 +45,40 @@ class OutputCaptureCallbacks final : public IDebugOutputCallbacks {
   STDMETHOD(Output)(ULONG /*mask*/, PCSTR text) override {
     if (text != nullptr) {
       std::lock_guard<std::mutex> lock(mutex_);
-      output_ += text;
+      if (truncated_) {
+        return S_OK;
+      }
+
+      std::string input(text);
+      std::size_t start = 0;
+      while (start < input.size()) {
+        std::size_t end = input.find('\n', start);
+        std::string line;
+        if (end == std::string::npos) {
+          line = input.substr(start);
+          start = input.size();
+        } else {
+          line = input.substr(start, end - start + 1);
+          start = end + 1;
+        }
+
+        if (!options_.pattern.empty()) {
+          if (line.find(options_.pattern) == std::string::npos) {
+            continue;
+          }
+        }
+
+        if (line_count_ < options_.max_lines) {
+          output_ += line;
+          if (!line.empty() && line.back() == '\n') {
+            line_count_++;
+          }
+        } else {
+          output_ += "\n[... truncated ...]\n";
+          truncated_ = true;
+          break;
+        }
+      }
     }
     return S_OK;
   }
@@ -59,6 +92,9 @@ class OutputCaptureCallbacks final : public IDebugOutputCallbacks {
   volatile LONG ref_count_ = 1;
   std::mutex mutex_;
   std::string output_;
+  CommandExecutionOptions options_;
+  int line_count_ = 0;
+  bool truncated_ = false;
 };
 
 std::string HResultToString(HRESULT hr) {
@@ -88,7 +124,7 @@ std::string HResultToString(HRESULT hr) {
 
 }  // namespace
 
-CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command) {
+CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command, const CommandExecutionOptions& options) {
   if (command.empty()) {
     return {false, "", "Command cannot be empty"};
   }
@@ -116,7 +152,7 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
   Microsoft::WRL::ComPtr<IDebugOutputCallbacks> previous_callbacks;
   (void)client->GetOutputCallbacks(&previous_callbacks);
 
-  auto* capture = new OutputCaptureCallbacks();
+  auto* capture = new OutputCaptureCallbacks(options);
   hr = client->SetOutputCallbacks(capture);
   if (FAILED(hr)) {
     capture->Release();

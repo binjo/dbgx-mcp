@@ -70,11 +70,13 @@ MethodOutcome HandleToolsList() {
       "\"tools\":["
       "{"
       "\"name\":\"windbg.eval\","
-      "\"description\":\"Execute one WinDbg command at a time and return text output; clients MUST run calls serially and wait for each call to finish before sending the next\","
+      "\"description\":\"Execute WinDbg command. Results returned as filtered/truncated text.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"command\":{\"type\":\"string\",\"description\":\"WinDbg command to execute; send commands one by one and wait for completion before the next command\"}"
+      "\"command\":{\"type\":\"string\",\"description\":\"WinDbg command to execute\"},"
+      "\"max_lines\":{\"type\":\"integer\",\"description\":\"Max lines to return (default 100)\"},"
+      "\"pattern\":{\"type\":\"string\",\"description\":\"Optional substring filter\"}"
       "},"
       "\"required\":[\"command\"],"
       "\"additionalProperties\":false"
@@ -129,7 +131,11 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     return outcome;
   }
 
-  const windbg::CommandExecutionResult execution = executor->Execute(command);
+  windbg::CommandExecutionOptions options;
+  json::TryGetIntField(arguments_fields, "max_lines", &options.max_lines);
+  json::TryGetStringField(arguments_fields, "pattern", &options.pattern);
+
+  const windbg::CommandExecutionResult execution = executor->Execute(command, options);
 
   const std::string payload_text = execution.success
                                        ? (execution.output.empty() ? "(no output)" : execution.output)

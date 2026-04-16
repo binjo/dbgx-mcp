@@ -65,12 +65,25 @@ function Import-VsEnvironment {
     Write-Host "Environment initialized." -ForegroundColor Gray
 }
 
-# Improved compiler detection
+# Only import if compiler is not already in path OR if it's the wrong architecture
 $CompilerPath = Get-Command "cl.exe" -ErrorAction SilentlyContinue
-if ($null -eq $CompilerPath) {
+$NeedsInit = $true
+
+if ($null -ne $CompilerPath) {
+    # Check if the existing cl.exe is the right architecture
+    # x64 cl.exe usually has "HostX64\x64" or "HostX86\x64" in the path
+    # x86 cl.exe usually has "HostX86\x86" or "HostX64\x86" in the path
+    if ($Arch -eq "x64" -and $CompilerPath.Source -like "*\x64\cl.exe") {
+        $NeedsInit = $false
+    } elseif ($Arch -eq "x86" -and $CompilerPath.Source -like "*\x86\cl.exe") {
+        $NeedsInit = $false
+    }
+}
+
+if ($NeedsInit) {
     Import-VsEnvironment -Architecture $Arch
 } else {
-    Write-Host "Compiler 'cl.exe' already in path ($($CompilerPath.Source)), skipping VS initialization." -ForegroundColor Gray
+    Write-Host "Correct compiler 'cl.exe' already in path ($($CompilerPath.Source)), skipping VS initialization." -ForegroundColor Gray
 }
 
 # 2. Clean Step

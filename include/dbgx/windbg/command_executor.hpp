@@ -10,10 +10,15 @@ struct CommandExecutionResult {
   std::string error_message;
 };
 
+struct CommandExecutionOptions {
+  int max_lines = 100;
+  std::string pattern;
+};
+
 class IWinDbgCommandExecutor {
  public:
   virtual ~IWinDbgCommandExecutor() = default;
-  virtual CommandExecutionResult Execute(const std::string& command) = 0;
+  virtual CommandExecutionResult Execute(const std::string& command, const CommandExecutionOptions& options = {}) = 0;
 };
 
 }  // namespace dbgx::windbg
