@@ -15,15 +15,15 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
     last_command = command;
     if (should_fail) {
       return {
-          .success = false,
-          .output = "",
-          .error_message = failure_message,
+          false,
+          "",
+          failure_message,
       };
     }
     return {
-        .success = true,
-        .output = output,
-        .error_message = "",
+        true,
+        output,
+        "",
     };
   }
 

@@ -29,16 +29,24 @@ This project provides a minimal C++ WinDbg extension DLL that exposes an MCP-com
 ### Prerequisites
 
 - Windows
-- CMake 3.20+
-- MSVC toolchain (Visual Studio Build Tools)
+- CMake 3.12+
+- MSVC toolchain (Visual Studio 2017+)
 - WinDbg SDK headers/libs (`DbgEng.h`, `dbgeng.lib`)
 
 ### 1. Build the extension
 
 ```powershell
-cmake -S . -B build -G "Ninja"
-cmake --build build
+mkdir build
+cd build
+cmake -G "Ninja" ..
+cmake --build .
 ```
+
+The configuration command (`cmake -G "Ninja" ..`) breaks down as follows:
+- `mkdir build`: Creates the directory for build artifacts.
+- `cd build`: Moves into that directory.
+- `-G "Ninja"`: Use the [Ninja](https://ninja-build.org/) build generator for high-performance builds. If you don't have Ninja, you can use `"Visual Studio 15 2017"` for VS 2017.
+- `..`: Points to the source code in the parent directory.
 
 Expected result:
 - Build succeeds.
@@ -104,6 +112,21 @@ Invoke-RestMethod -Uri "http://127.0.0.1:5678/mcp" -Method Post -ContentType "ap
 
 Expected result:
 - Response returns command output text from WinDbg.
+
+### Testing with `curl` (cmd.exe)
+
+If you prefer using `curl` from a standard Windows Command Prompt, ensure you escape the double quotes in the JSON body:
+
+```cmd
+# initialize
+curl -X POST http://127.0.0.1:5678/mcp -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}"
+
+# tools/list
+curl -X POST http://127.0.0.1:5678/mcp -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}"
+
+# tools/call (windbg.eval)
+curl -X POST http://127.0.0.1:5678/mcp -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"windbg.eval\",\"arguments\":{\"command\":\"r eax\"}}}"
+```
 
 ## Troubleshooting `.load` Failures
 

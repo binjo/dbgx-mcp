@@ -29,16 +29,24 @@ Language: [English](README.md) | 简体中文
 ### 前置条件
 
 - Windows
-- CMake 3.20+
-- MSVC 工具链（Visual Studio Build Tools）
+- CMake 3.12+
+- MSVC 工具链（Visual Studio 2017+）
 - WinDbg SDK 头文件与库（`DbgEng.h`, `dbgeng.lib`）
 
 ### 1. 构建扩展
 
 ```powershell
-cmake -S . -B build -G "Ninja"
-cmake --build build
+mkdir build
+cd build
+cmake -G "Ninja" ..
+cmake --build .
 ```
+
+配置命令的详细说明：
+- `mkdir build`：创建用于存放构建产物的目录。
+- `cd build`：进入该目录。
+- `-G "Ninja"`：使用 [Ninja](https://ninja-build.org/) 生成器以获得高性能构建。若环境中没有 Ninja，可使用 `"Visual Studio 15 2017"` 来匹配 VS 2017。
+- `..`：指向上一级目录中的源代码。
 
 预期结果：
 - 构建成功。

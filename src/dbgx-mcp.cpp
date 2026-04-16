@@ -255,11 +255,18 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
   state.router = std::make_unique<dbgx::mcp::JsonRpcRouter>(state.executor.get());
   state.server = std::make_unique<dbgx::mcp::HttpServer>();
 
+  char bind_addr_buf[256];
+  std::string bind_host = "127.0.0.1";
+  if (GetEnvironmentVariableA("WINDBG_MCP_BIND", bind_addr_buf, sizeof(bind_addr_buf)) > 0) {
+    bind_host = bind_addr_buf;
+  }
+
   std::string error_message;
   dbgx::mcp::HttpServerStartReport start_report;
-  if (!state.server->Start("127.0.0.1", kDefaultPort, HandleRequest, &error_message, &start_report)) {
+  if (!state.server->Start(bind_host, kDefaultPort, HandleRequest, &error_message, &start_report)) {
     LogMessage(
-        "Failed to start HTTP server: " + error_message + " (initial_port=" + std::to_string(kDefaultPort) +
+        "Failed to start HTTP server: " + error_message + " (bind_host=" + bind_host +
+        ", initial_port=" + std::to_string(kDefaultPort) +
         ", attempts=" + std::to_string(start_report.attempt_count) +
         ", conflicts=" + std::to_string(start_report.conflict_count) + ")");
     state.server.reset();
@@ -270,11 +277,12 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
 
   if (start_report.fallback_used) {
     LogMessage(
-        "HTTP MCP bind fallback engaged: initial_port=" + std::to_string(start_report.initial_port) +
+        "HTTP MCP bind fallback engaged: bind_host=" + bind_host +
+        ", initial_port=" + std::to_string(start_report.initial_port) +
         ", conflicts=" + std::to_string(start_report.conflict_count) +
         ", final_port=" + std::to_string(state.server->BoundPort()));
   }
-  LogMessage("HTTP MCP server listening on http://127.0.0.1:" + std::to_string(state.server->BoundPort()) +
+  LogMessage("HTTP MCP server listening on http://" + bind_host + ":" + std::to_string(state.server->BoundPort()) +
              "/mcp");
   return S_OK;
 }

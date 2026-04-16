@@ -1,8 +1,8 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.12)
 
 project(dbgx_mcp LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -61,6 +61,13 @@ set_target_properties(dbgx-mcp PROPERTIES
   VERSION ${DBGX_VERSION}
 )
 
+if(MSVC)
+  # CMake 3.12 doesn't have target_link_options (added in 3.13)
+  set_target_properties(dbgx-mcp PROPERTIES
+    LINK_FLAGS "/DEF:\"${WINDBG_EXTENSION_DEF_FILE}\""
+  )
+endif()
+
 target_include_directories(dbgx-mcp PRIVATE include)
 
 target_compile_definitions(dbgx-mcp PRIVATE
@@ -73,12 +80,6 @@ target_link_libraries(dbgx-mcp PRIVATE
   dbgeng
   ws2_32
 )
-
-if(MSVC)
-  target_link_options(dbgx-mcp PRIVATE
-    "/DEF:${WINDBG_EXTENSION_DEF_FILE}"
-  )
-endif()
 
 add_custom_target(check_windbg_exports
   COMMAND "${CMAKE_COMMAND}"

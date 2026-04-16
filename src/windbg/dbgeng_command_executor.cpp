@@ -90,16 +90,16 @@ std::string HResultToString(HRESULT hr) {
 
 CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command) {
   if (command.empty()) {
-    return {.success = false, .output = "", .error_message = "Command cannot be empty"};
+    return {false, "", "Command cannot be empty"};
   }
 
   Microsoft::WRL::ComPtr<IDebugClient> client;
   HRESULT hr = DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf()));
   if (FAILED(hr)) {
     return {
-        .success = false,
-        .output = "",
-        .error_message = "DebugCreate failed: " + HResultToString(hr),
+        false,
+        "",
+        "DebugCreate failed: " + HResultToString(hr),
     };
   }
 
@@ -107,9 +107,9 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
   hr = client.As(&control);
   if (FAILED(hr)) {
     return {
-        .success = false,
-        .output = "",
-        .error_message = "IDebugControl not available: " + HResultToString(hr),
+        false,
+        "",
+        "IDebugControl not available: " + HResultToString(hr),
     };
   }
 
@@ -121,9 +121,9 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
   if (FAILED(hr)) {
     capture->Release();
     return {
-        .success = false,
-        .output = "",
-        .error_message = "SetOutputCallbacks failed: " + HResultToString(hr),
+        false,
+        "",
+        "SetOutputCallbacks failed: " + HResultToString(hr),
     };
   }
 
@@ -136,16 +136,16 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
 
   if (FAILED(hr)) {
     return {
-        .success = false,
-        .output = output,
-        .error_message = "IDebugControl::Execute failed: " + HResultToString(hr),
+        false,
+        output,
+        "IDebugControl::Execute failed: " + HResultToString(hr),
     };
   }
 
   return {
-      .success = true,
-      .output = output,
-      .error_message = "",
+      true,
+      output,
+      "",
   };
 }
 
