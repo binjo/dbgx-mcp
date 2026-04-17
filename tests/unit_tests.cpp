@@ -1,6 +1,7 @@
 #include "dbgx/mcp/json_rpc.hpp"
 #include "dbgx/mcp/io_echo.hpp"
 #include "dbgx/mcp/http_server.hpp"
+#include "dbgx/mcp/json.hpp"
 
 #include <iostream>
 #include <string>
@@ -28,6 +29,10 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
         output,
         "",
     };
+  }
+
+  dbgx::windbg::SessionMetadata GetSessionMetadata() override {
+    return {1234, "test.exe", "Test Target"};
   }
 
   bool should_fail = false;

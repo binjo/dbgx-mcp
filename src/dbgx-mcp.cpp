@@ -1,6 +1,7 @@
 #include "dbgx/mcp/http_server.hpp"
 #include "dbgx/mcp/io_echo.hpp"
 #include "dbgx/mcp/json_rpc.hpp"
+#include "dbgx/mcp/json.hpp"
 #include "dbgx/windbg/dbgeng_command_executor.hpp"
 
 #include <DbgEng.h>
@@ -89,8 +90,8 @@ void RegisterSession(std::uint16_t port) {
     f << "{\"port\":" << port 
       << ",\"pid\":" << GetCurrentProcessId()
       << ",\"target_pid\":" << meta.process_id
-      << ",\"executable\":\"" << meta.executable_name << "\""
-      << ",\"info\":\"" << meta.target_info << "\""
+      << ",\"executable\":\"" << dbgx::json::Escape(meta.executable_name) << "\""
+      << ",\"info\":\"" << dbgx::json::Escape(meta.target_info) << "\""
       << "}";
     state.registered_file_path = file_path.string();
   }

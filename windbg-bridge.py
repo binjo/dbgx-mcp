@@ -68,6 +68,34 @@ def main():
             params = req_data.get("params", {})
             
             # Handle local gateway commands
+            if method == "tools/list":
+                # Forward to backend first to get real tools
+                url = f"http://{GUEST_IP}:{_current_port}/mcp"
+                req = urllib.request.Request(
+                    url, 
+                    data=line.encode('utf-8'), 
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as f:
+                        resp_data = json.loads(f.read().decode('utf-8'))
+                        if "result" in resp_data and "tools" in resp_data["result"]:
+                            # Add our gateway tool
+                            resp_data["result"]["tools"].append({
+                                "name": "list_sessions",
+                                "description": "List all active WinDbg MCP sessions in the guest VM.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {}
+                                }
+                            })
+                            output_stream.write(json.dumps(resp_data) + "\n")
+                            output_stream.flush()
+                            continue
+                except:
+                    pass
+
             if method == "tools/call":
                 tool_name = params.get("name")
                 tool_args = params.get("arguments", {})
