@@ -108,7 +108,16 @@ def main():
                     with urllib.request.urlopen(req, timeout=10) as f:
                         resp_data = json.loads(f.read().decode('utf-8'))
                         if "result" in resp_data and "tools" in resp_data["result"]:
-                            # Add our gateway tool
+                            # 1. Update windbg.eval schema to include session_id
+                            for tool in resp_data["result"]["tools"]:
+                                if tool["name"] == "windbg.eval":
+                                    properties = tool.get("inputSchema", {}).get("properties", {})
+                                    properties["session_id"] = {
+                                        "type": "integer",
+                                        "description": "The port number of the target WinDbg session (e.g., 5678, 5679). Get this from list_sessions."
+                                    }
+                            
+                            # 2. Add our gateway tool
                             resp_data["result"]["tools"].append({
                                 "name": "list_sessions",
                                 "description": "List all active WinDbg MCP sessions in the guest VM.",
