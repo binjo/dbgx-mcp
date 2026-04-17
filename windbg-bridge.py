@@ -68,6 +68,33 @@ def main():
             params = req_data.get("params", {})
             
             # Handle local gateway commands
+            if method == "initialize":
+                # Forward to backend first to get real capabilities
+                url = f"http://{GUEST_IP}:{_current_port}/mcp"
+                req = urllib.request.Request(
+                    url, 
+                    data=line.encode('utf-8'), 
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as f:
+                        resp_data = json.loads(f.read().decode('utf-8'))
+                        if "result" in resp_data and "capabilities" in resp_data["result"]:
+                            capabilities = resp_data["result"]["capabilities"]
+                            if "tools" in capabilities:
+                                if "availableTools" in capabilities["tools"]:
+                                    capabilities["tools"]["availableTools"].append("list_sessions")
+                                else:
+                                    capabilities["tools"]["availableTools"] = ["windbg.eval", "list_sessions"]
+                            
+                            output_stream.write(json.dumps(resp_data) + "\n")
+                            output_stream.flush()
+                            continue
+                except Exception as e:
+                    log(f"INITIALIZE ERROR: {e}")
+                    pass
+
             if method == "tools/list":
                 # Forward to backend first to get real tools
                 url = f"http://{GUEST_IP}:{_current_port}/mcp"
@@ -93,7 +120,8 @@ def main():
                             output_stream.write(json.dumps(resp_data) + "\n")
                             output_stream.flush()
                             continue
-                except:
+                except Exception as e:
+                    log(f"TOOLS/LIST ERROR: {e}")
                     pass
 
             if method == "tools/call":
