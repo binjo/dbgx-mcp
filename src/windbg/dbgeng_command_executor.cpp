@@ -185,4 +185,38 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
   };
 }
 
+SessionMetadata DbgEngCommandExecutor::GetSessionMetadata() {
+  SessionMetadata metadata;
+  metadata.process_id = GetCurrentProcessId();
+
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return metadata;
+  }
+
+  Microsoft::WRL::ComPtr<IDebugSystemObjects> systems;
+  if (SUCCEEDED(client.As(&systems))) {
+    ULONG pid = 0;
+    if (SUCCEEDED(systems->GetCurrentProcessSystemId(&pid))) {
+      metadata.process_id = static_cast<std::uint32_t>(pid);
+    }
+
+    char exe_name[MAX_PATH];
+    if (SUCCEEDED(systems->GetCurrentProcessExecutableName(exe_name, sizeof(exe_name), nullptr))) {
+      metadata.executable_name = exe_name;
+    }
+  }
+
+  Microsoft::WRL::ComPtr<IDebugControl> control;
+  if (SUCCEEDED(client.As(&control))) {
+    ULONG type = 0;
+    ULONG qual = 0;
+    if (SUCCEEDED(control->GetDebuggeeType(&type, &qual))) {
+      metadata.target_info = "Type=" + std::to_string(type) + ", Qual=" + std::to_string(qual);
+    }
+  }
+
+  return metadata;
+}
+
 }  // namespace dbgx::windbg

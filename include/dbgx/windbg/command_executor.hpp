@@ -15,10 +15,17 @@ struct CommandExecutionOptions {
   std::string pattern;
 };
 
+struct SessionMetadata {
+  std::uint32_t process_id = 0;
+  std::string executable_name;
+  std::string target_info;
+};
+
 class IWinDbgCommandExecutor {
  public:
   virtual ~IWinDbgCommandExecutor() = default;
   virtual CommandExecutionResult Execute(const std::string& command, const CommandExecutionOptions& options = {}) = 0;
+  virtual SessionMetadata GetSessionMetadata() = 0;
 };
 
 }  // namespace dbgx::windbg

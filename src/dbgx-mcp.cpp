@@ -9,6 +9,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,6 +35,7 @@ struct ExtensionState {
   std::unique_ptr<dbgx::mcp::JsonRpcRouter> router;
   std::unique_ptr<dbgx::mcp::HttpServer> server;
   std::atomic<std::uint64_t> next_local_trace_id{1};
+  std::string registered_file_path;
 };
 
 ExtensionState& State() {
@@ -61,6 +64,44 @@ void LogMessage(const std::string& message) {
 
   std::string fallback_line = text + "\n";
   OutputDebugStringA(fallback_line.c_str());
+}
+
+std::string GetRegistryDir() {
+  char temp_path[MAX_PATH];
+  if (GetTempPathA(MAX_PATH, temp_path) == 0) {
+    return "";
+  }
+  std::filesystem::path path = std::filesystem::path(temp_path) / "dbgx-mcp-registry";
+  std::filesystem::create_directories(path);
+  return path.string();
+}
+
+void RegisterSession(std::uint16_t port) {
+  std::string dir = GetRegistryDir();
+  if (dir.empty()) return;
+
+  ExtensionState& state = State();
+  dbgx::windbg::SessionMetadata meta = state.executor->GetSessionMetadata();
+
+  std::filesystem::path file_path = std::filesystem::path(dir) / (std::to_string(port) + ".json");
+  std::ofstream f(file_path);
+  if (f.is_open()) {
+    f << "{\"port\":" << port 
+      << ",\"pid\":" << GetCurrentProcessId()
+      << ",\"target_pid\":" << meta.process_id
+      << ",\"executable\":\"" << meta.executable_name << "\""
+      << ",\"info\":\"" << meta.target_info << "\""
+      << "}";
+    state.registered_file_path = file_path.string();
+  }
+}
+
+void UnregisterSession() {
+  ExtensionState& state = State();
+  if (!state.registered_file_path.empty()) {
+    std::filesystem::remove(state.registered_file_path);
+    state.registered_file_path.clear();
+  }
 }
 
 std::uint64_t ElapsedMillis(const RequestTraceState& trace_state) {
@@ -154,7 +195,38 @@ dbgx::mcp::HttpResponse FinishMcpRequest(dbgx::mcp::HttpResponse response, const
   return response;
 }
 
+dbgx::mcp::HttpResponse HandleSessionsRequest(const dbgx::mcp::HttpRequest& request) {
+  dbgx::mcp::HttpResponse response;
+  response.status_code = 200;
+  response.content_type = "application/json";
+  
+  std::string dir = GetRegistryDir();
+  std::string json = "[";
+  bool first = true;
+  
+  if (!dir.empty() && std::filesystem::exists(dir)) {
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+      if (entry.path().extension() == ".json") {
+        std::ifstream f(entry.path());
+        if (f.is_open()) {
+          std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+          if (!first) json += ",";
+          json += content;
+          first = false;
+        }
+      }
+    }
+  }
+  json += "]";
+  response.body = json;
+  return response;
+}
+
 dbgx::mcp::HttpResponse HandleRequest(const dbgx::mcp::HttpRequest& request) {
+  if (request.path == "/sessions") {
+    return HandleSessionsRequest(request);
+  }
+
   dbgx::mcp::HttpResponse response;
   const RequestTraceState trace_state = BuildRequestTraceState(request);
 
@@ -282,6 +354,9 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
         ", conflicts=" + std::to_string(start_report.conflict_count) +
         ", final_port=" + std::to_string(state.server->BoundPort()));
   }
+  
+  RegisterSession(state.server->BoundPort());
+
   LogMessage("HTTP MCP server listening on http://" + bind_host + ":" + std::to_string(state.server->BoundPort()) +
              "/mcp");
   return S_OK;
@@ -292,9 +367,11 @@ extern "C" HRESULT CALLBACK DebugExtensionCanUnload(void) {
 }
 
 extern "C" void CALLBACK DebugExtensionUninitialize(void) {
+  UnregisterSession();
   Cleanup();
 }
 
 extern "C" void CALLBACK DebugExtensionUnload(void) {
+  UnregisterSession();
   Cleanup();
 }
