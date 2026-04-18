@@ -3,12 +3,14 @@ import json
 import urllib.request
 import urllib.error
 import time
+import os
+import tempfile
 
 # Remote WinDbg MCP guest IP
-GUEST_IP = "172.16.23.188"
+GUEST_IP = next((v for k, v in os.environ.items() if k.lower() == "windbg_mcp_bind"), "172.16.23.188")
 # Well-known base port
 BASE_PORT = 5678
-LOG_FILE = "/tmp/windbg-bridge.log"
+LOG_FILE = os.path.join(tempfile.gettempdir(), "windbg-bridge.log")
 
 # Global state to track selected port
 _current_port = BASE_PORT
@@ -21,7 +23,7 @@ def get_sessions():
     """Discover all active sessions in the guest VM."""
     # Try the base port first as it is the most likely to be up
     ports_to_try = [BASE_PORT] + [p for p in range(BASE_PORT + 1, BASE_PORT + 11)]
-    
+
     for port in ports_to_try:
         url = f"http://{GUEST_IP}:{port}/sessions"
         try:
@@ -54,26 +56,26 @@ def main():
         if not line:
             log("Stdin closed")
             break
-            
+
         line = line.strip()
         if not line:
             continue
-            
+
         log(f"REQ: {line[:200]}...")
-        
+
         try:
             req_data = json.loads(line)
             req_id = req_data.get("id")
             method = req_data.get("method")
             params = req_data.get("params", {})
-            
+
             # Handle local gateway commands
             if method == "initialize":
                 # Forward to backend first to get real capabilities
                 url = f"http://{GUEST_IP}:{_current_port}/mcp"
                 req = urllib.request.Request(
-                    url, 
-                    data=line.encode('utf-8'), 
+                    url,
+                    data=line.encode('utf-8'),
                     headers={'Content-Type': 'application/json'},
                     method='POST'
                 )
@@ -87,7 +89,7 @@ def main():
                                     capabilities["tools"]["availableTools"].append("list_sessions")
                                 else:
                                     capabilities["tools"]["availableTools"] = ["windbg.eval", "list_sessions"]
-                            
+
                             output_stream.write(json.dumps(resp_data) + "\n")
                             output_stream.flush()
                             continue
@@ -99,8 +101,8 @@ def main():
                 # Forward to backend first to get real tools
                 url = f"http://{GUEST_IP}:{_current_port}/mcp"
                 req = urllib.request.Request(
-                    url, 
-                    data=line.encode('utf-8'), 
+                    url,
+                    data=line.encode('utf-8'),
                     headers={'Content-Type': 'application/json'},
                     method='POST'
                 )
@@ -116,7 +118,7 @@ def main():
                                         "type": "integer",
                                         "description": "The port number of the target WinDbg session (e.g., 5678, 5679). Get this from list_sessions."
                                     }
-                            
+
                             # 2. Add our gateway tool
                             resp_data["result"]["tools"].append({
                                 "name": "list_sessions",
@@ -136,12 +138,12 @@ def main():
             if method == "tools/call":
                 tool_name = params.get("name")
                 tool_args = params.get("arguments", {})
-                
+
                 if tool_name == "list_sessions":
                     output_stream.write(json.dumps(handle_list_sessions(req_id)) + "\n")
                     output_stream.flush()
                     continue
-                
+
                 # If a session_id (port) is provided in arguments, use it
                 target_port = tool_args.get("session_id", _current_port)
                 # Remove session_id from arguments before forwarding to backend
@@ -155,32 +157,32 @@ def main():
 
             # Forward to the chosen port
             url = f"http://{GUEST_IP}:{target_port}/mcp"
-            
+
             req = urllib.request.Request(
-                url, 
-                data=line.encode('utf-8'), 
+                url,
+                data=line.encode('utf-8'),
                 headers={'Content-Type': 'application/json'},
                 method='POST'
             )
-            
+
             with urllib.request.urlopen(req, timeout=60) as f:
                 status = f.getcode()
                 response = f.read().decode('utf-8').strip()
-                
+
                 if response:
                     log(f"RES ({status}) from :{target_port}: {response[:200]}...")
                     output_stream.write(response + "\n")
                     output_stream.flush()
                 else:
                     log(f"RES ({status}) from :{target_port}: No body")
-                
+
         except Exception as e:
             err_msg = str(e)
             if isinstance(e, urllib.error.URLError):
                 err_msg = f"Network error on port {target_port}: {e.reason}"
-            
+
             log(f"BRIDGE ERROR: {err_msg}")
-            
+
             try:
                 req_id = json.loads(line).get("id")
                 if req_id is not None:

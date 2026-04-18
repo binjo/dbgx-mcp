@@ -26,17 +26,21 @@ Write-Host "--- WinDbg MCP Extension: Build & Deploy ---" -ForegroundColor Cyan
 # 1. Initialize Visual Studio Environment
 function Import-VsEnvironment {
     param([string]$Architecture)
-    
-    Write-Host "Searching for Visual Studio 2017..."
+
+    Write-Host "Searching for Visual Studio (2017, 2019, or 2022)..."
     $VsWherePath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path $VsWherePath)) {
-        throw "vswhere.exe not found. Is Visual Studio installed?"
+        # Fallback to path search
+        $VsWherePath = Get-Command "vswhere.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+        if (-not $VsWherePath) {
+            throw "vswhere.exe not found. Is Visual Studio installed?"
+        }
     }
 
-    # Added -products * to find BuildTools as well as full VS instances
-    $VsInstallPath = & $VsWherePath -latest -version "[15.0,16.0)" -products * -property installationPath
+    # Find the latest installation starting from version 15.0 (VS 2017)
+    $VsInstallPath = & $VsWherePath -latest -version "[15.0,)" -products * -property installationPath
     if (-not $VsInstallPath) {
-        throw "Visual Studio 2017 (or Build Tools) not found by vswhere."
+        throw "Visual Studio 2017 or newer (or Build Tools) not found by vswhere."
     }
 
     $VcVarsBatch = Join-Path $VsInstallPath "VC\Auxiliary\Build\vcvarsall.bat"
@@ -45,7 +49,7 @@ function Import-VsEnvironment {
     }
 
     Write-Host "Initializing $Architecture environment from: $VcVarsBatch"
-    
+
     # Run the batch file and capture the resulting environment variables
     $TempFile = [System.IO.Path]::GetTempFileName()
     $BatchCmd = "`"$VcVarsBatch`" $Architecture && set > `"$TempFile`""
@@ -86,7 +90,18 @@ if ($NeedsInit) {
     Write-Host "Correct compiler 'cl.exe' already in path ($($CompilerPath.Source)), skipping VS initialization." -ForegroundColor Gray
 }
 
-# 2. Clean Step
+# 2. Clean Step & Generator Check
+if (Test-Path $BuildDir) {
+    $CacheFile = Join-Path $BuildDir "CMakeCache.txt"
+    if (Test-Path $CacheFile) {
+        $ExistingGenerator = Get-Content $CacheFile | Select-String "CMAKE_GENERATOR:INTERNAL="
+        if ($null -ne $ExistingGenerator -and $ExistingGenerator.Line -notlike "*Ninja*") {
+            Write-Host "Detected different generator in existing build directory. Cleaning..." -ForegroundColor Yellow
+            $Clean = $true
+        }
+    }
+}
+
 if ($Clean -and (Test-Path $BuildDir)) {
     Write-Host "Cleaning build directory..."
     Remove-Item -Recurse -Force $BuildDir
@@ -101,12 +116,15 @@ Push-Location $BuildDir
 try {
     Write-Host "Configuring CMake ($Arch, $BuildType)..."
     # Note: Using Ninja generator. Ensure Ninja is in your path.
-    cmake -G "Ninja" -DCMAKE_BUILD_TYPE=$BuildType ..
+    # Using quotes for the define to avoid PowerShell expansion issues with special characters if any
+    cmake -G "Ninja" "-DCMAKE_BUILD_TYPE=$BuildType" ..
 
     Write-Host "Building project..."
+    # For Ninja, --config is mostly ignored but we pass it anyway for consistency
     cmake --build . --config $BuildType
 } catch {
-    Write-Error "Build failed. Ensure 'Ninja' is installed and in your PATH."
+    Write-Error "Build failed. If you recently switched Visual Studio versions or generators, try running with -Clean."
+    Write-Error "Error details: $_"
     Pop-Location
     return
 }
