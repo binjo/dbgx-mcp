@@ -70,6 +70,16 @@ def main():
             params = req_data.get("params", {})
 
             # Handle local gateway commands
+            if method == "ping":
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {}
+                }
+                output_stream.write(json.dumps(response) + "\n")
+                output_stream.flush()
+                continue
+
             if method == "initialize":
                 # Forward to backend first to get real capabilities
                 url = f"http://{GUEST_IP}:{_current_port}/mcp"
