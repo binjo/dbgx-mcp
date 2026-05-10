@@ -93,7 +93,7 @@ def get_sessions():
 
 
 def handle_list_sessions(req_id):
-    """Processes the list_sessions tool call.
+    """Processes the windbg.list_sessions tool call.
 
     Args:
       req_id: The JSON-RPC request ID to associate with the result.
@@ -223,7 +223,7 @@ def main():
                         resp_data = json.loads(f.read().decode("utf-8"))
                         if "result" in resp_data and "tools" in resp_data["result"]:
                             for tool in resp_data["result"]["tools"]:
-                                if tool["name"] == "windbg.eval":
+                                if tool["name"].startswith("windbg."):
                                     props = tool.setdefault(
                                         "inputSchema", {}
                                     ).setdefault("properties", {})
@@ -231,13 +231,13 @@ def main():
                                         "type": "integer",
                                         "description": (
                                             "Port of target WinDbg session. "
-                                            "Find via list_sessions."
+                                            "Find via windbg.list_sessions."
                                         ),
                                     }
 
                             resp_data["result"]["tools"].append(
                                 {
-                                    "name": "list_sessions",
+                                    "name": "windbg.list_sessions",
                                     "description": (
                                         "List all active WinDbg MCP sessions "
                                         "in the guest VM."
@@ -262,7 +262,7 @@ def main():
                             "result": {
                                 "tools": [
                                     {
-                                        "name": "list_sessions",
+                                        "name": "windbg.list_sessions",
                                         "description": (
                                             "List active sessions (Backend "
                                             "currently unreachable)."
@@ -283,7 +283,7 @@ def main():
                 tool_name = params.get("name")
                 tool_args = params.get("arguments", {})
 
-                if tool_name == "list_sessions":
+                if tool_name == "windbg.list_sessions" or tool_name == "list_sessions":
                     send_response(output_stream, handle_list_sessions(req_id))
                     continue
 

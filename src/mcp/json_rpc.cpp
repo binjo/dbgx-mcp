@@ -57,7 +57,7 @@ MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
   outcome.result_json =
       "{"
       "\"protocolVersion\":\"" + json::Escape(requested_version) + "\","
-      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\"]}},"
+      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg.get_context\",\"windbg.read_memory\",\"windbg.search\"]}},"
       "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING "\"}"
       "}";
   return outcome;
