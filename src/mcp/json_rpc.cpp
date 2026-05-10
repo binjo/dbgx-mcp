@@ -8,7 +8,7 @@ namespace dbgx::mcp {
 
 namespace {
 
-constexpr const char* kProtocolVersion = "2025-11-25";
+constexpr const char* kProtocolVersion = "2024-11-05";
 
 struct MethodOutcome {
   bool ok = false;
@@ -43,12 +43,19 @@ std::string BuildJsonRpcError(std::string_view id_raw, int code, std::string_vie
   return body;
 }
 
-MethodOutcome HandleInitialize() {
+MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
+  std::string requested_version = kProtocolVersion;
+  json::FieldMap params_fields;
+  std::string parse_error;
+  if (json::TryGetObjectField(root_fields, "params", &params_fields, &parse_error)) {
+    json::TryGetStringField(params_fields, "protocolVersion", &requested_version);
+  }
+
   MethodOutcome outcome;
   outcome.ok = true;
   outcome.result_json =
       "{"
-      "\"protocolVersion\":\"2025-11-25\","
+      "\"protocolVersion\":\"" + json::Escape(requested_version) + "\","
       "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\"]}},"
       "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING "\"}"
       "}";
@@ -158,7 +165,7 @@ MethodOutcome DispatchMethod(
     return HandleInitializedNotification();
   }
   if (method == "initialize") {
-    return HandleInitialize();
+    return HandleInitialize(root_fields);
   }
   if (method == "tools/list") {
     return HandleToolsList();

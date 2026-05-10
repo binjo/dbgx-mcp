@@ -1,53 +1,120 @@
-import sys
+"""Bridge Gateway for WinDbg Model Context Protocol (MCP).
+
+This script acts as a proxy between MCP clients (like Zed or Claude Desktop)
+and a remote WinDbg session running the dbgx-mcp extension. It handles
+Stdio-to-HTTP translation, multi-session discovery, and protocol stability.
+"""
+
 import json
-import urllib.request
-import urllib.error
-import time
 import os
+import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 
 # Remote WinDbg MCP guest IP
-GUEST_IP = next((v for k, v in os.environ.items() if k.lower() == "windbg_mcp_bind"), "172.16.23.188")
-# Well-known base port
+GUEST_IP = next(
+    (v for k, v in os.environ.items() if k.lower() == "windbg_mcp_bind"),
+    "172.16.23.188",
+)
+# Well-known base port for the WinDbg MCP server
 BASE_PORT = 5678
+# Path to the diagnostic log file
 LOG_FILE = os.path.join(tempfile.gettempdir(), "windbg-bridge.log")
 
-# Global state to track selected port
+# Global state to track the currently selected backend port
 _current_port = BASE_PORT
 
+
 def log(msg):
-    with open(LOG_FILE, "a") as f:
-        f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    """Logs a diagnostic message to the temporary log file.
+
+    Args:
+      msg: The message string to log.
+    """
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except IOError:
+        pass
+
+
+def send_response(output_stream, data):
+    """Serializes and sends a JSON-RPC response to stdout.
+
+    Ensures the JSON is formatted as a single line to prevent protocol
+    desynchronization in clients that expect line-buffered Stdio transport.
+
+    Args:
+      output_stream: The file-like object to write to (usually sys.stdout).
+      data: The dictionary to serialize as JSON.
+    """
+    try:
+        line = json.dumps(data)
+        output_stream.write(line + "\n")
+        output_stream.flush()
+        log(f"SENT: {line[:200]}...")
+    except (TypeError, ValueError, IOError) as e:
+        log(f"SEND ERROR: {e}")
+
 
 def get_sessions():
-    """Discover all active sessions in the guest VM."""
-    # Try the base port first as it is the most likely to be up
-    ports_to_try = [BASE_PORT] + [p for p in range(BASE_PORT + 1, BASE_PORT + 11)]
+    """Discover all active WinDbg MCP sessions in the guest VM.
 
+    Scans a range of ports starting from BASE_PORT to find active endpoints
+    exposing the /sessions metadata.
+
+    Returns:
+      A list of session dictionaries, each containing process info and port.
+    """
+    ports_to_try = [BASE_PORT] + [p for p in range(BASE_PORT + 1, BASE_PORT + 11)]
+    sessions = []
     for port in ports_to_try:
         url = f"http://{GUEST_IP}:{port}/sessions"
         try:
-            with urllib.request.urlopen(url, timeout=2) as f:
+            # Use short timeout for scanning
+            with urllib.request.urlopen(url, timeout=0.3) as f:
                 if f.getcode() == 200:
-                    return json.loads(f.read().decode('utf-8'))
-        except:
+                    data = json.loads(f.read().decode("utf-8"))
+                    # Tag with port so client knows where it came from
+                    if isinstance(data, list):
+                        for s in data:
+                            s["port"] = port
+                        sessions.extend(data)
+        except (
+            urllib.error.URLError,
+            json.JSONDecodeError,
+            TimeoutError,
+            ConnectionError,
+        ):
             continue
-    return []
+    return sessions
+
 
 def handle_list_sessions(req_id):
+    """Processes the list_sessions tool call.
+
+    Args:
+      req_id: The JSON-RPC request ID to associate with the result.
+
+    Returns:
+      A JSON-RPC response dictionary containing the session list.
+    """
     sessions = get_sessions()
-    response = {
+    return {
         "jsonrpc": "2.0",
         "id": req_id,
         "result": {
             "content": [{"type": "text", "text": json.dumps(sessions, indent=2)}]
-        }
+        },
     }
-    return response
+
 
 def main():
+    """Main execution loop for the bridge gateway."""
     global _current_port
-    log("Bridge Gateway started")
+    log(f"Bridge Gateway started (Guest: {GUEST_IP})")
     input_stream = sys.stdin
     output_stream = sys.stdout
 
@@ -61,153 +128,218 @@ def main():
         if not line:
             continue
 
-        log(f"REQ: {line[:200]}...")
-
         try:
             req_data = json.loads(line)
             req_id = req_data.get("id")
             method = req_data.get("method")
             params = req_data.get("params", {})
+            log(f"REQ: {method} (id: {req_id})")
 
-            # Handle local gateway commands
+            # 1. Handle local gateway heartbeats
             if method == "ping":
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {}
-                }
-                output_stream.write(json.dumps(response) + "\n")
-                output_stream.flush()
+                send_response(
+                    output_stream, {"jsonrpc": "2.0", "id": req_id, "result": {}}
+                )
                 continue
 
+            # 2. Handle Handshake/Initialization
             if method == "initialize":
-                # Forward to backend first to get real capabilities
+                requested_version = params.get("protocolVersion", "2024-11-05")
+                # Strategy: Scan for an active session to use as the default port
+                log(
+                    f"Searching for active WinDbg sessions (Requested version: {requested_version})..."
+                )
+                sessions = get_sessions()
+                if sessions:
+                    # Prefer the session on the lowest port (usually 5678 or 5679)
+                    _current_port = sorted(sessions, key=lambda x: x.get("port", 9999))[
+                        0
+                    ]["port"]
+                    log(
+                        f"Found active session on port :{_current_port}. Using as default."
+                    )
+                else:
+                    log(
+                        f"No active sessions found. Falling back to base port :{BASE_PORT}"
+                    )
+
                 url = f"http://{GUEST_IP}:{_current_port}/mcp"
                 req = urllib.request.Request(
                     url,
-                    data=line.encode('utf-8'),
-                    headers={'Content-Type': 'application/json'},
-                    method='POST'
+                    data=line.encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
                 )
                 try:
-                    with urllib.request.urlopen(req, timeout=10) as f:
-                        resp_data = json.loads(f.read().decode('utf-8'))
-                        if "result" in resp_data and "capabilities" in resp_data["result"]:
-                            capabilities = resp_data["result"]["capabilities"]
-                            if "tools" in capabilities:
-                                if "availableTools" in capabilities["tools"]:
-                                    capabilities["tools"]["availableTools"].append("list_sessions")
-                                else:
-                                    capabilities["tools"]["availableTools"] = ["windbg.eval", "list_sessions"]
+                    with urllib.request.urlopen(req, timeout=5) as f:
+                        resp_data = json.loads(f.read().decode("utf-8"))
+                        if "result" in resp_data:
+                            # Echo requested version to satisfy client constraints
+                            resp_data["result"]["protocolVersion"] = requested_version
 
-                            output_stream.write(json.dumps(resp_data) + "\n")
-                            output_stream.flush()
-                            continue
-                except Exception as e:
-                    log(f"INITIALIZE ERROR: {e}")
-                    pass
+                            if "capabilities" in resp_data["result"]:
+                                caps = resp_data["result"]["capabilities"]
+                                if "tools" not in caps:
+                                    caps["tools"] = {}
+                                log(f"Backend init successful on :{_current_port}")
 
+                        send_response(output_stream, resp_data)
+                        continue
+                except (
+                    urllib.error.URLError,
+                    json.JSONDecodeError,
+                    TimeoutError,
+                    ConnectionError,
+                ) as e:
+                    log(
+                        f"INIT BACKEND FAIL on :{_current_port}: {e}. Returning synthetic success."
+                    )
+                    synthetic = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "protocolVersion": requested_version,
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {
+                                "name": "windbg-bridge-gateway",
+                                "version": "1.1.0",
+                            },
+                        },
+                    }
+                    send_response(output_stream, synthetic)
+                    continue
+
+            # 3. Handle Tool Discovery
             if method == "tools/list":
-                # Forward to backend first to get real tools
                 url = f"http://{GUEST_IP}:{_current_port}/mcp"
                 req = urllib.request.Request(
                     url,
-                    data=line.encode('utf-8'),
-                    headers={'Content-Type': 'application/json'},
-                    method='POST'
+                    data=line.encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
                 )
                 try:
-                    with urllib.request.urlopen(req, timeout=10) as f:
-                        resp_data = json.loads(f.read().decode('utf-8'))
+                    with urllib.request.urlopen(req, timeout=5) as f:
+                        resp_data = json.loads(f.read().decode("utf-8"))
                         if "result" in resp_data and "tools" in resp_data["result"]:
-                            # 1. Update windbg.eval schema to include session_id
                             for tool in resp_data["result"]["tools"]:
                                 if tool["name"] == "windbg.eval":
-                                    properties = tool.get("inputSchema", {}).get("properties", {})
-                                    properties["session_id"] = {
+                                    props = tool.setdefault(
+                                        "inputSchema", {}
+                                    ).setdefault("properties", {})
+                                    props["session_id"] = {
                                         "type": "integer",
-                                        "description": "The port number of the target WinDbg session (e.g., 5678, 5679). Get this from list_sessions."
+                                        "description": (
+                                            "Port of target WinDbg session. "
+                                            "Find via list_sessions."
+                                        ),
                                     }
 
-                            # 2. Add our gateway tool
-                            resp_data["result"]["tools"].append({
-                                "name": "list_sessions",
-                                "description": "List all active WinDbg MCP sessions in the guest VM.",
-                                "inputSchema": {
-                                    "type": "object",
-                                    "properties": {}
+                            resp_data["result"]["tools"].append(
+                                {
+                                    "name": "list_sessions",
+                                    "description": (
+                                        "List all active WinDbg MCP sessions "
+                                        "in the guest VM."
+                                    ),
+                                    "inputSchema": {"type": "object", "properties": {}},
                                 }
-                            })
-                            output_stream.write(json.dumps(resp_data) + "\n")
-                            output_stream.flush()
-                            continue
-                except Exception as e:
-                    log(f"TOOLS/LIST ERROR: {e}")
-                    pass
+                            )
+                        send_response(output_stream, resp_data)
+                        continue
+                except (
+                    urllib.error.URLError,
+                    json.JSONDecodeError,
+                    TimeoutError,
+                    ConnectionError,
+                ) as e:
+                    log(f"TOOLS/LIST BACKEND FAIL on :{_current_port}: {e}")
+                    send_response(
+                        output_stream,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "tools": [
+                                    {
+                                        "name": "list_sessions",
+                                        "description": (
+                                            "List active sessions (Backend "
+                                            "currently unreachable)."
+                                        ),
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {},
+                                        },
+                                    }
+                                ]
+                            },
+                        },
+                    )
+                    continue
 
+            # 4. Handle Execution
             if method == "tools/call":
                 tool_name = params.get("name")
                 tool_args = params.get("arguments", {})
 
                 if tool_name == "list_sessions":
-                    output_stream.write(json.dumps(handle_list_sessions(req_id)) + "\n")
-                    output_stream.flush()
+                    send_response(output_stream, handle_list_sessions(req_id))
                     continue
 
-                # If a session_id (port) is provided in arguments, use it
                 target_port = tool_args.get("session_id", _current_port)
-                # Remove session_id from arguments before forwarding to backend
                 if "session_id" in tool_args:
                     del tool_args["session_id"]
-                    # Also update req_data for forwarding
                     req_data["params"]["arguments"] = tool_args
                     line = json.dumps(req_data)
             else:
                 target_port = _current_port
 
-            # Forward to the chosen port
+            # Generic Forwarding to Backend
             url = f"http://{GUEST_IP}:{target_port}/mcp"
-
             req = urllib.request.Request(
                 url,
-                data=line.encode('utf-8'),
-                headers={'Content-Type': 'application/json'},
-                method='POST'
+                data=line.encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
 
-            with urllib.request.urlopen(req, timeout=60) as f:
-                status = f.getcode()
-                response = f.read().decode('utf-8').strip()
-
-                if response:
-                    log(f"RES ({status}) from :{target_port}: {response[:200]}...")
-                    output_stream.write(response + "\n")
-                    output_stream.flush()
-                else:
-                    log(f"RES ({status}) from :{target_port}: No body")
-
-        except Exception as e:
-            err_msg = str(e)
-            if isinstance(e, urllib.error.URLError):
-                err_msg = f"Network error on port {target_port}: {e.reason}"
-
-            log(f"BRIDGE ERROR: {err_msg}")
-
             try:
-                req_id = json.loads(line).get("id")
+                with urllib.request.urlopen(req, timeout=60) as f:
+                    response_raw = f.read().decode("utf-8").strip()
+                    if response_raw:
+                        resp_json = json.loads(response_raw)
+                        send_response(output_stream, resp_json)
+                    else:
+                        log(f"Empty response from :{target_port}")
+                        if req_id is not None:
+                            send_response(
+                                output_stream,
+                                {"jsonrpc": "2.0", "id": req_id, "result": {}},
+                            )
+            except (
+                urllib.error.URLError,
+                json.JSONDecodeError,
+                TimeoutError,
+                ConnectionError,
+            ) as e:
+                log(f"FORWARD ERROR to :{target_port}: {e}")
                 if req_id is not None:
-                    error_response = {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32000,
-                            "message": err_msg
-                        }
-                    }
-                    output_stream.write(json.dumps(error_response) + "\n")
-                    output_stream.flush()
-            except:
-                pass
+                    send_response(
+                        output_stream,
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": {
+                                "code": -32000,
+                                "message": f"Backend :{target_port} unreachable: {e}",
+                            },
+                        },
+                    )
+
+        except (json.JSONDecodeError, KeyError) as e:
+            log(f"GLOBAL BRIDGE ERROR: {e}")
+
 
 if __name__ == "__main__":
     main()
