@@ -5,7 +5,13 @@
 #include <DbgEng.h>
 #include <wrl/client.h>
 
+#include <cctype>
+#include <cstdlib>
 #include <mutex>
+#include <vector>
+
+#include "dbgx/mcp/json_writer.hpp"
+#include "dbgx/windbg/model_serializer.hpp"
 
 namespace dbgx::windbg {
 
@@ -183,6 +189,189 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
       output,
       "",
   };
+}
+
+CommandExecutionResult DbgEngCommandExecutor::EvaluateModel(const std::string& expression, int max_depth) {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IHostDataModelAccess> access;
+  if (FAILED(client.As(&access))) {
+    return {false, "", "IHostDataModelAccess not available"};
+  }
+
+  Microsoft::WRL::ComPtr<IDataModelManager> manager;
+  Microsoft::WRL::ComPtr<IDebugHost> host;
+  if (FAILED(access->GetDataModel(&manager, &host))) {
+    return {false, "", "Failed to get Data Model"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugHostEvaluator2> evaluator;
+  if (FAILED(host.As(&evaluator))) {
+    return {false, "", "IDebugHostEvaluator2 not available"};
+  }
+
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, expression.c_str(), -1, nullptr, 0);
+  std::vector<wchar_t> wexpr(wlen);
+  MultiByteToWideChar(CP_UTF8, 0, expression.c_str(), -1, wexpr.data(), wlen);
+
+  Microsoft::WRL::ComPtr<IModelObject> result_obj;
+  if (FAILED(evaluator->EvaluateExtendedExpression(nullptr, wexpr.data(), nullptr, &result_obj, nullptr))) {
+    return {false, "", "Expression evaluation failed"};
+  }
+
+  mcp::JsonWriter writer;
+  ModelSerializer::Serialize(result_obj.Get(), writer, max_depth);
+
+  return {true, writer.GetJSON(), ""};
+}
+
+CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshot() {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  mcp::JsonWriter writer;
+  writer.StartObject();
+
+  // 1. Registers
+  Microsoft::WRL::ComPtr<IDebugRegisters> registers;
+  if (SUCCEEDED(client.As(&registers))) {
+    writer.Key("registers");
+    writer.StartObject();
+    ULONG count = 0;
+    registers->GetNumberRegisters(&count);
+    for (ULONG i = 0; i < count; ++i) {
+      char name[64];
+      if (SUCCEEDED(registers->GetDescription(i, name, sizeof(name), nullptr, nullptr))) {
+        DEBUG_VALUE val;
+        if (SUCCEEDED(registers->GetValue(i, &val))) {
+          if (val.Type == DEBUG_VALUE_INT64) {
+            writer.Key(name);
+            writer.HexValue(val.I64);
+          } else if (val.Type == DEBUG_VALUE_INT32) {
+            writer.Key(name);
+            writer.HexValue(val.I32);
+          }
+        }
+      }
+    }
+    writer.EndObject();
+  }
+
+  // 2. Stack
+  Microsoft::WRL::ComPtr<IDebugControl> control;
+  if (SUCCEEDED(client.As(&control))) {
+    writer.Key("stack");
+    writer.StartArray();
+    DEBUG_STACK_FRAME frames[20];
+    ULONG filled = 0;
+    if (SUCCEEDED(control->GetStackTrace(0, 0, 0, frames, 20, &filled))) {
+      Microsoft::WRL::ComPtr<IDebugSymbols> symbols;
+      client.As(&symbols);
+      for (ULONG i = 0; i < filled; ++i) {
+        writer.StartObject();
+        writer.Key("instruction_offset");
+        writer.HexValue(frames[i].InstructionOffset);
+        if (symbols) {
+          char name[256];
+          ULONG64 disp = 0;
+          if (SUCCEEDED(symbols->GetNameByOffset(frames[i].InstructionOffset, name, sizeof(name), nullptr, &disp))) {
+            writer.Key("symbol");
+            std::string sym = name;
+            if (disp > 0) sym += "+0x" + std::to_string(disp);
+            writer.StringValue(sym);
+          }
+        }
+        writer.EndObject();
+      }
+    }
+    writer.EndArray();
+  }
+
+  writer.EndObject();
+  return {true, writer.GetJSON(), ""};
+}
+
+CommandExecutionResult DbgEngCommandExecutor::ReadMemory(std::uint64_t address, std::uint32_t length) {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugDataSpaces> data;
+  if (FAILED(client.As(&data))) {
+    return {false, "", "IDebugDataSpaces not available"};
+  }
+
+  if (length > 1024 * 1024) length = 1024 * 1024; // Limit to 1MB
+
+  std::vector<unsigned char> buffer(length);
+  ULONG bytes_read = 0;
+  HRESULT hr = data->ReadVirtual(address, buffer.data(), length, &bytes_read);
+  if (FAILED(hr) && bytes_read == 0) {
+    return {false, "", "ReadVirtual failed: " + HResultToString(hr)};
+  }
+
+  std::string hex;
+  hex.reserve(bytes_read * 2);
+  static const char* kDigits = "0123456789abcdef";
+  for (ULONG i = 0; i < bytes_read; ++i) {
+    hex.push_back(kDigits[buffer[i] >> 4]);
+    hex.push_back(kDigits[buffer[i] & 0x0f]);
+  }
+
+  return {true, hex, ""};
+}
+
+CommandExecutionResult DbgEngCommandExecutor::SearchMemory(
+    std::uint64_t start_address,
+    std::uint64_t end_address,
+    const std::string& pattern) {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugDataSpaces> data;
+  if (FAILED(client.As(&data))) {
+    return {false, "", "IDebugDataSpaces not available"};
+  }
+
+  std::vector<unsigned char> pattern_bytes;
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    if (isxdigit(pattern[i])) {
+      if (i + 1 < pattern.size() && isxdigit(pattern[i + 1])) {
+        char hex[3] = {pattern[i], pattern[i + 1], 0};
+        pattern_bytes.push_back(static_cast<unsigned char>(strtoul(hex, nullptr, 16)));
+        i++;
+      }
+    }
+  }
+
+  if (pattern_bytes.empty()) {
+    return {false, "", "Empty or invalid pattern"};
+  }
+
+  mcp::JsonWriter writer;
+  writer.StartArray();
+
+  ULONG64 found_addr = 0;
+  ULONG64 current = start_address;
+  while (current < end_address) {
+    if (SUCCEEDED(data->SearchVirtual(current, end_address - current, pattern_bytes.data(), (ULONG)pattern_bytes.size(), 1, &found_addr))) {
+      writer.HexValue(found_addr);
+      current = found_addr + 1;
+    } else {
+      break;
+    }
+  }
+
+  writer.EndArray();
+  return {true, writer.GetJSON(), ""};
 }
 
 SessionMetadata DbgEngCommandExecutor::GetSessionMetadata() {

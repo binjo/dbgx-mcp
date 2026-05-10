@@ -32,7 +32,23 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
   }
 
   dbgx::windbg::SessionMetadata GetSessionMetadata() override {
-    return {1234, "test.exe", "Test Target"};
+    return {1234, "test.exe", "Live Session"};
+  }
+
+  dbgx::windbg::CommandExecutionResult EvaluateModel(const std::string&, int) override {
+    return {true, "{}", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult GetContextSnapshot() override {
+    return {true, "{}", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult ReadMemory(std::uint64_t, std::uint32_t) override {
+    return {true, "00", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult SearchMemory(std::uint64_t, std::uint64_t, const std::string&) override {
+    return {true, "[]", ""};
   }
 
   bool should_fail = false;

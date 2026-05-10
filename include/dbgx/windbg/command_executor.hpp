@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace dbgx::windbg {
@@ -25,6 +26,10 @@ class IWinDbgCommandExecutor {
  public:
   virtual ~IWinDbgCommandExecutor() = default;
   virtual CommandExecutionResult Execute(const std::string& command, const CommandExecutionOptions& options = {}) = 0;
+  virtual CommandExecutionResult EvaluateModel(const std::string& expression, int max_depth = 5) = 0;
+  virtual CommandExecutionResult GetContextSnapshot() = 0;
+  virtual CommandExecutionResult ReadMemory(std::uint64_t address, std::uint32_t length) = 0;
+  virtual CommandExecutionResult SearchMemory(std::uint64_t start_address, std::uint64_t end_address, const std::string& pattern) = 0;
   virtual SessionMetadata GetSessionMetadata() = 0;
 };
 

@@ -48,7 +48,9 @@ add_library(dbgx-mcp SHARED
   src/mcp/io_echo.cpp
   src/mcp/json.cpp
   src/mcp/json_rpc.cpp
+  src/mcp/json_writer.cpp
   src/windbg/dbgeng_command_executor.cpp
+  src/windbg/model_serializer.cpp
   src/dbgx-mcp.cpp
   src/dbgx-mcp.def
   "${CMAKE_CURRENT_BINARY_DIR}/version.rc"
@@ -99,6 +101,7 @@ add_executable(unit_tests
   src/mcp/io_echo.cpp
   src/mcp/json.cpp
   src/mcp/json_rpc.cpp
+  src/mcp/json_writer.cpp
   tests/unit_tests.cpp
 )
 

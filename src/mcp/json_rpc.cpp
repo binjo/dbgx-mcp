@@ -1,5 +1,6 @@
 #include "dbgx/mcp/json_rpc.hpp"
 
+#include <cstdlib>
 #include <utility>
 
 #include "dbgx/mcp/json.hpp"
@@ -77,15 +78,64 @@ MethodOutcome HandleToolsList() {
       "\"tools\":["
       "{"
       "\"name\":\"windbg.eval\","
-      "\"description\":\"Execute WinDbg command. Results returned as filtered/truncated text.\","
+      "\"description\":\"Execute WinDbg command. Results returned as filtered/truncated text. NOTE: WinDbg is inherently single-threaded for command execution; clients MUST run calls serially and wait for each call to finish before sending the next.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"command\":{\"type\":\"string\",\"description\":\"WinDbg command to execute\"},"
+      "\"command\":{\"type\":\"string\",\"description\":\"WinDbg command to execute. Because the debugger engine is single-threaded, clients should send commands one by one and wait for completion before the next command.\"},"
       "\"max_lines\":{\"type\":\"integer\",\"description\":\"Max lines to return (default 100)\"},"
       "\"pattern\":{\"type\":\"string\",\"description\":\"Optional substring filter\"}"
       "},"
       "\"required\":[\"command\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.dx\","
+      "\"description\":\"Evaluate WinDbg Data Model expression and return as structured JSON.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"expression\":{\"type\":\"string\",\"description\":\"Data Model expression (e.g. @$curprocess)\"},"
+      "\"max_depth\":{\"type\":\"integer\",\"description\":\"Max recursion depth (default 5)\"}"
+      "},"
+      "\"required\":[\"expression\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.get_context\","
+      "\"description\":\"Get a comprehensive snapshot of the current debugger state (registers, stack). \","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.read_memory\","
+      "\"description\":\"Read virtual memory and return as hex string.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address to read from\"},"
+      "\"length\":{\"type\":\"integer\",\"description\":\"Number of bytes to read\"}"
+      "},"
+      "\"required\":[\"address\",\"length\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.search\","
+      "\"description\":\"Search virtual memory for a byte pattern.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"start_address\":{\"type\":\"string\",\"description\":\"Hex start address\"},"
+      "\"end_address\":{\"type\":\"string\",\"description\":\"Hex end address\"},"
+      "\"pattern\":{\"type\":\"string\",\"description\":\"Hex pattern to search for (e.g. '41 42 43')\"}"
+      "},"
+      "\"required\":[\"start_address\",\"end_address\",\"pattern\"],"
       "\"additionalProperties\":false"
       "}"
       "}"
@@ -118,12 +168,6 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     return outcome;
   }
 
-  if (tool_name != "windbg.eval") {
-    outcome.error_code = -32602;
-    outcome.error_message = "Invalid params: unknown tool name";
-    return outcome;
-  }
-
   json::FieldMap arguments_fields;
   if (!json::TryGetObjectField(params_fields, "arguments", &arguments_fields, &parse_error)) {
     outcome.error_code = -32602;
@@ -131,18 +175,63 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     return outcome;
   }
 
-  std::string command;
-  if (!json::TryGetStringField(arguments_fields, "command", &command) || command.empty()) {
+  windbg::CommandExecutionResult execution;
+  bool is_json_output = false;
+
+  if (tool_name == "windbg.eval") {
+    std::string command;
+    if (!json::TryGetStringField(arguments_fields, "command", &command) || command.empty()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: command must be a non-empty string";
+      return outcome;
+    }
+    windbg::CommandExecutionOptions options;
+    json::TryGetIntField(arguments_fields, "max_lines", &options.max_lines);
+    json::TryGetStringField(arguments_fields, "pattern", &options.pattern);
+    execution = executor->Execute(command, options);
+  } else if (tool_name == "windbg.dx") {
+    std::string expression;
+    if (!json::TryGetStringField(arguments_fields, "expression", &expression) || expression.empty()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: expression must be a non-empty string";
+      return outcome;
+    }
+    int max_depth = 5;
+    json::TryGetIntField(arguments_fields, "max_depth", &max_depth);
+    execution = executor->EvaluateModel(expression, max_depth);
+    is_json_output = true;
+  } else if (tool_name == "windbg.get_context") {
+    execution = executor->GetContextSnapshot();
+    is_json_output = true;
+  } else if (tool_name == "windbg.read_memory") {
+    std::string addr_str;
+    int length = 0;
+    if (!json::TryGetStringField(arguments_fields, "address", &addr_str) ||
+        !json::TryGetIntField(arguments_fields, "length", &length)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: address and length are required";
+      return outcome;
+    }
+    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
+    execution = executor->ReadMemory(address, (uint32_t)length);
+  } else if (tool_name == "windbg.search") {
+    std::string start_str, end_str, pattern;
+    if (!json::TryGetStringField(arguments_fields, "start_address", &start_str) ||
+        !json::TryGetStringField(arguments_fields, "end_address", &end_str) ||
+        !json::TryGetStringField(arguments_fields, "pattern", &pattern)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: start_address, end_address, and pattern are required";
+      return outcome;
+    }
+    uint64_t start = strtoull(start_str.c_str(), nullptr, 16);
+    uint64_t end = strtoull(end_str.c_str(), nullptr, 16);
+    execution = executor->SearchMemory(start, end, pattern);
+    is_json_output = true;
+  } else {
     outcome.error_code = -32602;
-    outcome.error_message = "Invalid params: command must be a non-empty string";
+    outcome.error_message = "Invalid params: unknown tool name";
     return outcome;
   }
-
-  windbg::CommandExecutionOptions options;
-  json::TryGetIntField(arguments_fields, "max_lines", &options.max_lines);
-  json::TryGetStringField(arguments_fields, "pattern", &options.pattern);
-
-  const windbg::CommandExecutionResult execution = executor->Execute(command, options);
 
   const std::string payload_text = execution.success
                                        ? (execution.output.empty() ? "(no output)" : execution.output)
