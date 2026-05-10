@@ -4,7 +4,7 @@ Language: English | [简体中文](README.zh-CN.md)
 
 ## Project Overview
 
-This project provides a minimal C++ WinDbg extension DLL that exposes an MCP-compatible HTTP endpoint (`/mcp`) and a basic `windbg.eval` tool.
+This project provides a C++ WinDbg extension DLL that exposes an MCP-compatible HTTP endpoint (`/mcp`) and a suite of structured tools for high-performance debugger inspection and agentic automation.
 
 ### Why use it
 
@@ -20,9 +20,9 @@ This project provides a minimal C++ WinDbg extension DLL that exposes an MCP-com
 
 ### Typical scenarios
 
-- Execute `windbg.eval` from an MCP client to inspect register/memory state.
-- Build and test JSON-RPC routing for WinDbg-backed tools.
-- Verify extension loading, exported symbols, and request/response visibility in WinDbg.
+- Execute `windbg.get_context` to get a structured snapshot of registers and the call stack.
+- Use `windbg.dx` to evaluate Data Model expressions and receive structured JSON instead of text tables.
+- Read and search virtual memory directly via `windbg.read_memory` and `windbg.search`.
 
 ## Quick Start
 
@@ -127,6 +127,19 @@ curl -X POST http://127.0.0.1:5678/mcp -H "Content-Type: application/json" -d "{
 # tools/call (windbg.eval)
 curl -X POST http://127.0.0.1:5678/mcp -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"windbg.eval\",\"arguments\":{\"command\":\"r eax\"}}}"
 ```
+
+## WinDbg Bridge Gateway
+
+The `windbg-bridge.py` script acts as a proxy between Stdio-based MCP clients (like Claude Desktop or Zed) and the remote WinDbg session. It handles multi-session discovery and protocol translation.
+
+### Usage
+
+1. Start one or more WinDbg sessions and load the extension.
+2. Run the bridge:
+   ```powershell
+   python windbg-bridge.py
+   ```
+3. Use the `windbg.list_sessions` tool to discover available debuggers and their ports.
 
 ## Troubleshooting `.load` Failures
 
@@ -254,6 +267,54 @@ Safety behavior remains unchanged:
     "name": "windbg.eval",
     "arguments": {
       "command": "r eax"
+    }
+  }
+}
+```
+
+### `tools/call` (`windbg.dx`)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "windbg.dx",
+    "arguments": {
+      "expression": "@$curprocess",
+      "max_depth": 3
+    }
+  }
+}
+```
+
+### `tools/call` (`windbg.get_context`)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "method": "tools/call",
+  "params": {
+    "name": "windbg.get_context",
+    "arguments": {}
+  }
+}
+```
+
+### `tools/call` (`windbg.read_memory`)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 6,
+  "method": "tools/call",
+  "params": {
+    "name": "windbg.read_memory",
+    "arguments": {
+      "address": "0x00401000",
+      "length": 64
     }
   }
 }
