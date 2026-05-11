@@ -66,8 +66,9 @@ set_target_properties(dbgx-mcp PROPERTIES
 if(MSVC)
   # CMake 3.12 doesn't have target_link_options (added in 3.13)
   set_target_properties(dbgx-mcp PROPERTIES
-    LINK_FLAGS "/DEF:\"${WINDBG_EXTENSION_DEF_FILE}\""
+    LINK_FLAGS "/DEF:\"${WINDBG_EXTENSION_DEF_FILE}\" /DEBUG /OPT:REF /OPT:ICF"
   )
+  target_compile_options(dbgx-mcp PRIVATE /Zi)
 endif()
 
 target_include_directories(dbgx-mcp PRIVATE include)

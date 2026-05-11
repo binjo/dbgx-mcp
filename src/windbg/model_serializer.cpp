@@ -19,6 +19,70 @@ std::string WideToUtf8(std::wstring_view wide) {
   return strTo;
 }
 
+HRESULT GetKindSafe(IModelObject* object, ModelObjectKind* kind) {
+  __try {
+    return object->GetKind(kind);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+HRESULT GetIntrinsicValueSafe(IModelObject* object, VARIANT* vt) {
+  __try {
+    return object->GetIntrinsicValue(vt);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+HRESULT GetConceptSafe(IModelObject* object, REFIID concept_id, void** concept_interface) {
+  __try {
+    return object->GetConcept(concept_id, reinterpret_cast<IUnknown**>(concept_interface), nullptr);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+HRESULT ToDisplayStringSafe(IStringDisplayableConcept* display_concept, IModelObject* object, BSTR* display_str) {
+  __try {
+    return display_concept->ToDisplayString(object, nullptr, display_str);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+HRESULT GetIteratorSafe(IIterableConcept* iter_concept, IModelObject* object, IModelIterator** iterator) {
+  __try {
+    return iter_concept->GetIterator(object, iterator);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+HRESULT GetNextItemSafe(IModelIterator* iterator, IModelObject** item) {
+  __try {
+    return iterator->GetNext(item, 0, nullptr, nullptr);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+HRESULT EnumerateKeyValuesSafe(IModelObject* object, IKeyEnumerator** keys) {
+  __try {
+    return object->EnumerateKeyValues(keys);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
+HRESULT GetNextKeySafe(IKeyEnumerator* keys, BSTR* key_name, IModelObject** key_value) {
+  __try {
+    return keys->GetNext(key_name, key_value, nullptr);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
 }  // namespace
 
 void ModelSerializer::Serialize(IModelObject* object, mcp::JsonWriter& writer, int max_depth) {
@@ -36,11 +100,36 @@ void ModelSerializer::SerializeRecursive(IModelObject* object, mcp::JsonWriter& 
     return;
   }
 
-  VARIANT vt;
-  VariantInit(&vt);
-  if (SUCCEEDED(object->GetIntrinsicValue(&vt))) {
-    SerializeIntrinsic(object, vt, writer, current_depth, max_depth);
-    VariantClear(&vt);
+  ModelObjectKind kind = ObjectNoValue;
+  if (FAILED(GetKindSafe(object, &kind))) {
+    SerializeDisplayString(object, writer);
+    return;
+  }
+
+  if (kind == ObjectError) {
+    SerializeDisplayString(object, writer);
+    return;
+  }
+
+  if (kind == ObjectNoValue) {
+    writer.NullValue();
+    return;
+  }
+
+  if (kind == ObjectMethod || kind == ObjectPropertyAccessor || kind == ObjectContext) {
+    SerializeDisplayString(object, writer);
+    return;
+  }
+
+  if (kind == ObjectIntrinsic) {
+    VARIANT vt;
+    VariantInit(&vt);
+    if (SUCCEEDED(GetIntrinsicValueSafe(object, &vt))) {
+      SerializeIntrinsic(object, vt, writer, current_depth, max_depth);
+      VariantClear(&vt);
+    } else {
+      SerializeDisplayString(object, writer);
+    }
     return;
   }
 
@@ -105,18 +194,18 @@ void ModelSerializer::SerializeIntrinsic(IModelObject* object, const VARIANT& vt
 
 bool ModelSerializer::TrySerializeIterable(IModelObject* object, mcp::JsonWriter& writer, int current_depth, int max_depth) {
   ComPtr<IIterableConcept> iter_concept;
-  if (FAILED(object->GetConcept(__uuidof(IIterableConcept), &iter_concept, nullptr))) {
+  if (FAILED(GetConceptSafe(object, __uuidof(IIterableConcept), &iter_concept))) {
     return false;
   }
 
   ComPtr<IModelIterator> iterator;
-  if (FAILED(iter_concept->GetIterator(object, &iterator))) {
+  if (FAILED(GetIteratorSafe(iter_concept.Get(), object, &iterator))) {
     return false;
   }
 
   writer.StartArray();
   ComPtr<IModelObject> item;
-  while (SUCCEEDED(iterator->GetNext(&item, 0, nullptr, nullptr)) && item) {
+  while (SUCCEEDED(GetNextItemSafe(iterator.Get(), &item)) && item) {
     SerializeRecursive(item.Get(), writer, current_depth + 1, max_depth);
     item.Reset();
   }
@@ -126,8 +215,8 @@ bool ModelSerializer::TrySerializeIterable(IModelObject* object, mcp::JsonWriter
 
 bool ModelSerializer::TrySerializeKeys(IModelObject* object, mcp::JsonWriter& writer, int current_depth, int max_depth) {
   ComPtr<IKeyEnumerator> keys;
-  // Use EnumerateKeyValues to get the actual property values rather than just names
-  if (FAILED(object->EnumerateKeyValues(&keys))) {
+  // Use EnumerateKeyValuesSafe to get the actual property values rather than just names
+  if (FAILED(EnumerateKeyValuesSafe(object, &keys))) {
     return false;
   }
 
@@ -135,7 +224,7 @@ bool ModelSerializer::TrySerializeKeys(IModelObject* object, mcp::JsonWriter& wr
   BSTR key_name = nullptr;
   ComPtr<IModelObject> key_value;
 
-  while (SUCCEEDED(keys->GetNext(&key_name, &key_value, nullptr)) && key_name) {
+  while (SUCCEEDED(GetNextKeySafe(keys.Get(), &key_name, &key_value)) && key_name) {
     if (!found_keys) {
       writer.StartObject();
       found_keys = true;
@@ -156,10 +245,42 @@ bool ModelSerializer::TrySerializeKeys(IModelObject* object, mcp::JsonWriter& wr
 }
 
 void ModelSerializer::SerializeDisplayString(IModelObject* object, mcp::JsonWriter& writer) {
+  if (object == nullptr) {
+    writer.NullValue();
+    return;
+  }
+
+  ModelObjectKind kind = ObjectNoValue;
+  if (FAILED(GetKindSafe(object, &kind))) {
+    writer.StringValue("<object>");
+    return;
+  }
+
+  if (kind == ObjectError) {
+    writer.StringValue("<error>");
+    return;
+  }
+  if (kind == ObjectNoValue) {
+    writer.NullValue();
+    return;
+  }
+  if (kind == ObjectMethod) {
+    writer.StringValue("<method>");
+    return;
+  }
+  if (kind == ObjectPropertyAccessor) {
+    writer.StringValue("<property accessor>");
+    return;
+  }
+  if (kind == ObjectContext) {
+    writer.StringValue("<context>");
+    return;
+  }
+
   ComPtr<IStringDisplayableConcept> display_concept;
-  if (SUCCEEDED(object->GetConcept(__uuidof(IStringDisplayableConcept), &display_concept, nullptr))) {
+  if (SUCCEEDED(GetConceptSafe(object, __uuidof(IStringDisplayableConcept), &display_concept))) {
     BSTR display_str = nullptr;
-    if (SUCCEEDED(display_concept->ToDisplayString(object, nullptr, &display_str))) {
+    if (SUCCEEDED(ToDisplayStringSafe(display_concept.Get(), object, &display_str))) {
       writer.StringValue(WideToUtf8(display_str ? display_str : L""));
       if (display_str) SysFreeString(display_str);
       return;

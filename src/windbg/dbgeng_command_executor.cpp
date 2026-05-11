@@ -128,6 +128,17 @@ std::string HResultToString(HRESULT hr) {
   return message;
 }
 
+HRESULT EvaluateExtendedExpressionSafe(
+    IDebugHostEvaluator2* evaluator,
+    const wchar_t* expression,
+    IModelObject** result_obj) {
+  __try {
+    return evaluator->EvaluateExtendedExpression(nullptr, expression, nullptr, result_obj, nullptr);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_FAIL;
+  }
+}
+
 }  // namespace
 
 CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command, const CommandExecutionOptions& options) {
@@ -218,7 +229,7 @@ CommandExecutionResult DbgEngCommandExecutor::EvaluateModel(const std::string& e
   MultiByteToWideChar(CP_UTF8, 0, expression.c_str(), -1, wexpr.data(), wlen);
 
   Microsoft::WRL::ComPtr<IModelObject> result_obj;
-  if (FAILED(evaluator->EvaluateExtendedExpression(nullptr, wexpr.data(), nullptr, &result_obj, nullptr))) {
+  if (FAILED(EvaluateExtendedExpressionSafe(evaluator.Get(), wexpr.data(), &result_obj))) {
     return {false, "", "Expression evaluation failed"};
   }
 
