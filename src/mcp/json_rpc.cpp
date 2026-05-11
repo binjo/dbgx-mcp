@@ -1,5 +1,6 @@
 #include "dbgx/mcp/json_rpc.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <utility>
 
@@ -42,6 +43,57 @@ std::string BuildJsonRpcError(std::string_view id_raw, int code, std::string_vie
   body += json::Escape(message);
   body += "\"}}";
   return body;
+}
+
+std::string PrettyPrintJson(std::string_view json) {
+  std::string pretty;
+  int indent = 0;
+  bool in_quote = false;
+  bool escape = false;
+  for (size_t i = 0; i < json.size(); ++i) {
+    char c = json[i];
+    if (escape) {
+      pretty.push_back(c);
+      escape = false;
+      continue;
+    }
+    if (c == '\\') {
+      pretty.push_back(c);
+      escape = true;
+      continue;
+    }
+    if (c == '"') {
+      pretty.push_back(c);
+      in_quote = !in_quote;
+      continue;
+    }
+    if (in_quote) {
+      pretty.push_back(c);
+      continue;
+    }
+    
+    if (c == '{' || c == '[') {
+      pretty.push_back(c);
+      pretty.push_back('\n');
+      indent += 2;
+      pretty.append(indent, ' ');
+    } else if (c == '}' || c == ']') {
+      pretty.push_back('\n');
+      indent = (std::max)(0, indent - 2);
+      pretty.append(indent, ' ');
+      pretty.push_back(c);
+    } else if (c == ',') {
+      pretty.push_back(c);
+      pretty.push_back('\n');
+      pretty.append(indent, ' ');
+    } else if (c == ':') {
+      pretty.push_back(c);
+      pretty.push_back(' ');
+    } else if (!isspace(static_cast<unsigned char>(c))) {
+      pretty.push_back(c);
+    }
+  }
+  return pretty;
 }
 
 MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
@@ -234,7 +286,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
   }
 
   const std::string payload_text = execution.success
-                                       ? (execution.output.empty() ? "(no output)" : execution.output)
+                                       ? (execution.output.empty() ? "(no output)" : 
+                                           (is_json_output ? PrettyPrintJson(execution.output) : execution.output))
                                        : (execution.error_message.empty() ? "Command execution failed"
                                                                           : execution.error_message);
 
