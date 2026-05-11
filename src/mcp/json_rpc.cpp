@@ -144,7 +144,7 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.dx\","
-      "\"description\":\"Evaluate WinDbg Data Model expression and return as structured JSON.\","
+      "\"description\":\"Evaluate WinDbg Data Model expression and return as structured JSON. NOTE: If a key/property contains non-identifier characters (like hyphens, spaces, or dots), query it using the @\\\"key\\\" syntax, e.g., Parent.@\\\"key-name\\\".\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
