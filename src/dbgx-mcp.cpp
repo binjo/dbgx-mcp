@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -27,6 +28,7 @@ struct RequestTraceState {
   std::string rpc_method;
   std::string rpc_id;
   std::string tool_name;
+  std::string detail_info;
   std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
 };
 
@@ -56,15 +58,22 @@ void LogMessage(const std::string& message) {
       std::string line = text + "\n";
       debug_control->Output(DEBUG_OUTPUT_NORMAL, "%s", line.c_str());
       debug_control->Release();
-      debug_client->Release();
-      return;
     }
-
     debug_client->Release();
   }
 
   std::string fallback_line = text + "\n";
   OutputDebugStringA(fallback_line.c_str());
+
+  // Write to log file in Temp directory
+  char temp_path[MAX_PATH];
+  if (GetTempPathA(MAX_PATH, temp_path) != 0) {
+    std::string log_file = std::string(temp_path) + "dbgx-mcp-extension.log";
+    std::ofstream f(log_file, std::ios::app);
+    if (f.is_open()) {
+      f << "[" << std::time(nullptr) << "] " << message << "\n";
+    }
+  }
 }
 
 std::string GetRegistryDir() {
@@ -125,6 +134,7 @@ dbgx::mcp::IoTraceContext BuildTraceContext(
   context.rpc_id = trace_state.rpc_id;
   context.tool_name = trace_state.tool_name;
   context.outcome = std::string(outcome);
+  context.detail_info = trace_state.detail_info;
   context.duration_ms = ElapsedMillis(trace_state);
   return context;
 }
@@ -147,6 +157,9 @@ RequestTraceState BuildRequestTraceState(const dbgx::mcp::HttpRequest& request) 
   }
   if (request_meta.has_tool_name) {
     trace_state.tool_name = request_meta.tool_name;
+  }
+  if (!request_meta.detail_info.empty()) {
+    trace_state.detail_info = request_meta.detail_info;
   }
 
   if (trace_state.trace_id.empty()) {
@@ -276,14 +289,19 @@ dbgx::mcp::HttpResponse HandleRequest(const dbgx::mcp::HttpRequest& request) {
   }
 
   ExtensionState& state = State();
-  std::lock_guard<std::mutex> lock(state.mutex);
-  if (state.router == nullptr) {
+  dbgx::mcp::JsonRpcRouter* router = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    router = state.router.get();
+  }
+
+  if (router == nullptr) {
     response.status_code = 500;
     response.body = "{\"error\":\"Router is not initialized\"}";
     return FinishMcpRequest(std::move(response), trace_state);
   }
 
-  const dbgx::mcp::JsonRpcHttpResult rpc_result = state.router->HandleJsonRpcPost(request.body);
+  const dbgx::mcp::JsonRpcHttpResult rpc_result = router->HandleJsonRpcPost(request.body);
   response.status_code = rpc_result.status_code;
   response.content_type = rpc_result.content_type;
   response.has_body = rpc_result.has_body;

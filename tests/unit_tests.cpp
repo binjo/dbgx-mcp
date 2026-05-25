@@ -2,6 +2,7 @@
 #include "dbgx/mcp/io_echo.hpp"
 #include "dbgx/mcp/http_server.hpp"
 #include "dbgx/mcp/json.hpp"
+#include "dbgx/windbg/catalog.hpp"
 
 #include <iostream>
 #include <string>
@@ -49,6 +50,14 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
 
   dbgx::windbg::CommandExecutionResult SearchMemory(std::uint64_t, std::uint64_t, const std::string&) override {
     return {true, "[]", ""};
+  }
+
+  dbgx::windbg::DebuggerExecutionState GetExecutionState() override {
+    return {1, "break", false, false, true, "Broken in"};
+  }
+
+  bool InterruptTarget() override {
+    return true;
   }
 
   bool should_fail = false;
@@ -471,6 +480,16 @@ void TestToolsCallWithOptions(int* failures) {
   Expect(executor.last_options.pattern == "ntdll", "tools/call should forward pattern", failures);
 }
 
+void TestCatalogSearch(int* failures) {
+  auto results = dbgx::windbg::Catalog::Search("bp");
+  Expect(!results.empty(), "Catalog search for bp should return matches", failures);
+  Expect(results[0].tokens[0] == "bp", "First search match should be bp breakpoint set", failures);
+
+  auto entry = dbgx::windbg::Catalog::GetById("bp_bu_bm_set_breakpoint");
+  Expect(entry.has_value(), "Lookup by ID should return valid entry", failures);
+  Expect(entry->tokens[0] == "bp", "Token should be bp", failures);
+}
+
 }  // namespace
 
 int main() {
@@ -497,6 +516,7 @@ int main() {
   TestIoEchoResponseSummaryCoversSuccessAndError(&failures);
   TestIoEchoResponseSummaryTreatsToolIsErrorAsError(&failures);
   TestIoEchoBlockingLocatabilityStageOrder(&failures);
+  TestCatalogSearch(&failures);
 
   if (failures == 0) {
     std::cout << "All unit tests passed.\n";

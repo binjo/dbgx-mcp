@@ -49,6 +49,7 @@ add_library(dbgx-mcp SHARED
   src/mcp/json.cpp
   src/mcp/json_rpc.cpp
   src/mcp/json_writer.cpp
+  src/windbg/catalog.cpp
   src/windbg/dbgeng_command_executor.cpp
   src/windbg/model_serializer.cpp
   src/dbgx-mcp.cpp
@@ -103,6 +104,7 @@ add_executable(unit_tests
   src/mcp/json.cpp
   src/mcp/json_rpc.cpp
   src/mcp/json_writer.cpp
+  src/windbg/catalog.cpp
   tests/unit_tests.cpp
 )
 

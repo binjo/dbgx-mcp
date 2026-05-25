@@ -139,6 +139,31 @@ RequestIoMeta ParseRequestIoMetaFromBody(std::string_view request_body) {
 
   if (json::TryGetStringField(params_fields, "name", &meta.tool_name)) {
     meta.has_tool_name = true;
+
+    json::FieldMap arguments_fields;
+    if (json::TryGetObjectField(params_fields, "arguments", &arguments_fields, &parse_error)) {
+      if (meta.tool_name == "windbg.eval") {
+        std::string command;
+        if (json::TryGetStringField(arguments_fields, "command", &command)) {
+          meta.detail_info = "command=\"" + command + "\"";
+        }
+      } else if (meta.tool_name == "windbg.dx") {
+        std::string expression;
+        if (json::TryGetStringField(arguments_fields, "expression", &expression)) {
+          meta.detail_info = "expression=\"" + expression + "\"";
+        }
+      } else if (meta.tool_name == "windbg.search_catalog") {
+        std::string query;
+        if (json::TryGetStringField(arguments_fields, "query", &query)) {
+          meta.detail_info = "query=\"" + query + "\"";
+        }
+      } else if (meta.tool_name == "windbg.read_memory") {
+        std::string address;
+        if (json::TryGetStringField(arguments_fields, "address", &address)) {
+          meta.detail_info = "address=" + address;
+        }
+      }
+    }
   }
   return meta;
 }
@@ -192,6 +217,9 @@ void AppendTraceContext(const IoTraceContext* trace_context, std::string* summar
     *summary += " stage=" + TruncateForSummary(trace_context->stage);
   }
   *summary += " duration_ms=" + std::to_string(trace_context->duration_ms);
+  if (!trace_context->detail_info.empty()) {
+    *summary += " " + trace_context->detail_info;
+  }
 }
 
 void AppendRpcRequestMeta(
@@ -223,6 +251,16 @@ void AppendRpcRequestMeta(
 
   if (!tool_name.empty() || rpc_method == "tools/call") {
     *summary += " tool=" + TruncateForSummary(tool_name.empty() ? "(missing)" : tool_name);
+  }
+
+  std::string detail_info;
+  if (trace_context != nullptr && !trace_context->detail_info.empty()) {
+    detail_info = trace_context->detail_info;
+  } else if (!request_meta.detail_info.empty()) {
+    detail_info = request_meta.detail_info;
+  }
+  if (!detail_info.empty()) {
+    *summary += " " + detail_info;
   }
 }
 

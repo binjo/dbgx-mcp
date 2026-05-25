@@ -1,5 +1,5 @@
 #include "dbgx/mcp/json_rpc.hpp"
-
+#include "dbgx/windbg/catalog.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <utility>
@@ -109,7 +109,7 @@ MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
   outcome.result_json =
       "{"
       "\"protocolVersion\":\"" + json::Escape(requested_version) + "\","
-      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg.get_context\",\"windbg.read_memory\",\"windbg.search\"]}},"
+      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg.get_context\",\"windbg.read_memory\",\"windbg.search\",\"windbg.get_execution_state\",\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\"]}},"
       "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING "\"}"
       "}";
   return outcome;
@@ -188,6 +188,49 @@ MethodOutcome HandleToolsList() {
       "\"pattern\":{\"type\":\"string\",\"description\":\"Hex pattern to search for (e.g. '41 42 43')\"}"
       "},"
       "\"required\":[\"start_address\",\"end_address\",\"pattern\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.get_execution_state\","
+      "\"description\":\"Query the current debugger execution state before deciding whether to interrupt or execute a command.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.interrupt\","
+      "\"description\":\"Request a debugger break into the currently running target and wait until debugger commands are accepted again.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.search_catalog\","
+      "\"description\":\"Search the offline debugger command catalog (bp, dt, k, r, etc.) for exact syntax, parameters, and examples.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"query\":{\"type\":\"string\",\"description\":\"Keyword or token to search for\"},"
+      "\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of results to return (default 10)\"}"
+      "},"
+      "\"required\":[\"query\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.get_command_docs\","
+      "\"description\":\"Get full offline documentation for a specific command ID.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"id\":{\"type\":\"string\",\"description\":\"Catalog entry ID (e.g., 'bp_bu_bm_set_breakpoint')\"}"
+      "},"
+      "\"required\":[\"id\"],"
       "\"additionalProperties\":false"
       "}"
       "}"
@@ -278,6 +321,91 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     uint64_t start = strtoull(start_str.c_str(), nullptr, 16);
     uint64_t end = strtoull(end_str.c_str(), nullptr, 16);
     execution = executor->SearchMemory(start, end, pattern);
+    is_json_output = true;
+  } else if (tool_name == "windbg.get_execution_state") {
+    auto state = executor->GetExecutionState();
+    std::string json_out = "{";
+    json_out += "\"raw_status\":" + std::to_string(state.raw_status) + ",";
+    json_out += "\"status_name\":\"" + json::Escape(state.status_name) + "\",";
+    json_out += "\"running\":" + std::string(state.running ? "true" : "false") + ",";
+    json_out += "\"busy\":" + std::string(state.busy ? "true" : "false") + ",";
+    json_out += "\"ready_for_commands\":" + std::string(state.ready_for_commands ? "true" : "false") + ",";
+    json_out += "\"summary\":\"" + json::Escape(state.summary) + "\"";
+    json_out += "}";
+
+    execution.success = true;
+    execution.output = json_out;
+    is_json_output = true;
+  } else if (tool_name == "windbg.interrupt") {
+    bool success = executor->InterruptTarget();
+    std::string json_out = "{\"success\":" + std::string(success ? "true" : "false") + "}";
+    
+    execution.success = true;
+    execution.output = json_out;
+    is_json_output = true;
+  } else if (tool_name == "windbg.search_catalog") {
+    std::string query;
+    json::TryGetStringField(arguments_fields, "query", &query);
+    int limit = 10;
+    json::TryGetIntField(arguments_fields, "limit", &limit);
+
+    auto results = windbg::Catalog::Search(query, limit);
+    std::string json_out = "[";
+    for (size_t i = 0; i < results.size(); ++i) {
+      if (i > 0) json_out += ",";
+      json_out += "{";
+      json_out += "\"id\":\"" + json::Escape(results[i].id) + "\",";
+      json_out += "\"title\":\"" + json::Escape(results[i].title) + "\",";
+      json_out += "\"summary\":\"" + json::Escape(results[i].summary) + "\",";
+      
+      json_out += "\"tokens\":[";
+      for (size_t t = 0; t < results[i].tokens.size(); ++t) {
+        if (t > 0) json_out += ",";
+        json_out += "\"" + json::Escape(results[i].tokens[t]) + "\"";
+      }
+      json_out += "],";
+      
+      json_out += "\"syntax\":\"" + json::Escape(results[i].syntax) + "\"";
+      json_out += "}";
+    }
+    json_out += "]";
+
+    execution.success = true;
+    execution.output = json_out;
+    is_json_output = true;
+  } else if (tool_name == "windbg.get_command_docs") {
+    std::string entry_id;
+    if (!json::TryGetStringField(arguments_fields, "id", &entry_id) || entry_id.empty()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: missing id";
+      return outcome;
+    }
+
+    auto entry = windbg::Catalog::GetById(entry_id);
+    if (!entry.has_value()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: command ID not found in catalog";
+      return outcome;
+    }
+
+    std::string json_out = "{";
+    json_out += "\"id\":\"" + json::Escape(entry->id) + "\",";
+    json_out += "\"title\":\"" + json::Escape(entry->title) + "\",";
+    json_out += "\"summary\":\"" + json::Escape(entry->summary) + "\",";
+    
+    json_out += "\"tokens\":[";
+    for (size_t t = 0; t < entry->tokens.size(); ++t) {
+      if (t > 0) json_out += ",";
+      json_out += "\"" + json::Escape(entry->tokens[t]) + "\"";
+    }
+    json_out += "],";
+    
+    json_out += "\"syntax\":\"" + json::Escape(entry->syntax) + "\",";
+    json_out += "\"documentation\":\"" + json::Escape(entry->documentation) + "\"";
+    json_out += "}";
+
+    execution.success = true;
+    execution.output = json_out;
     is_json_output = true;
   } else {
     outcome.error_code = -32602;
