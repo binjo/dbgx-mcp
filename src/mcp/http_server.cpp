@@ -14,6 +14,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <objbase.h>
 
 namespace dbgx::mcp {
 
@@ -506,20 +507,24 @@ bool HttpServer::Start(
         continue;
       }
 
-      HttpRequest request;
-      std::string parse_error;
-      HttpResponse response;
-      if (ReceiveRequest(client_socket, &request, &parse_error)) {
-        response = impl_->handler(request);
-      } else {
-        response.status_code = 400;
-        response.body = "{\"error\":\"" + parse_error + "\"}";
-      }
+      std::thread([this, client_socket]() {
+        (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        HttpRequest request;
+        std::string parse_error;
+        HttpResponse response;
+        if (ReceiveRequest(client_socket, &request, &parse_error)) {
+          response = impl_->handler(request);
+        } else {
+          response.status_code = 400;
+          response.body = "{\"error\":\"" + parse_error + "\"}";
+        }
 
-      const std::string response_text = BuildHttpResponseText(response);
-      SendAll(client_socket, response_text);
-      shutdown(client_socket, SD_BOTH);
-      closesocket(client_socket);
+        const std::string response_text = BuildHttpResponseText(response);
+        SendAll(client_socket, response_text);
+        shutdown(client_socket, SD_BOTH);
+        closesocket(client_socket);
+        CoUninitialize();
+      }).detach();
     }
 
     impl_->running.store(false);

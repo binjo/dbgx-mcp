@@ -41,6 +41,8 @@ struct ExtensionState {
   std::string registered_file_path;
 };
 
+DWORD g_MainThreadId = 0;
+
 ExtensionState& State() {
   static ExtensionState state;
   return state;
@@ -49,17 +51,19 @@ ExtensionState& State() {
 void LogMessage(const std::string& message) {
   const std::string text = "[windbg-mcp] " + message;
 
-  IDebugClient* debug_client = nullptr;
-  if (SUCCEEDED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(&debug_client))) &&
-      debug_client != nullptr) {
-    IDebugControl* debug_control = nullptr;
-    if (SUCCEEDED(debug_client->QueryInterface(__uuidof(IDebugControl), reinterpret_cast<void**>(&debug_control))) &&
-        debug_control != nullptr) {
-      std::string line = text + "\n";
-      debug_control->Output(DEBUG_OUTPUT_NORMAL, "%s", line.c_str());
-      debug_control->Release();
+  if (GetCurrentThreadId() == g_MainThreadId) {
+    IDebugClient* debug_client = nullptr;
+    if (SUCCEEDED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(&debug_client))) &&
+        debug_client != nullptr) {
+      IDebugControl* debug_control = nullptr;
+      if (SUCCEEDED(debug_client->QueryInterface(__uuidof(IDebugControl), reinterpret_cast<void**>(&debug_control))) &&
+          debug_control != nullptr) {
+        std::string line = text + "\n";
+        debug_control->Output(DEBUG_OUTPUT_NORMAL, "%s", line.c_str());
+        debug_control->Release();
+      }
+      debug_client->Release();
     }
-    debug_client->Release();
   }
 
   std::string fallback_line = text + "\n";
@@ -328,6 +332,8 @@ void Cleanup() {
 }  // namespace
 
 extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flags) {
+  g_MainThreadId = GetCurrentThreadId();
+
   if (version != nullptr) {
     *version = DEBUG_EXTENSION_VERSION(1, 0);
   }
@@ -378,6 +384,8 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
 
   LogMessage("HTTP MCP server listening on http://" + bind_host + ":" + std::to_string(state.server->BoundPort()) +
              "/mcp");
+  LogMessage("  * Background request logs are written to %TEMP%\\dbgx-mcp-extension.log to prevent UI deadlocks.");
+  LogMessage("  * AI background tool executions will display '[Background Job]' status indicators in this window.");
   return S_OK;
 }
 

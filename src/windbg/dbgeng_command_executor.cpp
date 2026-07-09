@@ -142,6 +142,22 @@ HRESULT EvaluateExtendedExpressionSafe(
 }  // namespace
 
 DbgEngCommandExecutor::DbgEngCommandExecutor() {
+  if (SUCCEEDED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client_.GetAddressOf())))) {
+    (void)client_.As(&control_);
+  }
+
+  // Create a separate IDebugControl in the MTA so background HTTP threads can call SetInterrupt 
+  // directly without COM marshalling to the main thread (which lacks a message pump in headless cdb.exe).
+  std::thread init_thread([this]() {
+    (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    Microsoft::WRL::ComPtr<IDebugClient> mta_client;
+    if (SUCCEEDED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(mta_client.GetAddressOf())))) {
+      (void)mta_client.As(&interrupt_control_);
+    }
+    CoUninitialize();
+  });
+  init_thread.join();
+
   worker_thread_ = std::thread(&DbgEngCommandExecutor::WorkerThreadProc, this);
 }
 
@@ -179,6 +195,7 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
 }
 
 void DbgEngCommandExecutor::WorkerThreadProc() {
+  (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   while (true) {
     ExecutionTask task;
     {
@@ -194,6 +211,7 @@ void DbgEngCommandExecutor::WorkerThreadProc() {
     CommandExecutionResult result = ExecuteSynchronously(task.command, task.options);
     task.promise.set_value(result);
   }
+  CoUninitialize();
 }
 
 CommandExecutionResult DbgEngCommandExecutor::ExecuteSynchronously(const std::string& command, const CommandExecutionOptions& options) {
@@ -235,7 +253,11 @@ CommandExecutionResult DbgEngCommandExecutor::ExecuteSynchronously(const std::st
     };
   }
 
+  control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL, "[windbg-mcp] [Background Job] Executing: %s\n", command.c_str());
+
   hr = control->Execute(DEBUG_OUTCTL_THIS_CLIENT, command.c_str(), DEBUG_EXECUTE_DEFAULT);
+
+  control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL, "[windbg-mcp] [Background Job] Completed. (Status: %s)\n", SUCCEEDED(hr) ? "Success" : "Failed/Interrupted");
 
   (void)client->SetOutputCallbacks(previous_callbacks.Get());
 
@@ -258,33 +280,25 @@ CommandExecutionResult DbgEngCommandExecutor::ExecuteSynchronously(const std::st
 }
 
 DebuggerExecutionState DbgEngCommandExecutor::GetExecutionState() {
-  Microsoft::WRL::ComPtr<IDebugClient> client;
-  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
-    return {};
-  }
-  Microsoft::WRL::ComPtr<IDebugControl> control;
-  if (FAILED(client.As(&control))) {
+  if (control_ == nullptr) {
     return {};
   }
 
   ULONG raw_status = 0;
-  if (FAILED(control->GetExecutionStatus(&raw_status))) {
+  if (FAILED(control_->GetExecutionStatus(&raw_status))) {
     return {};
   }
   return ParseRawStatus(raw_status);
 }
 
 bool DbgEngCommandExecutor::InterruptTarget() {
-  Microsoft::WRL::ComPtr<IDebugClient> client;
-  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
-    return false;
+  if (interrupt_control_ != nullptr) {
+    return SUCCEEDED(interrupt_control_->SetInterrupt(DEBUG_INTERRUPT_ACTIVE));
   }
-  Microsoft::WRL::ComPtr<IDebugControl> control;
-  if (FAILED(client.As(&control))) {
-    return false;
+  if (control_ != nullptr) {
+    return SUCCEEDED(control_->SetInterrupt(DEBUG_INTERRUPT_ACTIVE));
   }
-
-  return SUCCEEDED(control->SetInterrupt(DEBUG_INTERRUPT_ACTIVE));
+  return false;
 }
 
 DebuggerExecutionState DbgEngCommandExecutor::ParseRawStatus(std::uint32_t raw_status) {
