@@ -16,6 +16,7 @@ struct RequestIoMeta {
   std::string rpc_method;
   std::string rpc_id_raw;
   std::string tool_name;
+  std::string detail_info;
 };
 
 struct IoTraceContext {
@@ -26,6 +27,7 @@ struct IoTraceContext {
   std::string tool_name;
   std::string outcome;
   std::uint64_t duration_ms = 0;
+  std::string detail_info;
 };
 
 RequestIoMeta ParseRequestIoMeta(const HttpRequest& request);

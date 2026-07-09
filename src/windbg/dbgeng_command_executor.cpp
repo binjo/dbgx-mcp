@@ -141,7 +141,62 @@ HRESULT EvaluateExtendedExpressionSafe(
 
 }  // namespace
 
+DbgEngCommandExecutor::DbgEngCommandExecutor() {
+  worker_thread_ = std::thread(&DbgEngCommandExecutor::WorkerThreadProc, this);
+}
+
+DbgEngCommandExecutor::~DbgEngCommandExecutor() {
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    shutdown_ = true;
+  }
+  cv_.notify_one();
+  if (worker_thread_.joinable()) {
+    worker_thread_.join();
+  }
+}
+
 CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command, const CommandExecutionOptions& options) {
+  auto state = GetExecutionState();
+  if (!state.ready_for_commands) {
+    return {
+        false,
+        "",
+        "Debugger is not ready for commands (status: " + state.status_name + "). "
+        "Query execution state first and call windbg.interrupt if you need to break in."
+    };
+  }
+
+  std::promise<CommandExecutionResult> promise;
+  std::future<CommandExecutionResult> future = promise.get_future();
+
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    task_queue_.push(ExecutionTask{command, options, std::move(promise)});
+  }
+  cv_.notify_one();
+  return future.get();
+}
+
+void DbgEngCommandExecutor::WorkerThreadProc() {
+  while (true) {
+    ExecutionTask task;
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex_);
+      cv_.wait(lock, [this] { return shutdown_ || !task_queue_.empty(); });
+      if (shutdown_ && task_queue_.empty()) {
+        break;
+      }
+      task = std::move(task_queue_.front());
+      task_queue_.pop();
+    }
+
+    CommandExecutionResult result = ExecuteSynchronously(task.command, task.options);
+    task.promise.set_value(result);
+  }
+}
+
+CommandExecutionResult DbgEngCommandExecutor::ExecuteSynchronously(const std::string& command, const CommandExecutionOptions& options) {
   if (command.empty()) {
     return {false, "", "Command cannot be empty"};
   }
@@ -200,6 +255,64 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
       output,
       "",
   };
+}
+
+DebuggerExecutionState DbgEngCommandExecutor::GetExecutionState() {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {};
+  }
+  Microsoft::WRL::ComPtr<IDebugControl> control;
+  if (FAILED(client.As(&control))) {
+    return {};
+  }
+
+  ULONG raw_status = 0;
+  if (FAILED(control->GetExecutionStatus(&raw_status))) {
+    return {};
+  }
+  return ParseRawStatus(raw_status);
+}
+
+bool DbgEngCommandExecutor::InterruptTarget() {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return false;
+  }
+  Microsoft::WRL::ComPtr<IDebugControl> control;
+  if (FAILED(client.As(&control))) {
+    return false;
+  }
+
+  return SUCCEEDED(control->SetInterrupt(DEBUG_INTERRUPT_ACTIVE));
+}
+
+DebuggerExecutionState DbgEngCommandExecutor::ParseRawStatus(std::uint32_t raw_status) {
+  DebuggerExecutionState state;
+  state.raw_status = raw_status;
+  
+  switch (raw_status) {
+    case DEBUG_STATUS_GO:
+      state.status_name = "go";
+      state.running = true;
+      state.summary = "The target is running.";
+      break;
+    case DEBUG_STATUS_BREAK:
+      state.status_name = "break";
+      state.ready_for_commands = true;
+      state.summary = "The target is broken in and ready for commands.";
+      break;
+    case DEBUG_STATUS_NO_DEBUGGEE:
+      state.status_name = "no_debuggee";
+      state.summary = "No debuggee is active.";
+      break;
+    default:
+      state.status_name = "busy";
+      state.busy = true;
+      state.summary = "The debugger is busy or processing events.";
+      break;
+  }
+  return state;
 }
 
 CommandExecutionResult DbgEngCommandExecutor::EvaluateModel(const std::string& expression, int max_depth) {
