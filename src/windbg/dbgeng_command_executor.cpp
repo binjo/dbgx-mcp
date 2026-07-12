@@ -335,12 +335,6 @@ CommandExecutionResult DbgEngCommandExecutor::EvaluateModel(const std::string& e
     return {false, "", "DebugCreate failed"};
   }
 
-  Microsoft::WRL::ComPtr<IDebugControl> control;
-  if (SUCCEEDED(client.As(&control))) {
-    control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL, "[windbg-mcp] [Background Job] Calling: windbg.dx (expression: %s)\n", expression.c_str());
-    client->FlushCallbacks();
-  }
-
   Microsoft::WRL::ComPtr<IHostDataModelAccess> access;
   if (FAILED(client.As(&access))) {
     return {false, "", "IHostDataModelAccess not available"};
@@ -376,12 +370,6 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshot() {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
-  }
-
-  Microsoft::WRL::ComPtr<IDebugControl> init_control;
-  if (SUCCEEDED(client.As(&init_control))) {
-    init_control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL, "[windbg-mcp] [Background Job] Calling: windbg.get_context\n");
-    client->FlushCallbacks();
   }
 
   mcp::JsonWriter writer;
@@ -452,12 +440,6 @@ CommandExecutionResult DbgEngCommandExecutor::ReadMemory(std::uint64_t address, 
     return {false, "", "DebugCreate failed"};
   }
 
-  Microsoft::WRL::ComPtr<IDebugControl> control;
-  if (SUCCEEDED(client.As(&control))) {
-    control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL, "[windbg-mcp] [Background Job] Calling: windbg.read_memory (address: 0x%I64x, length: %u)\n", address, length);
-    client->FlushCallbacks();
-  }
-
   Microsoft::WRL::ComPtr<IDebugDataSpaces> data;
   if (FAILED(client.As(&data))) {
     return {false, "", "IDebugDataSpaces not available"};
@@ -487,12 +469,6 @@ CommandExecutionResult DbgEngCommandExecutor::WriteMemory(std::uint64_t address,
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
-  }
-
-  Microsoft::WRL::ComPtr<IDebugControl> control;
-  if (SUCCEEDED(client.As(&control))) {
-    control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL, "[windbg-mcp] [Background Job] Calling: windbg.write_memory (address: 0x%I64x, data: %s)\n", address, hex_data.c_str());
-    client->FlushCallbacks();
   }
 
   Microsoft::WRL::ComPtr<IDebugDataSpaces> data;
@@ -540,12 +516,6 @@ CommandExecutionResult DbgEngCommandExecutor::SearchMemory(
     return {false, "", "DebugCreate failed"};
   }
 
-  Microsoft::WRL::ComPtr<IDebugControl> control;
-  if (SUCCEEDED(client.As(&control))) {
-    control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL, "[windbg-mcp] [Background Job] Calling: windbg.search (start: 0x%I64x, end: 0x%I64x, pattern: %s)\n", start_address, end_address, pattern.c_str());
-    client->FlushCallbacks();
-  }
-
   Microsoft::WRL::ComPtr<IDebugDataSpaces> data;
   if (FAILED(client.As(&data))) {
     return {false, "", "IDebugDataSpaces not available"};
@@ -588,12 +558,6 @@ CommandExecutionResult DbgEngCommandExecutor::GetThreads() {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
-  }
-
-  Microsoft::WRL::ComPtr<IDebugControl> control;
-  if (SUCCEEDED(client.As(&control))) {
-    control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL, "[windbg-mcp] [Background Job] Calling: windbg.get_threads\n");
-    client->FlushCallbacks();
   }
 
   Microsoft::WRL::ComPtr<IDebugSystemObjects> systems;
