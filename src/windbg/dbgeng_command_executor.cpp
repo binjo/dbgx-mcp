@@ -465,6 +465,123 @@ CommandExecutionResult DbgEngCommandExecutor::ReadMemory(std::uint64_t address, 
   return {true, hex, ""};
 }
 
+CommandExecutionResult DbgEngCommandExecutor::CarvePE(std::uint64_t address, std::uint32_t length) {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugDataSpaces> data;
+  if (FAILED(client.As(&data))) {
+    return {false, "", "IDebugDataSpaces not available"};
+  }
+
+  // Limit raw read to 10MB to avoid excessive heap allocations
+  if (length > 10 * 1024 * 1024) length = 10 * 1024 * 1024;
+  std::vector<unsigned char> mem_data(length);
+  ULONG bytes_read = 0;
+  HRESULT hr = data->ReadVirtual(address, mem_data.data(), length, &bytes_read);
+  if (FAILED(hr) && bytes_read == 0) {
+    return {false, "", "ReadVirtual failed: " + HResultToString(hr)};
+  }
+  mem_data.resize(bytes_read);
+
+  if (mem_data.size() < 64 || mem_data[0] != 'M' || mem_data[1] != 'Z') {
+    return {false, "", "Address does not contain a valid MZ PE header"};
+  }
+
+  std::uint32_t pe_offset = 0;
+  std::memcpy(&pe_offset, &mem_data[0x3c], 4);
+  if (pe_offset + 248 > mem_data.size()) {
+    return {false, "", "PE offset goes out of bounds"};
+  }
+
+  if (mem_data[pe_offset] != 'P' || mem_data[pe_offset+1] != 'E' ||
+      mem_data[pe_offset+2] != 0 || mem_data[pe_offset+3] != 0) {
+    return {false, "", "PE signature not found at offset " + std::to_string(pe_offset)};
+  }
+
+  std::uint16_t num_sections = 0;
+  std::memcpy(&num_sections, &mem_data[pe_offset + 6], 2);
+
+  std::uint16_t optional_header_size = 0;
+  std::memcpy(&optional_header_size, &mem_data[pe_offset + 20], 2);
+
+  std::uint32_t section_tbl_offset = pe_offset + 24 + optional_header_size;
+  if (section_tbl_offset + (num_sections * 40) > mem_data.size()) {
+    return {false, "", "Section table goes out of bounds"};
+  }
+
+  struct SectionInfo {
+    char name[8];
+    std::uint32_t vsize;
+    std::uint32_t vaddr;
+    std::uint32_t psize;
+    std::uint32_t paddr;
+  };
+
+  std::vector<SectionInfo> sections;
+  std::uint32_t max_end_paddr = 0;
+  std::uint32_t min_paddr = 0xffffffff;
+
+  for (std::uint16_t i = 0; i < num_sections; ++i) {
+    std::uint32_t offset = section_tbl_offset + i * 40;
+    SectionInfo sect;
+    std::memcpy(sect.name, &mem_data[offset], 8);
+    std::memcpy(&sect.vsize, &mem_data[offset + 8], 4);
+    std::memcpy(&sect.vaddr, &mem_data[offset + 12], 4);
+    std::memcpy(&sect.psize, &mem_data[offset + 16], 4);
+    std::memcpy(&sect.paddr, &mem_data[offset + 20], 4);
+
+    sections.push_back(sect);
+    if (sect.paddr + sect.psize > max_end_paddr) {
+      max_end_paddr = sect.paddr + sect.psize;
+    }
+    if (sect.paddr < min_paddr && sect.paddr > 0) {
+      min_paddr = sect.paddr;
+    }
+  }
+
+  if (sections.empty() || max_end_paddr == 0) {
+    return {false, "", "No sections found or invalid raw size"};
+  }
+
+  std::uint32_t headers_size = (min_paddr == 0xffffffff) ? 0x200 : min_paddr;
+  if (headers_size > mem_data.size()) {
+    headers_size = (std::uint32_t)mem_data.size();
+  }
+
+  std::vector<unsigned char> disk_data(max_end_paddr, 0);
+
+  // 1. Copy headers
+  std::memcpy(disk_data.data(), mem_data.data(), headers_size);
+
+  // 2. Map sections from memory aligned view to file aligned view
+  for (const auto& sect : sections) {
+    if (sect.vaddr >= mem_data.size()) {
+      continue;
+    }
+    std::uint32_t copy_size = sect.psize;
+    if (sect.vaddr + copy_size > mem_data.size()) {
+      copy_size = (std::uint32_t)mem_data.size() - sect.vaddr;
+    }
+    if (sect.paddr + copy_size > disk_data.size()) {
+      copy_size = (std::uint32_t)disk_data.size() - sect.paddr;
+    }
+    std::memcpy(disk_data.data() + sect.paddr, mem_data.data() + sect.vaddr, copy_size);
+  }
+
+  std::string hex;
+  hex.reserve(disk_data.size() * 2);
+  static const char* kDigits = "0123456789abcdef";
+  for (size_t i = 0; i < disk_data.size(); ++i) {
+    hex.push_back(kDigits[disk_data[i] >> 4]);
+    hex.push_back(kDigits[disk_data[i] & 0x0f]);
+  }
+
+  return {true, hex, ""};
+}
+
 CommandExecutionResult DbgEngCommandExecutor::WriteMemory(std::uint64_t address, const std::string& hex_data) {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {

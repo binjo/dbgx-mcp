@@ -52,6 +52,10 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
     return {true, "{\"bytes_written\":2}", ""};
   }
 
+  dbgx::windbg::CommandExecutionResult CarvePE(std::uint64_t, std::uint32_t) override {
+    return {true, "4d5a0000", ""};
+  }
+
   dbgx::windbg::CommandExecutionResult SearchMemory(std::uint64_t, std::uint64_t, const std::string&) override {
     return {true, "[]", ""};
   }
@@ -523,6 +527,17 @@ void TestToolsCallWriteMemory(int* failures) {
   Expect(Contains(result.body, "bytes_written"), "write_memory should return bytes_written", failures);
 }
 
+void TestToolsCallCarvePE(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":66,"method":"tools/call","params":{"name":"windbg.carve_pe","arguments":{"address":"0x18517130000","length":40960}}})");
+
+  Expect(result.status_code == 200, "carve_pe should return HTTP 200", failures);
+  Expect(Contains(result.body, "4d5a0000"), "carve_pe should return reconstructed PE hex data", failures);
+}
+
 void TestToolsCallGetThreads(int* failures) {
   FakeExecutor executor;
   dbgx::mcp::JsonRpcRouter router(&executor);
@@ -565,6 +580,7 @@ int main() {
   TestCatalogSearch(&failures);
   TestToolsCallGetSessionMetadata(&failures);
   TestToolsCallWriteMemory(&failures);
+  TestToolsCallCarvePE(&failures);
   TestToolsCallGetThreads(&failures);
 
   if (failures == 0) {

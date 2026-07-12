@@ -178,6 +178,19 @@ MethodOutcome HandleToolsList() {
       "}"
       "},"
       "{"
+      "\"name\":\"windbg.carve_pe\","
+      "\"description\":\"Carve and reconstruct a Portable Executable (PE) image (DLL/EXE) directly from the target's virtual memory back into standard disk layout, resolving section offsets dynamically.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex base address of the mapped PE image in memory\"},"
+      "\"length\":{\"type\":\"integer\",\"description\":\"Estimated virtual size of the image to read (e.g. 40960 for 40KB)\"}"
+      "},"
+      "\"required\":[\"address\",\"length\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
       "\"name\":\"windbg.search\","
       "\"description\":\"Search virtual memory for a byte pattern.\","
       "\"inputSchema\":{"
@@ -340,6 +353,17 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     }
     uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
     execution = executor->ReadMemory(address, (uint32_t)length);
+  } else if (tool_name == "windbg.carve_pe") {
+    std::string addr_str;
+    int length = 0;
+    if (!json::TryGetStringField(arguments_fields, "address", &addr_str) ||
+        !json::TryGetIntField(arguments_fields, "length", &length)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: address and length are required";
+      return outcome;
+    }
+    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
+    execution = executor->CarvePE(address, (uint32_t)length);
   } else if (tool_name == "windbg.search") {
     std::string start_str, end_str, pattern;
     if (!json::TryGetStringField(arguments_fields, "start_address", &start_str) ||

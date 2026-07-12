@@ -20,6 +20,7 @@ class DbgEngCommandExecutor final : public IWinDbgCommandExecutor {
   CommandExecutionResult GetContextSnapshot() override;
   CommandExecutionResult ReadMemory(std::uint64_t address, std::uint32_t length) override;
   CommandExecutionResult WriteMemory(std::uint64_t address, const std::string& hex_data) override;
+  CommandExecutionResult CarvePE(std::uint64_t address, std::uint32_t length) override;
   CommandExecutionResult SearchMemory(
       std::uint64_t start_address,
       std::uint64_t end_address,
