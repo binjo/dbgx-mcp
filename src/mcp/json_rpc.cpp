@@ -233,6 +233,37 @@ MethodOutcome HandleToolsList() {
       "\"required\":[\"id\"],"
       "\"additionalProperties\":false"
       "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.get_session_metadata\","
+      "\"description\":\"Get metadata for the current WinDbg session, such as process ID, architecture (e.g. x64, x86, arm64), debuggee class (user/kernel mode), executable name, and target info.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.write_memory\","
+      "\"description\":\"Write virtual memory in the target process. Safe way to patch code, edit variables, or write memory structures directly.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address to write to\"},"
+      "\"data\":{\"type\":\"string\",\"description\":\"Hexadecimal representation of bytes to write (e.g. '9090' to write two NOP instructions)\"}"
+      "},"
+      "\"required\":[\"address\",\"data\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.get_threads\","
+      "\"description\":\"List all active threads in the current target process, including WinDbg index, system thread ID (TID), and whether it is the currently selected thread.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{},"
+      "\"additionalProperties\":false"
+      "}"
       "}"
       "]"
       "}";
@@ -406,6 +437,33 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
 
     execution.success = true;
     execution.output = json_out;
+    is_json_output = true;
+  } else if (tool_name == "windbg.get_session_metadata") {
+    auto meta = executor->GetSessionMetadata();
+    std::string json_out = "{";
+    json_out += "\"process_id\":" + std::to_string(meta.process_id) + ",";
+    json_out += "\"executable_name\":\"" + json::Escape(meta.executable_name) + "\",";
+    json_out += "\"target_info\":\"" + json::Escape(meta.target_info) + "\",";
+    json_out += "\"architecture\":\"" + json::Escape(meta.architecture) + "\",";
+    json_out += "\"debuggee_class\":\"" + json::Escape(meta.debuggee_class) + "\"";
+    json_out += "}";
+
+    execution.success = true;
+    execution.output = json_out;
+    is_json_output = true;
+  } else if (tool_name == "windbg.write_memory") {
+    std::string addr_str, hex_data;
+    if (!json::TryGetStringField(arguments_fields, "address", &addr_str) ||
+        !json::TryGetStringField(arguments_fields, "data", &hex_data)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: address and data are required";
+      return outcome;
+    }
+    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
+    execution = executor->WriteMemory(address, hex_data);
+    is_json_output = true;
+  } else if (tool_name == "windbg.get_threads") {
+    execution = executor->GetThreads();
     is_json_output = true;
   } else {
     outcome.error_code = -32602;

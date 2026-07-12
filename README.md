@@ -320,6 +320,51 @@ Safety behavior remains unchanged:
 }
 ```
 
+### `tools/call` (`windbg.get_session_metadata`)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "windbg.get_session_metadata",
+    "arguments": {}
+  }
+}
+```
+
+### `tools/call` (`windbg.write_memory`)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "tools/call",
+  "params": {
+    "name": "windbg.write_memory",
+    "arguments": {
+      "address": "0x00401000",
+      "data": "9090"
+    }
+  }
+}
+```
+
+### `tools/call` (`windbg.get_threads`)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "tools/call",
+  "params": {
+    "name": "windbg.get_threads",
+    "arguments": {}
+  }
+}
+```
+
 ## Security Notes (MVP)
 
 - Binds to `127.0.0.1` only.

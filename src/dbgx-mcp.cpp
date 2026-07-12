@@ -105,6 +105,8 @@ void RegisterSession(std::uint16_t port) {
       << ",\"target_pid\":" << meta.process_id
       << ",\"executable\":\"" << dbgx::json::Escape(meta.executable_name) << "\""
       << ",\"info\":\"" << dbgx::json::Escape(meta.target_info) << "\""
+      << ",\"architecture\":\"" << dbgx::json::Escape(meta.architecture) << "\""
+      << ",\"debuggee_class\":\"" << dbgx::json::Escape(meta.debuggee_class) << "\""
       << "}";
     state.registered_file_path = file_path.string();
   }

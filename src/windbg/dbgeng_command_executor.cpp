@@ -465,6 +465,48 @@ CommandExecutionResult DbgEngCommandExecutor::ReadMemory(std::uint64_t address, 
   return {true, hex, ""};
 }
 
+CommandExecutionResult DbgEngCommandExecutor::WriteMemory(std::uint64_t address, const std::string& hex_data) {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugDataSpaces> data;
+  if (FAILED(client.As(&data))) {
+    return {false, "", "IDebugDataSpaces not available"};
+  }
+
+  std::vector<unsigned char> buffer;
+  buffer.reserve(hex_data.size() / 2);
+  for (size_t i = 0; i < hex_data.size(); ++i) {
+    if (isxdigit(hex_data[i])) {
+      if (i + 1 < hex_data.size() && isxdigit(hex_data[i + 1])) {
+        char hex[3] = {hex_data[i], hex_data[i + 1], 0};
+        buffer.push_back(static_cast<unsigned char>(strtoul(hex, nullptr, 16)));
+        i++;
+      }
+    }
+  }
+
+  if (buffer.empty()) {
+    return {false, "", "Empty or invalid hex data"};
+  }
+
+  ULONG bytes_written = 0;
+  HRESULT hr = data->WriteVirtual(address, buffer.data(), (ULONG)buffer.size(), &bytes_written);
+  if (FAILED(hr)) {
+    return {false, "", "WriteVirtual failed: " + HResultToString(hr)};
+  }
+
+  mcp::JsonWriter writer;
+  writer.StartObject();
+  writer.Key("bytes_written");
+  writer.IntValue(bytes_written);
+  writer.EndObject();
+
+  return {true, writer.GetJSON(), ""};
+}
+
 CommandExecutionResult DbgEngCommandExecutor::SearchMemory(
     std::uint64_t start_address,
     std::uint64_t end_address,
@@ -512,6 +554,48 @@ CommandExecutionResult DbgEngCommandExecutor::SearchMemory(
   return {true, writer.GetJSON(), ""};
 }
 
+CommandExecutionResult DbgEngCommandExecutor::GetThreads() {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugSystemObjects> systems;
+  if (FAILED(client.As(&systems))) {
+    return {false, "", "IDebugSystemObjects not available"};
+  }
+
+  ULONG num_threads = 0;
+  if (FAILED(systems->GetNumberThreads(&num_threads)) || num_threads == 0) {
+    return {false, "", "Failed to get thread count or no threads active"};
+  }
+
+  std::vector<ULONG> ids(num_threads);
+  std::vector<ULONG> sys_ids(num_threads);
+  if (FAILED(systems->GetThreadIdsByIndex(0, num_threads, ids.data(), sys_ids.data()))) {
+    return {false, "", "GetThreadIdsByIndex failed"};
+  }
+
+  ULONG current_id = 0;
+  systems->GetCurrentThreadId(&current_id);
+
+  mcp::JsonWriter writer;
+  writer.StartArray();
+  for (ULONG i = 0; i < num_threads; ++i) {
+    writer.StartObject();
+    writer.Key("thread_index");
+    writer.IntValue(ids[i]);
+    writer.Key("system_thread_id");
+    writer.IntValue(sys_ids[i]);
+    writer.Key("is_current");
+    writer.BoolValue(ids[i] == current_id);
+    writer.EndObject();
+  }
+  writer.EndArray();
+
+  return {true, writer.GetJSON(), ""};
+}
+
 SessionMetadata DbgEngCommandExecutor::GetSessionMetadata() {
   SessionMetadata metadata;
   metadata.process_id = GetCurrentProcessId();
@@ -540,6 +624,34 @@ SessionMetadata DbgEngCommandExecutor::GetSessionMetadata() {
     ULONG qual = 0;
     if (SUCCEEDED(control->GetDebuggeeType(&type, &qual))) {
       metadata.target_info = "Type=" + std::to_string(type) + ", Qual=" + std::to_string(qual);
+      if (type == DEBUG_CLASS_USER_WINDOWS) {
+        metadata.debuggee_class = "user";
+      } else if (type == DEBUG_CLASS_KERNEL) {
+        metadata.debuggee_class = "kernel";
+      } else {
+        metadata.debuggee_class = "other (" + std::to_string(type) + ")";
+      }
+    }
+
+    ULONG proc_type = 0;
+    if (SUCCEEDED(control->GetEffectiveProcessorType(&proc_type))) {
+      switch (proc_type) {
+        case IMAGE_FILE_MACHINE_I386:
+          metadata.architecture = "x86";
+          break;
+        case IMAGE_FILE_MACHINE_AMD64:
+          metadata.architecture = "x64";
+          break;
+        case IMAGE_FILE_MACHINE_ARM64:
+          metadata.architecture = "arm64";
+          break;
+        case IMAGE_FILE_MACHINE_ARM:
+          metadata.architecture = "arm";
+          break;
+        default:
+          metadata.architecture = "unknown (0x" + std::to_string(proc_type) + ")";
+          break;
+      }
     }
   }
 

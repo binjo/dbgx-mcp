@@ -33,7 +33,7 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
   }
 
   dbgx::windbg::SessionMetadata GetSessionMetadata() override {
-    return {1234, "test.exe", "Live Session"};
+    return {1234, "test.exe", "Live Session", "x64", "user"};
   }
 
   dbgx::windbg::CommandExecutionResult EvaluateModel(const std::string&, int) override {
@@ -48,8 +48,16 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
     return {true, "00", ""};
   }
 
+  dbgx::windbg::CommandExecutionResult WriteMemory(std::uint64_t, const std::string&) override {
+    return {true, "{\"bytes_written\":2}", ""};
+  }
+
   dbgx::windbg::CommandExecutionResult SearchMemory(std::uint64_t, std::uint64_t, const std::string&) override {
     return {true, "[]", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult GetThreads() override {
+    return {true, "[{\"thread_index\":0,\"system_thread_id\":9999,\"is_current\":true}]", ""};
   }
 
   dbgx::windbg::DebuggerExecutionState GetExecutionState() override {
@@ -490,6 +498,44 @@ void TestCatalogSearch(int* failures) {
   Expect(entry->tokens[0] == "bp", "Token should be bp", failures);
 }
 
+void TestToolsCallGetSessionMetadata(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"windbg.get_session_metadata","arguments":{}}})");
+
+  Expect(result.status_code == 200, "get_session_metadata should return HTTP 200", failures);
+  Expect(Contains(result.body, "process_id"), "get_session_metadata should return process_id", failures);
+  Expect(Contains(result.body, "test.exe"), "get_session_metadata should return executable name", failures);
+  Expect(Contains(result.body, "x64"), "get_session_metadata should return x64 architecture", failures);
+  Expect(Contains(result.body, "user"), "get_session_metadata should return user debuggee_class", failures);
+}
+
+void TestToolsCallWriteMemory(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"windbg.write_memory","arguments":{"address":"0x1000","data":"9090"}}})");
+
+  Expect(result.status_code == 200, "write_memory should return HTTP 200", failures);
+  Expect(Contains(result.body, "bytes_written"), "write_memory should return bytes_written", failures);
+}
+
+void TestToolsCallGetThreads(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"windbg.get_threads","arguments":{}}})");
+
+  Expect(result.status_code == 200, "get_threads should return HTTP 200", failures);
+  Expect(Contains(result.body, "thread_index"), "get_threads should return thread_index", failures);
+  Expect(Contains(result.body, "system_thread_id"), "get_threads should return system_thread_id", failures);
+  Expect(Contains(result.body, "is_current"), "get_threads should return is_current", failures);
+}
+
 }  // namespace
 
 int main() {
@@ -517,6 +563,9 @@ int main() {
   TestIoEchoResponseSummaryTreatsToolIsErrorAsError(&failures);
   TestIoEchoBlockingLocatabilityStageOrder(&failures);
   TestCatalogSearch(&failures);
+  TestToolsCallGetSessionMetadata(&failures);
+  TestToolsCallWriteMemory(&failures);
+  TestToolsCallGetThreads(&failures);
 
   if (failures == 0) {
     std::cout << "All unit tests passed.\n";
