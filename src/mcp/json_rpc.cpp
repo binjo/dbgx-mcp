@@ -71,7 +71,7 @@ std::string PrettyPrintJson(std::string_view json) {
       pretty.push_back(c);
       continue;
     }
-    
+
     if (c == '{' || c == '[') {
       pretty.push_back(c);
       pretty.push_back('\n');
@@ -109,7 +109,7 @@ MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
   outcome.result_json =
       "{"
       "\"protocolVersion\":\"" + json::Escape(requested_version) + "\","
-      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg.get_context\",\"windbg.read_memory\",\"windbg.search\",\"windbg.get_execution_state\",\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\"]}},"
+      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg.get_context\",\"windbg.read_memory\",\"windbg.carve_pe\",\"windbg.search\",\"windbg.get_execution_state\",\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\",\"windbg.get_session_metadata\",\"windbg.write_memory\",\"windbg.get_threads\"]}},"
       "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING "\"}"
       "}";
   return outcome;
@@ -394,7 +394,7 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
   } else if (tool_name == "windbg.interrupt") {
     bool success = executor->InterruptTarget();
     std::string json_out = "{\"success\":" + std::string(success ? "true" : "false") + "}";
-    
+
     execution.success = true;
     execution.output = json_out;
     is_json_output = true;
@@ -412,14 +412,14 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
       json_out += "\"id\":\"" + json::Escape(results[i].id) + "\",";
       json_out += "\"title\":\"" + json::Escape(results[i].title) + "\",";
       json_out += "\"summary\":\"" + json::Escape(results[i].summary) + "\",";
-      
+
       json_out += "\"tokens\":[";
       for (size_t t = 0; t < results[i].tokens.size(); ++t) {
         if (t > 0) json_out += ",";
         json_out += "\"" + json::Escape(results[i].tokens[t]) + "\"";
       }
       json_out += "],";
-      
+
       json_out += "\"syntax\":\"" + json::Escape(results[i].syntax) + "\"";
       json_out += "}";
     }
@@ -447,14 +447,14 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     json_out += "\"id\":\"" + json::Escape(entry->id) + "\",";
     json_out += "\"title\":\"" + json::Escape(entry->title) + "\",";
     json_out += "\"summary\":\"" + json::Escape(entry->summary) + "\",";
-    
+
     json_out += "\"tokens\":[";
     for (size_t t = 0; t < entry->tokens.size(); ++t) {
       if (t > 0) json_out += ",";
       json_out += "\"" + json::Escape(entry->tokens[t]) + "\"";
     }
     json_out += "],";
-    
+
     json_out += "\"syntax\":\"" + json::Escape(entry->syntax) + "\",";
     json_out += "\"documentation\":\"" + json::Escape(entry->documentation) + "\"";
     json_out += "}";
@@ -496,7 +496,7 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
   }
 
   const std::string payload_text = execution.success
-                                       ? (execution.output.empty() ? "(no output)" : 
+                                       ? (execution.output.empty() ? "(no output)" :
                                            (is_json_output ? PrettyPrintJson(execution.output) : execution.output))
                                        : (execution.error_message.empty() ? "Command execution failed"
                                                                           : execution.error_message);

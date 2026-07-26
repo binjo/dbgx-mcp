@@ -142,6 +142,54 @@ def case_initialize(
         "windbg.eval" in available_tools_list,
         "initialize must advertise windbg.eval in availableTools",
     )
+    expect(
+        "windbg.dx" in available_tools_list,
+        "initialize must advertise windbg.dx in availableTools",
+    )
+    expect(
+        "windbg.get_context" in available_tools_list,
+        "initialize must advertise windbg.get_context in availableTools",
+    )
+    expect(
+        "windbg.read_memory" in available_tools_list,
+        "initialize must advertise windbg.read_memory in availableTools",
+    )
+    expect(
+        "windbg.carve_pe" in available_tools_list,
+        "initialize must advertise windbg.carve_pe in availableTools",
+    )
+    expect(
+        "windbg.search" in available_tools_list,
+        "initialize must advertise windbg.search in availableTools",
+    )
+    expect(
+        "windbg.get_execution_state" in available_tools_list,
+        "initialize must advertise windbg.get_execution_state in availableTools",
+    )
+    expect(
+        "windbg.interrupt" in available_tools_list,
+        "initialize must advertise windbg.interrupt in availableTools",
+    )
+    expect(
+        "windbg.search_catalog" in available_tools_list,
+        "initialize must advertise windbg.search_catalog in availableTools",
+    )
+    expect(
+        "windbg.get_command_docs" in available_tools_list,
+        "initialize must advertise windbg.get_command_docs in availableTools",
+    )
+    expect(
+        "windbg.get_session_metadata" in available_tools_list,
+        "initialize must advertise windbg.get_session_metadata in availableTools",
+    )
+    expect(
+        "windbg.write_memory" in available_tools_list,
+        "initialize must advertise windbg.write_memory in availableTools",
+    )
+    expect(
+        "windbg.get_threads" in available_tools_list,
+        "initialize must advertise windbg.get_threads in availableTools",
+    )
 
     server_info = result.get("serverInfo")
     expect(

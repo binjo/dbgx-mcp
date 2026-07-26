@@ -100,7 +100,7 @@ void RegisterSession(std::uint16_t port) {
   std::filesystem::path file_path = std::filesystem::path(dir) / (std::to_string(port) + ".json");
   std::ofstream f(file_path);
   if (f.is_open()) {
-    f << "{\"port\":" << port 
+    f << "{\"port\":" << port
       << ",\"pid\":" << GetCurrentProcessId()
       << ",\"target_pid\":" << meta.process_id
       << ",\"executable\":\"" << dbgx::json::Escape(meta.executable_name) << "\""
@@ -215,21 +215,54 @@ dbgx::mcp::HttpResponse FinishMcpRequest(dbgx::mcp::HttpResponse response, const
   return response;
 }
 
+bool IsProcessAlive(DWORD pid) {
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (process == nullptr) {
+    return GetLastError() == ERROR_ACCESS_DENIED;
+  }
+
+  DWORD exit_code = 0;
+  if (GetExitCodeProcess(process, &exit_code)) {
+    CloseHandle(process);
+    return exit_code == STILL_ACTIVE;
+  }
+
+  CloseHandle(process);
+  return false;
+}
+
 dbgx::mcp::HttpResponse HandleSessionsRequest(const dbgx::mcp::HttpRequest& request) {
   dbgx::mcp::HttpResponse response;
   response.status_code = 200;
   response.content_type = "application/json";
-  
+
   std::string dir = GetRegistryDir();
   std::string json = "[";
   bool first = true;
-  
+
   if (!dir.empty() && std::filesystem::exists(dir)) {
     for (const auto& entry : std::filesystem::directory_iterator(dir)) {
       if (entry.path().extension() == ".json") {
         std::ifstream f(entry.path());
         if (f.is_open()) {
           std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+          f.close(); // Close explicitly before possible deletion
+
+          size_t pid_pos = content.find("\"pid\":");
+          if (pid_pos != std::string::npos) {
+            size_t val_start = pid_pos + 6;
+            size_t val_end = content.find_first_not_of("0123456789", val_start);
+            if (val_end != std::string::npos && val_end > val_start) {
+              std::string pid_str = content.substr(val_start, val_end - val_start);
+              DWORD target_pid = static_cast<DWORD>(std::stoul(pid_str));
+
+              if (!IsProcessAlive(target_pid)) {
+                std::filesystem::remove(entry.path());
+                continue;
+              }
+            }
+          }
+
           if (!first) json += ",";
           json += content;
           first = false;
@@ -381,7 +414,7 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
         ", conflicts=" + std::to_string(start_report.conflict_count) +
         ", final_port=" + std::to_string(state.server->BoundPort()));
   }
-  
+
   RegisterSession(state.server->BoundPort());
 
   LogMessage("HTTP MCP server listening on http://" + bind_host + ":" + std::to_string(state.server->BoundPort()) +

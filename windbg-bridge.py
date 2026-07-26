@@ -2,13 +2,15 @@
 
 This script acts as a proxy between MCP clients (like Zed or Claude Desktop)
 and a remote WinDbg session running the dbgx-mcp extension. It handles
-Stdio-to-HTTP translation, multi-session discovery, and protocol stability.
+Stdio-to-HTTP translation, multi-session discovery, protocol stability,
+command guardrails, smart TTL caching, and error enrichment.
 """
 
 import concurrent.futures
 import http.client
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -33,6 +35,7 @@ _current_port = BASE_PORT
 _stdout_lock = threading.Lock()
 _connections_lock = threading.Lock()
 _conn_locks_lock = threading.Lock()
+_cache_lock = threading.Lock()
 
 _connections = {}
 _conn_locks = {}
@@ -40,13 +43,153 @@ _conn_locks = {}
 # Standard library thread pool for processing requests concurrently
 _request_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
+# ====================================================================
+# CACHE AND GUARDRAIL CONFIGURATIONS
+# ====================================================================
+
+# Simple memory cache: { (port, command_str): (timestamp, result_dict) }
+_command_cache = {}
+
+# Restrict commands that can brick or kill the debugger session
+DANGEROUS_COMMANDS = {
+    "q", "qq", "qd", ".kill", ".detach", ".restart", ".reboot"
+}
+
+def get_cache_ttl(command: str) -> float:
+    """Returns appropriate TTL in seconds based on command semantics."""
+    cmd = command.lower().strip()
+
+    # Strictly static / metadata
+    if any(x in cmd for x in ["version", ".effmach", "vertarget"]):
+        return 300.0  # 5 minutes
+
+    # Moderately static
+    if "lm" in cmd or cmd.startswith("x "):
+        return 120.0  # 2 minutes
+
+    # High-level structures
+    if any(x in cmd for x in ["!peb", "!teb", "!object"]):
+        return 30.0   # 30 seconds
+
+    # Fast-changing execution context (Registers and stacks)
+    if any(x == cmd or cmd.startswith(x + " ") for x in ["r", "k", "kb", "kp", "kv"]):
+        return 5.0    # 5 seconds to cushion fast loop queries without stale reads
+
+    return 0.0  # Bypass cache (write operations, execution control, etc.)
+
+
+def validate_command(command: str) -> tuple[bool, str]:
+    """Checks if a command is safe to execute. Returns (is_safe, error_message)."""
+    # Split by semicolon to check each individual subcommand
+    subcommands = command.split(";")
+    for sub in subcommands:
+        parts = sub.strip().split()
+        if not parts:
+            continue
+        base_cmd = parts[0].lower()
+        if base_cmd in DANGEROUS_COMMANDS:
+            return False, (
+                f"The command '{base_cmd}' is prohibited by the gateway "
+                "guardrails to prevent accidental termination or corruption of the "
+                "debugging session."
+            )
+    return True, ""
+
+
+def get_timeout_for_request(req_data) -> float:
+    """Determine appropriate timeout in seconds for a request based on method, tool, and command."""
+    method = req_data.get("method")
+    if method != "tools/call":
+        return 60.0
+
+    params = req_data.get("params", {})
+    tool_name = params.get("name")
+    tool_args = params.get("arguments", {})
+
+    if tool_name == "windbg.eval":
+        command = tool_args.get("command", "")
+        cmd_lower = command.lower().strip()
+
+        # Extended symbol loading commands
+        if any(ext_cmd in cmd_lower for ext_cmd in [".reload /f", ".reload -f"]):
+            return 1200.0  # 20 minutes
+
+        # Standard symbol operations
+        if any(sym_cmd in cmd_lower for sym_cmd in [".reload", ".sympath", ".symfix"]):
+            return 300.0   # 5 minutes
+
+        # Process list commands
+        if any(proc_cmd in cmd_lower for proc_cmd in ["!process 0 0", "!process 0 7", "!process 0 1f"]):
+            return 480.0   # 8 minutes
+
+        # Streaming commands
+        if any(stream_cmd in cmd_lower for stream_cmd in ["!for_each_process", "!for_each_thread", "!for_each_module"]):
+            return 900.0   # 15 minutes
+
+        # Large analysis commands
+        if any(large_cmd in cmd_lower for large_cmd in ["!analyze -v", "!thread -1", "!process -1"]):
+            return 300.0   # 5 minutes
+
+        # Bulk commands
+        if any(bulk_cmd in cmd_lower for bulk_cmd in ["lm", "!dlls", "!handle", "!vm", "!address"]):
+            return 180.0   # 3 minutes
+
+        # Quick commands
+        if any(quick_cmd in cmd_lower for quick_cmd in ["version", "help", "?", "r", ".effmach", "vertarget"]):
+            return 10.0    # 10 seconds
+
+        # Analysis commands
+        if any(analysis_cmd in cmd_lower for analysis_cmd in ["!analyze", "!thread", "!process"]):
+            return 120.0   # 2 minutes
+
+        # Memory commands
+        if any(memory_cmd in cmd_lower for memory_cmd in ["dd", "dq", "dp", "da", "du"]):
+            return 90.0    # 1.5 minutes
+
+        # Execution commands
+        if any(exec_cmd in cmd_lower for exec_cmd in ["g", "p", "t", "bp", "bc"]):
+            return 60.0    # 1 minute
+
+        return 60.0
+
+    elif tool_name == "windbg.carve_pe":
+        return 300.0  # 5 minutes for PE extraction
+
+    elif tool_name == "windbg.search":
+        return 120.0  # 2 minutes for memory search
+
+    elif tool_name == "windbg.read_memory":
+        return 90.0   # 1.5 minutes for reading memory
+
+    return 60.0
+
+
+def enrich_error_response(command: str, error_message: str) -> list[str]:
+    """Generates actionable workflow recovery hints for agents based on typical failures."""
+    suggestions = []
+    low_err = error_message.lower()
+    cmd = command.lower().strip()
+
+    if "not found" in low_err or "unresolved" in low_err:
+        suggestions.append("Verify the symbol/expression spelling.")
+        suggestions.append("Check loaded symbols using 'lm' or try reloading symbols using '.reload'.")
+    elif "access denied" in low_err or "privilege" in low_err:
+        suggestions.append("Ensure you are running the target with administrative privileges.")
+        suggestions.append("Verify current thread and process context.")
+    elif "syntax" in low_err:
+        suggestions.append("Consult the internal WinDbg catalog tool 'windbg.search_catalog' for syntax specs.")
+
+    if cmd.startswith("bp") or cmd.startswith("bu"):
+        suggestions.append("To inspect breakpoints after setting them, use the 'bl' command.")
+
+    return suggestions
+
+# ====================================================================
+# GATEWAY LOGISTICS
+# ====================================================================
 
 def log(msg):
-    """Logs a diagnostic message to the temporary log file.
-
-    Args:
-      msg: The message string to log.
-    """
+    """Logs a diagnostic message to the temporary log file."""
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
@@ -55,16 +198,7 @@ def log(msg):
 
 
 def send_response(output_stream, data):
-    """Serializes and sends a JSON-RPC response to stdout.
-
-    Ensures the JSON is formatted as a single line to prevent protocol
-    desynchronization in clients that expect line-buffered Stdio transport.
-    Uses a mutex to ensure thread-safe output.
-
-    Args:
-      output_stream: The file-like object to write to (usually sys.stdout).
-      data: The dictionary to serialize as JSON.
-    """
+    """Serializes and sends a JSON-RPC response to stdout thread-safely."""
     try:
         line = json.dumps(data)
         with _stdout_lock:
@@ -75,14 +209,16 @@ def send_response(output_stream, data):
         log(f"SEND ERROR: {e}")
 
 
-def get_connection(host, port):
+def get_connection(host, port, timeout=60.0):
     """Retrieves or creates a persistent HTTP connection (thread-safe)."""
     key = f"{host}:{port}"
     with _connections_lock:
         conn = _connections.get(key)
         if conn is None:
-            conn = http.client.HTTPConnection(host, port, timeout=60)
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
             _connections[key] = conn
+        else:
+            conn.timeout = timeout
         return conn
 
 
@@ -96,12 +232,12 @@ def get_connection_lock(key):
         return lock
 
 
-def forward_post(host, port, path, body_bytes):
+def forward_post(host, port, path, body_bytes, timeout=60.0):
     """Forwards a POST request using a persistent keep-alive connection with automatic reconnect."""
     key = f"{host}:{port}"
     lock = get_connection_lock(key)
     with lock:
-        conn = get_connection(host, port)
+        conn = get_connection(host, port, timeout=timeout)
         try:
             conn.request(
                 "POST",
@@ -127,7 +263,7 @@ def forward_post(host, port, path, body_bytes):
                 if key in _connections:
                     del _connections[key]
             # Retry once
-            conn = get_connection(host, port)
+            conn = get_connection(host, port, timeout=timeout)
             conn.request(
                 "POST",
                 path,
@@ -160,17 +296,9 @@ def scan_port(port):
 
 
 def get_sessions():
-    """Discover all active WinDbg MCP sessions in the guest VM.
-
-    Scans a range of ports starting from BASE_PORT in parallel to find active endpoints
-    exposing the /sessions metadata.
-
-    Returns:
-      A list of session dictionaries, each containing process info and port.
-    """
+    """Discover all active WinDbg MCP sessions in the guest VM."""
     ports_to_try = [BASE_PORT] + [p for p in range(BASE_PORT + 1, BASE_PORT + 11)]
     sessions = []
-    # Scan all ports in parallel using a thread pool to avoid blocking (completes in ~0.3s)
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=len(ports_to_try)
     ) as executor:
@@ -181,14 +309,7 @@ def get_sessions():
 
 
 def handle_list_sessions(req_id):
-    """Processes the windbg.list_sessions tool call.
-
-    Args:
-      req_id: The JSON-RPC request ID to associate with the result.
-
-    Returns:
-      A JSON-RPC response dictionary containing the session list.
-    """
+    """Processes the windbg.list_sessions tool call."""
     sessions = get_sessions()
     return {
         "jsonrpc": "2.0",
@@ -198,6 +319,9 @@ def handle_list_sessions(req_id):
         },
     }
 
+# ====================================================================
+# MAIN STRATEGIC DISPATCH
+# ====================================================================
 
 def handle_request(line, output_stream):
     """Processes an individual JSON-RPC request from start to finish."""
@@ -231,7 +355,7 @@ def handle_request(line, output_stream):
 
             try:
                 resp_bytes, status = forward_post(
-                    GUEST_IP, _current_port, "/mcp", line.encode("utf-8")
+                    GUEST_IP, _current_port, "/mcp", line.encode("utf-8"), timeout=60.0
                 )
                 resp_data = json.loads(resp_bytes.decode("utf-8"))
                 if "result" in resp_data:
@@ -267,7 +391,7 @@ def handle_request(line, output_stream):
         if method == "tools/list":
             try:
                 resp_bytes, status = forward_post(
-                    GUEST_IP, _current_port, "/mcp", line.encode("utf-8")
+                    GUEST_IP, _current_port, "/mcp", line.encode("utf-8"), timeout=60.0
                 )
                 resp_data = json.loads(resp_bytes.decode("utf-8"))
                 if "result" in resp_data and "tools" in resp_data["result"]:
@@ -325,7 +449,7 @@ def handle_request(line, output_stream):
             tool_name = params.get("name")
             tool_args = params.get("arguments", {})
 
-            if tool_name == "windbg.list_sessions" or tool_name == "list_sessions":
+            if tool_name in ("windbg.list_sessions", "list_sessions"):
                 send_response(output_stream, handle_list_sessions(req_id))
                 return
 
@@ -334,16 +458,75 @@ def handle_request(line, output_stream):
                 del tool_args["session_id"]
                 req_data["params"]["arguments"] = tool_args
                 line = json.dumps(req_data)
+
+            # --- GUARDRAIL INTERCEPTOR ---
+            if tool_name == "windbg.eval":
+                command = tool_args.get("command", "")
+                is_safe, guard_err = validate_command(command)
+                if not is_safe:
+                    log(f"GUARDRAIL BLOCKED: '{command}'")
+                    send_response(output_stream, {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32602,
+                            "message": guard_err
+                        }
+                    })
+                    return
+
+                # --- SMART TTL CACHE INTERCEPTOR ---
+                ttl = get_cache_ttl(command)
+                if ttl > 0.0:
+                    cache_key = (target_port, command.strip())
+                    with _cache_lock:
+                        cached_item = _command_cache.get(cache_key)
+                        if cached_item:
+                            cache_time, cached_res = cached_item
+                            if time.time() - cache_time < ttl:
+                                log(f"CACHE HIT: '{command}' on :{target_port}")
+                                # CRITICAL FIX: Clone and swap the ID to match current request context!
+                                resp_to_send = dict(cached_res)
+                                resp_to_send["id"] = req_id
+                                send_response(output_stream, resp_to_send)
+                                return
         else:
             target_port = _current_port
 
         # Generic Forwarding to Backend
         try:
+            req_timeout = get_timeout_for_request(req_data)
+            log(f"FORWARD_POST: using adaptive timeout {req_timeout}s for tool/command")
             resp_bytes, status = forward_post(
-                GUEST_IP, target_port, "/mcp", line.encode("utf-8")
+                GUEST_IP, target_port, "/mcp", line.encode("utf-8"), timeout=req_timeout
             )
             if resp_bytes:
                 resp_json = json.loads(resp_bytes.decode("utf-8"))
+
+                # Intercept results to cache or enrich errors
+                if method == "tools/call":
+                    tool_name = params.get("name")
+
+                    if tool_name == "windbg.eval":
+                        command = tool_args.get("command", "")
+
+                        # Populate cache on success
+                        if "result" in resp_json:
+                            ttl = get_cache_ttl(command)
+                            if ttl > 0.0:
+                                cache_key = (target_port, command.strip())
+                                with _cache_lock:
+                                    _command_cache[cache_key] = (time.time(), resp_json)
+                                    log(f"CACHED: '{command}' on :{target_port} (TTL: {ttl}s)")
+
+                        # Enrich syntax/runtime errors with actionable recommendations
+                        elif "error" in resp_json:
+                            err_msg = resp_json["error"].get("message", "")
+                            suggestions = enrich_error_response(command, err_msg)
+                            if suggestions:
+                                resp_json["error"]["suggestions"] = suggestions
+                                log(f"ENRICHED ERROR: '{command}' suggestions={suggestions}")
+
                 send_response(output_stream, resp_json)
             else:
                 log(f"Empty response from :{target_port}")
