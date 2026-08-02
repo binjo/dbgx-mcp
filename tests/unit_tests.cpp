@@ -7,6 +7,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <filesystem>
+#include <windows.h>
 
 namespace {
 
@@ -36,8 +39,9 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
     return {1234, "test.exe", "Live Session", "x64", "user"};
   }
 
-  dbgx::windbg::CommandExecutionResult EvaluateModel(const std::string&, int) override {
-    return {true, "{}", ""};
+  dbgx::windbg::CommandExecutionResult EvaluateModel(const std::string& expression, int) override {
+    evaluated_expressions.push_back(expression);
+    return {true, "{\"field_name\":\"value\"}", ""};
   }
 
   dbgx::windbg::CommandExecutionResult GetContextSnapshot() override {
@@ -78,6 +82,7 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
   std::string last_command;
   dbgx::windbg::CommandExecutionOptions last_options;
   int call_count = 0;
+  std::vector<std::string> evaluated_expressions;
 };
 
 bool Contains(const std::string& text, const std::string& expected_substring) {
@@ -551,6 +556,88 @@ void TestToolsCallGetThreads(int* failures) {
   Expect(Contains(result.body, "is_current"), "get_threads should return is_current", failures);
 }
 
+void TestToolsCallApplySyntheticType(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"windbg.apply_synthetic_type","arguments":{"header_path":"d:\\t\\mcfg.h","struct_name":"ACPI_MCFG","address":"0xAFFF2A00"}}})");
+
+  Expect(result.status_code == 200, "apply_synthetic_type should return HTTP 200", failures);
+  Expect(Contains(result.body, "field_name"), "apply_synthetic_type should return serialized fields", failures);
+
+  // Verify that SynTypes.js is loaded
+  Expect(executor.call_count == 1, "apply_synthetic_type should load SynTypes.js", failures);
+  Expect(Contains(executor.last_command, "SynTypes.js"), "should contain SynTypes.js in scriptload", failures);
+
+  // Verify that ReadHeader and CreateInstance are evaluated
+  Expect(executor.evaluated_expressions.size() == 2, "should evaluate exactly 2 expressions", failures);
+  Expect(Contains(executor.evaluated_expressions[0], "ReadHeader"), "first expression should read header", failures);
+  Expect(Contains(executor.evaluated_expressions[0], "d:\\\\t\\\\mcfg.h"), "first expression should contain escaped header path", failures);
+  Expect(Contains(executor.evaluated_expressions[1], "CreateInstance"), "second expression should create instance", failures);
+  Expect(Contains(executor.evaluated_expressions[1], "0xAFFF2A00"), "second expression should contain target address", failures);
+}
+
+void TestToolsCallApplyStruct(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"windbg.apply_struct","arguments":{"struct_definition":"struct CustomStruct { int age; };","struct_name":"CustomStruct","address":"0x7ff80000"}}})");
+
+  Expect(result.status_code == 200, "apply_struct should return HTTP 200", failures);
+  Expect(Contains(result.body, "field_name"), "apply_struct should return serialized fields", failures);
+
+  // Verify that SynTypes.js is loaded
+  Expect(executor.call_count == 1, "apply_struct should load SynTypes.js", failures);
+  Expect(Contains(executor.last_command, "SynTypes.js"), "should contain SynTypes.js in scriptload", failures);
+
+  // Verify that ReadHeader and CreateInstance are evaluated
+  Expect(executor.evaluated_expressions.size() == 2, "should evaluate exactly 2 expressions", failures);
+  Expect(Contains(executor.evaluated_expressions[0], "ReadHeader"), "first expression should read header", failures);
+  Expect(Contains(executor.evaluated_expressions[0], "synthetic_inline.h"), "first expression should contain the inline header name", failures);
+  Expect(Contains(executor.evaluated_expressions[1], "CreateInstance"), "second expression should create instance", failures);
+  Expect(Contains(executor.evaluated_expressions[1], "0x7ff80000"), "second expression should contain target address", failures);
+
+  // Verify that the inline header was written to `%TEMP%\synthetic_inline.h`
+  char expanded_path[MAX_PATH];
+  DWORD size = ExpandEnvironmentStringsA("%TEMP%\\synthetic_inline.h", expanded_path, MAX_PATH);
+  if (size > 0 && size <= MAX_PATH) {
+    std::ifstream in(expanded_path);
+    Expect(in.good(), "the inline header file should exist and be readable", failures);
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Expect(content == "struct CustomStruct { int age; };", "the inline header content should match", failures);
+    in.close();
+    std::filesystem::remove(expanded_path);
+  }
+}
+
+void TestToolsCallWriteFile(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  // We write a file to %TEMP%\test_mcp_write_file.txt
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"windbg.write_file","arguments":{"path":"%TEMP%\\test_mcp_write_file.txt","content":"hello windbg write_file"}}})");
+
+  Expect(result.status_code == 200, "write_file should return HTTP 200", failures);
+  Expect(Contains(result.body, "success"), "write_file should return success field", failures);
+  Expect(Contains(result.body, "test_mcp_write_file.txt"), "write_file should return the filename", failures);
+  Expect(Contains(result.body, "bytes_written"), "write_file should return bytes_written", failures);
+
+  // Verify that the file was actually written (on Windows)
+  char expanded_path[MAX_PATH];
+  DWORD size = ExpandEnvironmentStringsA("%TEMP%\\test_mcp_write_file.txt", expanded_path, MAX_PATH);
+  if (size > 0 && size <= MAX_PATH) {
+    std::ifstream in(expanded_path);
+    Expect(in.good(), "the written file should exist and be readable", failures);
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    Expect(content == "hello windbg write_file", "the file content should match", failures);
+    in.close();
+    std::filesystem::remove(expanded_path);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -582,6 +669,9 @@ int main() {
   TestToolsCallWriteMemory(&failures);
   TestToolsCallCarvePE(&failures);
   TestToolsCallGetThreads(&failures);
+  TestToolsCallApplySyntheticType(&failures);
+  TestToolsCallApplyStruct(&failures);
+  TestToolsCallWriteFile(&failures);
 
   if (failures == 0) {
     std::cout << "All unit tests passed.\n";

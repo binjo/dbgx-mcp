@@ -6,6 +6,7 @@ Stdio-to-HTTP translation, multi-session discovery, protocol stability,
 command guardrails, smart TTL caching, and error enrichment.
 """
 
+import atexit
 import concurrent.futures
 import http.client
 import json
@@ -52,7 +53,14 @@ _command_cache = {}
 
 # Restrict commands that can brick or kill the debugger session
 DANGEROUS_COMMANDS = {
-    "q", "qq", "qd", ".kill", ".detach", ".restart", ".reboot"
+    # Session exit / termination
+    "q", "qq", "qd", ".kill", ".detach", ".abandon", ".restart", ".reboot", ".crash",
+    # Shell escapes
+    ".shell", "!shell",
+    # Extension and script lifecycle (prevent untrusted binary or script execution)
+    ".load", ".unload", ".loadby", ".scriptload", ".scriptunload",
+    # Networking / remote server commands
+    ".server", ".endsrv", ".remote"
 }
 
 def get_cache_ttl(command: str) -> float:
@@ -80,6 +88,20 @@ def get_cache_ttl(command: str) -> float:
 
 def validate_command(command: str) -> tuple[bool, str]:
     """Checks if a command is safe to execute. Returns (is_safe, error_message)."""
+    # Guardrail: Reject compound blocks using curly braces (used for scripts/loops in WinDbg)
+    if "{" in command or "}" in command:
+        return False, (
+            "The use of curly braces '{' and '}' is prohibited by the gateway "
+            "guardrails to prevent compound script blocks and potential command injection."
+        )
+
+    # Guardrail: Reject sourcing/nesting commands from disk files to prevent arbitrary code/file execution
+    if any(pattern in command for pattern in ["$<", "$>", "$$<", "$$>"]):
+        return False, (
+            "Sourcing or nesting command files (using '$<' or '$$<') is prohibited "
+            "to prevent unauthorized disk file execution."
+        )
+
     # Split by semicolon to check each individual subcommand
     subcommands = command.split(";")
     for sub in subcommands:
@@ -554,8 +576,109 @@ def handle_request(line, output_stream):
         log(f"GLOBAL BRIDGE REQUEST ERROR: {e}")
 
 
+_global_mutex_handle = None
+_posix_lock_file = None
+
+
+def acquire_global_mutex() -> bool:
+    """Acquires a system-wide single ownership lock.
+    
+    On Windows, uses the system-wide 'Local\\dbgxmcp' named mutex.
+    On macOS/Linux, uses standard POSIX fcntl file locking on a temporary file.
+    
+    Returns True if the lock was successfully acquired,
+    otherwise False if another bridge instance is already running.
+    """
+    global _global_mutex_handle, _posix_lock_file
+
+    if sys.platform != "win32":
+        try:
+            import fcntl
+            lock_path = os.path.join(tempfile.gettempdir(), "dbgxmcp.lock")
+            # Open the file for writing (create if not exists)
+            _posix_lock_file = open(lock_path, "w")
+            # Try to acquire an exclusive, non-blocking file lock
+            fcntl.flock(_posix_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            log(f"Acquired system-wide POSIX file lock at '{lock_path}'")
+            return True
+        except (IOError, BlockingIOError):
+            log("POSIX lock acquisition failed: another bridge instance is running")
+            if _posix_lock_file:
+                try:
+                    _posix_lock_file.close()
+                except Exception:
+                    pass
+                _posix_lock_file = None
+            return False
+        except Exception as e:
+            log(f"POSIX file locking failed: {e}")
+            return True  # Fallback to True if something fails unexpectedly
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        mutex_name = "Local\\dbgxmcp"
+
+        CreateMutex = ctypes.windll.kernel32.CreateMutexW
+        CreateMutex.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        CreateMutex.restype = wintypes.HANDLE
+
+        GetLastError = ctypes.windll.kernel32.GetLastError
+        GetLastError.restype = wintypes.DWORD
+
+        ERROR_ALREADY_EXISTS = 183
+
+        handle = CreateMutex(None, False, mutex_name)
+        if not handle:
+            return False
+
+        last_error = GetLastError()
+        if last_error == ERROR_ALREADY_EXISTS:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return False
+
+        _global_mutex_handle = handle
+        log(f"Acquired system-wide named mutex '{mutex_name}'")
+        return True
+    except Exception as e:
+        log(f"Mutex creation failed: {e}")
+        return True  # Fallback to True if something fails unexpectedly in ctypes loading
+
+
+def release_global_mutex():
+    """Releases the system lock on exit."""
+    global _global_mutex_handle, _posix_lock_file
+    if _global_mutex_handle and sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.CloseHandle(_global_mutex_handle)
+            log("Released named mutex")
+        except Exception:
+            pass
+        _global_mutex_handle = None
+    elif _posix_lock_file and sys.platform != "win32":
+        try:
+            import fcntl
+            fcntl.flock(_posix_lock_file, fcntl.LOCK_UN)
+            _posix_lock_file.close()
+            log("Released POSIX file lock")
+        except Exception:
+            pass
+        _posix_lock_file = None
+
+
 def main():
     """Main execution loop for the bridge gateway."""
+    # Register the clean-up handler for the mutex lock
+    atexit.register(release_global_mutex)
+
+    if not acquire_global_mutex():
+        msg = "CRITICAL: Another WinDbg MCP launcher already owns Local\\dbgxmcp. Exiting."
+        log(msg)
+        sys.stderr.write(msg + "\n")
+        sys.exit(1)
+
     log(f"Bridge Gateway started (Guest: {GUEST_IP})")
     input_stream = sys.stdin
     output_stream = sys.stdout

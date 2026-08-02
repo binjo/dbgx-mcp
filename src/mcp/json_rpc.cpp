@@ -1,8 +1,12 @@
 #include "dbgx/mcp/json_rpc.hpp"
 #include "dbgx/windbg/catalog.hpp"
+#include "dbgx/mcp/syntypes_js.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <utility>
+#include <filesystem>
+#include <fstream>
+#include <windows.h>
 
 #include "dbgx/mcp/json.hpp"
 
@@ -109,7 +113,7 @@ MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
   outcome.result_json =
       "{"
       "\"protocolVersion\":\"" + json::Escape(requested_version) + "\","
-      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg.get_context\",\"windbg.read_memory\",\"windbg.carve_pe\",\"windbg.search\",\"windbg.get_execution_state\",\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\",\"windbg.get_session_metadata\",\"windbg.write_memory\",\"windbg.get_threads\"]}},"
+      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg.get_context\",\"windbg.read_memory\",\"windbg.carve_pe\",\"windbg.search\",\"windbg.get_execution_state\",\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\",\"windbg.get_session_metadata\",\"windbg.write_memory\",\"windbg.get_threads\",\"windbg.apply_synthetic_type\",\"windbg.write_file\",\"windbg.apply_struct\"]}},"
       "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING "\"}"
       "}";
   return outcome;
@@ -275,6 +279,50 @@ MethodOutcome HandleToolsList() {
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.apply_synthetic_type\","
+      "\"description\":\"Apply a synthetic C-style structure definition (loaded from a header file) onto a virtual memory address, returning a fully structured, field-attributed view of the memory.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"header_path\":{\"type\":\"string\",\"description\":\"Path to the C-style header (.h) file containing the struct definition\"},"
+      "\"struct_name\":{\"type\":\"string\",\"description\":\"Name of the struct definition to apply (e.g., 'ACPI_MCFG')\"},"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address or expression representing the target memory location\"},"
+      "\"module_name\":{\"type\":\"string\",\"description\":\"The module name to bind the type to (default: 'bootmgr')\"},"
+      "\"syntypes_path\":{\"type\":\"string\",\"description\":\"Optional path to the SynTypes.js extension (default: '%TEMP%\\\\SynTypes.js')\"}"
+      "},"
+      "\"required\":[\"header_path\",\"struct_name\",\"address\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.write_file\","
+      "\"description\":\"Write a text file directly onto the Windows guest VM file system. Dynamically creates directories and resolves environment variables (like %TEMP% or %USERPROFILE%). Excellent for transferring custom C-struct headers or SynTypes.js scripts from the host to the guest VM.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"path\":{\"type\":\"string\",\"description\":\"Absolute path on the guest VM to write the file to (supports Windows environment variables like '%TEMP%\\\\mcfg.h')\"},"
+      "\"content\":{\"type\":\"string\",\"description\":\"Content of the file to write\"}"
+      "},"
+      "\"required\":[\"path\",\"content\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.apply_struct\","
+      "\"description\":\"Apply an inline C-style struct definition directly onto a virtual memory address, returning a structured JSON view of the memory fields on-the-fly. Highly agentic: allows the agent to construct custom structures dynamically without needing any filesystem preparation.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"struct_definition\":{\"type\":\"string\",\"description\":\"The C-style struct definition to apply (e.g., 'struct Header { char sig[4]; int len; };')\"},"
+      "\"struct_name\":{\"type\":\"string\",\"description\":\"The name of the struct inside the definition to instantiate (e.g., 'Header')\"},"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address or expression representing the target memory location\"},"
+      "\"module_name\":{\"type\":\"string\",\"description\":\"The module name to bind the type to (default: 'bootmgr')\"}"
+      "},"
+      "\"required\":[\"struct_definition\",\"struct_name\",\"address\"],"
       "\"additionalProperties\":false"
       "}"
       "}"
@@ -488,6 +536,179 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     is_json_output = true;
   } else if (tool_name == "windbg.get_threads") {
     execution = executor->GetThreads();
+    is_json_output = true;
+  } else if (tool_name == "windbg.apply_synthetic_type") {
+    std::string header_path, struct_name, address_str;
+    if (!json::TryGetStringField(arguments_fields, "header_path", &header_path) ||
+        !json::TryGetStringField(arguments_fields, "struct_name", &struct_name) ||
+        !json::TryGetStringField(arguments_fields, "address", &address_str)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: header_path, struct_name, and address are required";
+      return outcome;
+    }
+    std::string module_name = "bootmgr";
+    json::TryGetStringField(arguments_fields, "module_name", &module_name);
+    std::string syntypes_path = "%TEMP%\\SynTypes.js";
+    json::TryGetStringField(arguments_fields, "syntypes_path", &syntypes_path);
+
+    // Expand environment variables dynamically in syntypes_path (e.g. %TEMP% to C:\Users\...)
+    char expanded_syntypes[MAX_PATH];
+    DWORD syntypes_size = ExpandEnvironmentStringsA(syntypes_path.c_str(), expanded_syntypes, MAX_PATH);
+    std::string resolved_syntypes = (syntypes_size > 0 && syntypes_size <= MAX_PATH) ? std::string(expanded_syntypes) : syntypes_path;
+
+    // 1. Automatically unpack/write the embedded SynTypes.js script onto the Windows guest filesystem
+    try {
+      std::filesystem::path syntypes_file(resolved_syntypes);
+      if (syntypes_file.has_parent_path()) {
+        std::filesystem::create_directories(syntypes_file.parent_path());
+      }
+      std::ofstream out(syntypes_file, std::ios::out | std::ios::binary);
+      if (out) {
+        out.write(kSynTypesJsCodeView.data(), kSynTypesJsCodeView.size());
+        out.close();
+      }
+    } catch (...) {
+      // Ignore failures if directory is write-protected but file is already there
+    }
+
+    // 2. Try to load SynTypes.js (ignore failure if already loaded or not found immediately)
+    executor->Execute(".scriptload \"" + resolved_syntypes + "\"");
+
+    // Expand environment variables dynamically in header_path
+    char expanded_header_path[MAX_PATH];
+    DWORD header_size = ExpandEnvironmentStringsA(header_path.c_str(), expanded_header_path, MAX_PATH);
+    std::string resolved_header = (header_size > 0 && header_size <= MAX_PATH) ? std::string(expanded_header_path) : header_path;
+
+    // 2. Escape backslashes in resolved_header for the JS string literal inside evaluate model
+    std::string escaped_header = "";
+    for (char c : resolved_header) {
+      if (c == '\\') {
+        escaped_header += "\\\\";
+      } else {
+        escaped_header += c;
+      }
+    }
+
+    // 3. Read the header file definition
+    std::string read_expr = "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + module_name + "\")";
+    executor->EvaluateModel(read_expr);
+
+    // 4. Create the synthetic structure instance and serialize it to structured JSON
+    std::string instance_expr = "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + struct_name + "\", " + address_str + ")";
+    execution = executor->EvaluateModel(instance_expr);
+    is_json_output = true;
+  } else if (tool_name == "windbg.apply_struct") {
+    std::string struct_def, struct_name, address_str;
+    if (!json::TryGetStringField(arguments_fields, "struct_definition", &struct_def) ||
+        !json::TryGetStringField(arguments_fields, "struct_name", &struct_name) ||
+        !json::TryGetStringField(arguments_fields, "address", &address_str)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: struct_definition, struct_name, and address are required";
+      return outcome;
+    }
+    std::string module_name = "bootmgr";
+    json::TryGetStringField(arguments_fields, "module_name", &module_name);
+
+    // 1. Resolve %TEMP%\synthetic_inline.h path on guest
+    char expanded_temp[MAX_PATH];
+    DWORD temp_size = ExpandEnvironmentStringsA("%TEMP%\\synthetic_inline.h", expanded_temp, MAX_PATH);
+    std::string inline_h_path = (temp_size > 0 && temp_size <= MAX_PATH) ? std::string(expanded_temp) : "C:\\temp\\synthetic_inline.h";
+
+    // 2. Write the struct_definition inline to %TEMP%\synthetic_inline.h
+    try {
+      std::filesystem::path h_file(inline_h_path);
+      if (h_file.has_parent_path()) {
+        std::filesystem::create_directories(h_file.parent_path());
+      }
+      std::ofstream out(h_file, std::ios::out | std::ios::binary);
+      if (!out) {
+        outcome.error_code = -32603;
+        outcome.error_message = "Failed to create inline header file: " + inline_h_path;
+        return outcome;
+      }
+      out.write(struct_def.data(), struct_def.size());
+      out.close();
+    } catch (const std::exception& e) {
+      outcome.error_code = -32603;
+      outcome.error_message = std::string("Filesystem exception creating inline header: ") + e.what();
+      return outcome;
+    }
+
+    // 3. Resolve %TEMP%\SynTypes.js path on guest
+    char expanded_syntypes[MAX_PATH];
+    DWORD syntypes_size = ExpandEnvironmentStringsA("%TEMP%\\SynTypes.js", expanded_syntypes, MAX_PATH);
+    std::string resolved_syntypes = (syntypes_size > 0 && syntypes_size <= MAX_PATH) ? std::string(expanded_syntypes) : "C:\\temp\\SynTypes.js";
+
+    // 4. Automatically unpack/write the embedded SynTypes.js script onto the Windows guest filesystem
+    try {
+      std::filesystem::path syntypes_file(resolved_syntypes);
+      if (syntypes_file.has_parent_path()) {
+        std::filesystem::create_directories(syntypes_file.parent_path());
+      }
+      std::ofstream out(syntypes_file, std::ios::out | std::ios::binary);
+      if (out) {
+        out.write(kSynTypesJsCodeView.data(), kSynTypesJsCodeView.size());
+        out.close();
+      }
+    } catch (...) {}
+
+    // 5. Try to load SynTypes.js (ignore failure if already loaded)
+    executor->Execute(".scriptload \"" + resolved_syntypes + "\"");
+
+    // 6. Escape backslashes in inline_h_path for the JS string literal inside evaluate model
+    std::string escaped_header = "";
+    for (char c : inline_h_path) {
+      if (c == '\\') {
+        escaped_header += "\\\\";
+      } else {
+        escaped_header += c;
+      }
+    }
+
+    // 7. Read the header file definition
+    std::string read_expr = "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + module_name + "\")";
+    executor->EvaluateModel(read_expr);
+
+    // 8. Create the synthetic structure instance and serialize it to structured JSON
+    std::string instance_expr = "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + struct_name + "\", " + address_str + ")";
+    execution = executor->EvaluateModel(instance_expr);
+    is_json_output = true;
+  } else if (tool_name == "windbg.write_file") {
+    std::string path_str, content_str;
+    if (!json::TryGetStringField(arguments_fields, "path", &path_str) ||
+        !json::TryGetStringField(arguments_fields, "content", &content_str)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: path and content are required";
+      return outcome;
+    }
+
+    // Resolve any Windows environment variables dynamically (e.g. %TEMP%)
+    char expanded_path[MAX_PATH];
+    DWORD size = ExpandEnvironmentStringsA(path_str.c_str(), expanded_path, MAX_PATH);
+    std::string target_path = (size > 0 && size <= MAX_PATH) ? std::string(expanded_path) : path_str;
+
+    try {
+      std::filesystem::path fs_path(target_path);
+      // Create parent directories if they don't exist
+      if (fs_path.has_parent_path()) {
+        std::filesystem::create_directories(fs_path.parent_path());
+      }
+
+      // Write text contents to file
+      std::ofstream out_file(fs_path, std::ios::out | std::ios::binary);
+      if (!out_file) {
+        execution.success = false;
+        execution.error_message = "Failed to open guest file for writing: " + target_path;
+      } else {
+        out_file.write(content_str.data(), content_str.size());
+        out_file.close();
+        execution.success = true;
+        execution.output = "{\"success\":true,\"resolved_path\":\"" + json::Escape(target_path) + "\",\"bytes_written\":" + std::to_string(content_str.size()) + "}";
+      }
+    } catch (const std::exception& e) {
+      execution.success = false;
+      execution.error_message = std::string("Filesystem exception: ") + e.what();
+    }
     is_json_output = true;
   } else {
     outcome.error_code = -32602;

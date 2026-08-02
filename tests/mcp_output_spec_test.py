@@ -190,6 +190,18 @@ def case_initialize(
         "windbg.get_threads" in available_tools_list,
         "initialize must advertise windbg.get_threads in availableTools",
     )
+    expect(
+        "windbg.apply_synthetic_type" in available_tools_list,
+        "initialize must advertise windbg.apply_synthetic_type in availableTools",
+    )
+    expect(
+        "windbg.apply_struct" in available_tools_list,
+        "initialize must advertise windbg.apply_struct in availableTools",
+    )
+    expect(
+        "windbg.write_file" in available_tools_list,
+        "initialize must advertise windbg.write_file in availableTools",
+    )
 
     server_info = result.get("serverInfo")
     expect(
