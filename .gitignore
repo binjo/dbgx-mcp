@@ -29,5 +29,10 @@ __pycache__/
 # Local third-party checkout
 /3rdpart/WinDbg-Samples/
 
+# Packaging artifacts
+/dist/
+/dist.zip/
+/dist.zip
+
 # Git worktrees
 /.worktrees/

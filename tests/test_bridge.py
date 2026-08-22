@@ -76,10 +76,10 @@ class TestBridge(unittest.TestCase):
         t = bridge.get_timeout_for_request(req)
         self.assertEqual(t, 300.0)
 
-    def test_validate_command_braces_blocked(self):
+    def test_validate_command_braces_allowed(self):
         is_safe, err = bridge.validate_command(".if (eax == 1) { r ebx }")
-        self.assertFalse(is_safe)
-        self.assertIn("curly braces", err)
+        self.assertTrue(is_safe)
+        self.assertEqual(err, "")
 
     def test_validate_command_file_nesting_blocked(self):
         is_safe, err = bridge.validate_command("$$><d:\\t\\recovery.cmd")
@@ -87,7 +87,7 @@ class TestBridge(unittest.TestCase):
         self.assertIn("Sourcing or nesting", err)
 
     def test_validate_command_extended_dangerous(self):
-        for cmd in [".crash", ".shell", "!shell", ".scriptload", ".server", ".remote"]:
+        for cmd in [".crash", ".shell", "!shell", ".server", ".remote"]:
             is_safe, err = bridge.validate_command(cmd)
             self.assertFalse(is_safe)
             self.assertIn("prohibited", err)

@@ -507,6 +507,10 @@ bool HttpServer::Start(
         continue;
       }
 
+      DWORD socket_timeout_ms = 10000; // 10 seconds timeout
+      setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&socket_timeout_ms), sizeof(socket_timeout_ms));
+      setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&socket_timeout_ms), sizeof(socket_timeout_ms));
+
       std::thread([this, client_socket]() {
         (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         HttpRequest request;

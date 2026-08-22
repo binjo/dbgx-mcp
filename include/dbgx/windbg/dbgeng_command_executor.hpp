@@ -1,5 +1,6 @@
 #pragma once
 #include "dbgx/windbg/command_executor.hpp"
+#include <functional>
 #include <condition_variable>
 #include <future>
 #include <mutex>
@@ -29,11 +30,19 @@ class DbgEngCommandExecutor final : public IWinDbgCommandExecutor {
   SessionMetadata GetSessionMetadata() override;
   DebuggerExecutionState GetExecutionState() override;
   bool InterruptTarget() override;
+  CommandExecutionResult GetModules() override;
+  CommandExecutionResult GetBreakpoints() override;
+  CommandExecutionResult Disassemble(std::uint64_t address, std::uint32_t count = 10) override;
+  CommandExecutionResult ReadString(std::uint64_t address, std::uint32_t max_length = 256, bool wide = false) override;
+  CommandExecutionResult Step(bool step_over = true) override;
+  CommandExecutionResult ContinueTarget() override;
+  CommandExecutionResult SetBreakpoint(const std::string& expression) override;
 
  private:
+  using TaskFunction = std::function<CommandExecutionResult()>;
+
   struct ExecutionTask {
-    std::string command;
-    CommandExecutionOptions options;
+    TaskFunction func;
     std::promise<CommandExecutionResult> promise;
   };
 
@@ -48,7 +57,19 @@ class DbgEngCommandExecutor final : public IWinDbgCommandExecutor {
   Microsoft::WRL::ComPtr<IDebugControl> interrupt_control_;
 
   void WorkerThreadProc();
+  CommandExecutionResult DispatchToWorker(TaskFunction func, bool check_ready = true);
   CommandExecutionResult ExecuteSynchronously(const std::string& command, const CommandExecutionOptions& options);
+  CommandExecutionResult EvaluateModelSynchronously(const std::string& expression, int max_depth);
+  CommandExecutionResult GetContextSnapshotSynchronously();
+  CommandExecutionResult ReadMemorySynchronously(std::uint64_t address, std::uint32_t length);
+  CommandExecutionResult WriteMemorySynchronously(std::uint64_t address, const std::string& hex_data);
+  CommandExecutionResult CarvePESynchronously(std::uint64_t address, std::uint32_t length);
+  CommandExecutionResult SearchMemorySynchronously(std::uint64_t start_address, std::uint64_t end_address, const std::string& pattern);
+  CommandExecutionResult GetThreadsSynchronously();
+  CommandExecutionResult GetModulesSynchronously();
+  CommandExecutionResult GetBreakpointsSynchronously();
+  CommandExecutionResult DisassembleSynchronously(std::uint64_t address, std::uint32_t count);
+  CommandExecutionResult ReadStringSynchronously(std::uint64_t address, std::uint32_t max_length, bool wide);
   static DebuggerExecutionState ParseRawStatus(std::uint32_t raw_status);
 };
 

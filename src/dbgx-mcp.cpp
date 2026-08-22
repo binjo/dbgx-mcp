@@ -94,22 +94,32 @@ void RegisterSession(std::uint16_t port) {
   std::string dir = GetRegistryDir();
   if (dir.empty()) return;
 
-  ExtensionState& state = State();
-  dbgx::windbg::SessionMetadata meta = state.executor->GetSessionMetadata();
+  std::thread([port, dir]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ExtensionState& state = State();
+    dbgx::windbg::SessionMetadata meta;
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      if (state.executor) {
+        meta = state.executor->GetSessionMetadata();
+      }
+    }
 
-  std::filesystem::path file_path = std::filesystem::path(dir) / (std::to_string(port) + ".json");
-  std::ofstream f(file_path);
-  if (f.is_open()) {
-    f << "{\"port\":" << port
-      << ",\"pid\":" << GetCurrentProcessId()
-      << ",\"target_pid\":" << meta.process_id
-      << ",\"executable\":\"" << dbgx::json::Escape(meta.executable_name) << "\""
-      << ",\"info\":\"" << dbgx::json::Escape(meta.target_info) << "\""
-      << ",\"architecture\":\"" << dbgx::json::Escape(meta.architecture) << "\""
-      << ",\"debuggee_class\":\"" << dbgx::json::Escape(meta.debuggee_class) << "\""
-      << "}";
-    state.registered_file_path = file_path.string();
-  }
+    std::filesystem::path file_path = std::filesystem::path(dir) / (std::to_string(port) + ".json");
+    std::ofstream f(file_path);
+    if (f.is_open()) {
+      f << "{\"port\":" << port
+        << ",\"pid\":" << GetCurrentProcessId()
+        << ",\"target_pid\":" << meta.process_id
+        << ",\"executable\":\"" << dbgx::json::Escape(meta.executable_name.empty() ? "WinDbg Session" : meta.executable_name) << "\""
+        << ",\"info\":\"" << dbgx::json::Escape(meta.target_info.empty() ? "Live Session" : meta.target_info) << "\""
+        << ",\"architecture\":\"" << dbgx::json::Escape(meta.architecture.empty() ? "unknown" : meta.architecture) << "\""
+        << ",\"debuggee_class\":\"" << dbgx::json::Escape(meta.debuggee_class.empty() ? "user" : meta.debuggee_class) << "\""
+        << "}";
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.registered_file_path = file_path.string();
+    }
+  }).detach();
 }
 
 void UnregisterSession() {
@@ -249,14 +259,21 @@ dbgx::mcp::HttpResponse HandleSessionsRequest(const dbgx::mcp::HttpRequest& requ
           f.close(); // Close explicitly before possible deletion
 
           size_t pid_pos = content.find("\"pid\":");
+          while (pid_pos != std::string::npos) {
+            if (pid_pos == 0 || content[pid_pos - 1] != '_') { // Ensure matching "pid" not "target_pid"
+              break;
+            }
+            pid_pos = content.find("\"pid\":", pid_pos + 6);
+          }
+
           if (pid_pos != std::string::npos) {
             size_t val_start = pid_pos + 6;
             size_t val_end = content.find_first_not_of("0123456789", val_start);
             if (val_end != std::string::npos && val_end > val_start) {
               std::string pid_str = content.substr(val_start, val_end - val_start);
-              DWORD target_pid = static_cast<DWORD>(std::stoul(pid_str));
+              DWORD host_pid = static_cast<DWORD>(std::stoul(pid_str));
 
-              if (!IsProcessAlive(target_pid)) {
+              if (!IsProcessAlive(host_pid)) {
                 std::filesystem::remove(entry.path());
                 continue;
               }

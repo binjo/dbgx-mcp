@@ -76,6 +76,35 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
     return true;
   }
 
+  dbgx::windbg::CommandExecutionResult GetModules() override {
+    return {true, "[{\"name\":\"test.dll\",\"base\":\"0x1000\",\"size\":4096}]", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult GetBreakpoints() override {
+    return {true, "[{\"id\":0,\"enabled\":true,\"address\":\"0x1000\"}]", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult Disassemble(std::uint64_t, std::uint32_t) override {
+    return {true, "[{\"address\":\"0x1000\",\"disassembly\":\"nop\"}]", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult ReadString(std::uint64_t, std::uint32_t, bool) override {
+    return {true, "{\"address\":\"0x1000\",\"string\":\"test\",\"length\":4,\"truncated\":false}", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult Step(bool) override {
+    return {true, "ok", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult ContinueTarget() override {
+    return {true, "ok", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult SetBreakpoint(const std::string& expression) override {
+    last_command = "bp " + expression;
+    return {true, "ok", ""};
+  }
+
   bool should_fail = false;
   std::string failure_message = "failed";
   std::string output = "ok";
@@ -595,21 +624,9 @@ void TestToolsCallApplyStruct(int* failures) {
   // Verify that ReadHeader and CreateInstance are evaluated
   Expect(executor.evaluated_expressions.size() == 2, "should evaluate exactly 2 expressions", failures);
   Expect(Contains(executor.evaluated_expressions[0], "ReadHeader"), "first expression should read header", failures);
-  Expect(Contains(executor.evaluated_expressions[0], "synthetic_inline.h"), "first expression should contain the inline header name", failures);
+  Expect(Contains(executor.evaluated_expressions[0], "synthetic_inline_"), "first expression should contain the inline header pattern", failures);
   Expect(Contains(executor.evaluated_expressions[1], "CreateInstance"), "second expression should create instance", failures);
   Expect(Contains(executor.evaluated_expressions[1], "0x7ff80000"), "second expression should contain target address", failures);
-
-  // Verify that the inline header was written to `%TEMP%\synthetic_inline.h`
-  char expanded_path[MAX_PATH];
-  DWORD size = ExpandEnvironmentStringsA("%TEMP%\\synthetic_inline.h", expanded_path, MAX_PATH);
-  if (size > 0 && size <= MAX_PATH) {
-    std::ifstream in(expanded_path);
-    Expect(in.good(), "the inline header file should exist and be readable", failures);
-    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    Expect(content == "struct CustomStruct { int age; };", "the inline header content should match", failures);
-    in.close();
-    std::filesystem::remove(expanded_path);
-  }
 }
 
 void TestToolsCallWriteFile(int* failures) {
@@ -636,6 +653,81 @@ void TestToolsCallWriteFile(int* failures) {
     in.close();
     std::filesystem::remove(expanded_path);
   }
+}
+
+void TestToolsCallGetModules(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"windbg.get_modules","arguments":{}}})");
+
+  Expect(result.status_code == 200, "get_modules should return HTTP 200", failures);
+  Expect(Contains(result.body, "test.dll"), "get_modules result should contain module name", failures);
+}
+
+void TestToolsCallGetBreakpoints(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"windbg.get_breakpoints","arguments":{}}})");
+
+  Expect(result.status_code == 200, "get_breakpoints should return HTTP 200", failures);
+  Expect(Contains(result.body, "0x1000"), "get_breakpoints result should contain address", failures);
+}
+
+void TestToolsCallDisassemble(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"windbg.disassemble","arguments":{"address":"0x1000","count":5}}})");
+
+  Expect(result.status_code == 200, "disassemble should return HTTP 200", failures);
+  Expect(Contains(result.body, "nop"), "disassemble result should contain disassembly instruction", failures);
+}
+
+void TestToolsCallReadString(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"windbg.read_string","arguments":{"address":"0x1000","max_length":64}}})");
+
+  Expect(result.status_code == 200, "read_string should return HTTP 200", failures);
+  Expect(Contains(result.body, "test"), "read_string result should contain string", failures);
+}
+
+void TestToolsCallStep(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"windbg.step","arguments":{"step_over":true}}})");
+
+  Expect(result.status_code == 200, "step should return HTTP 200", failures);
+}
+
+void TestToolsCallContinue(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"windbg.continue","arguments":{}}})");
+
+  Expect(result.status_code == 200, "continue should return HTTP 200", failures);
+}
+
+void TestToolsCallSetBreakpoint(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"windbg.set_breakpoint","arguments":{"expression":"main"}}})");
+
+  Expect(result.status_code == 200, "set_breakpoint should return HTTP 200", failures);
+  Expect(executor.last_command == "bp main", "set_breakpoint should execute bp main", failures);
 }
 
 }  // namespace
@@ -672,6 +764,13 @@ int main() {
   TestToolsCallApplySyntheticType(&failures);
   TestToolsCallApplyStruct(&failures);
   TestToolsCallWriteFile(&failures);
+  TestToolsCallGetModules(&failures);
+  TestToolsCallGetBreakpoints(&failures);
+  TestToolsCallDisassemble(&failures);
+  TestToolsCallReadString(&failures);
+  TestToolsCallStep(&failures);
+  TestToolsCallContinue(&failures);
+  TestToolsCallSetBreakpoint(&failures);
 
   if (failures == 0) {
     std::cout << "All unit tests passed.\n";

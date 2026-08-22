@@ -462,6 +462,22 @@ bool TryGetIntField(const FieldMap& fields, const std::string& key, int* out_val
   }
 }
 
+bool TryGetBoolField(const FieldMap& fields, const std::string& key, bool* out_value) {
+  std::string raw;
+  if (!TryGetRawField(fields, key, &raw) || out_value == nullptr) {
+    return false;
+  }
+  if (raw == "true") {
+    *out_value = true;
+    return true;
+  }
+  if (raw == "false") {
+    *out_value = false;
+    return true;
+  }
+  return false;
+}
+
 bool TryGetObjectField(
     const FieldMap& fields,
     const std::string& key,

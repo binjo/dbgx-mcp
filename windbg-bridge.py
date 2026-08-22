@@ -19,10 +19,10 @@ import time
 import urllib.error
 import urllib.request
 
-# Remote WinDbg MCP guest IP
+# Remote WinDbg MCP guest IP (defaults to 127.0.0.1 for local WinDbg)
 GUEST_IP = next(
-    (v for k, v in os.environ.items() if k.lower() == "windbg_mcp_bind"),
-    "172.16.23.188",
+    (v for k, v in os.environ.items() if k.lower() in ("windbg_mcp_bind", "windbg_mcp_host")),
+    "127.0.0.1",
 )
 # Well-known base port for the WinDbg MCP server
 BASE_PORT = 5678
@@ -57,8 +57,6 @@ DANGEROUS_COMMANDS = {
     "q", "qq", "qd", ".kill", ".detach", ".abandon", ".restart", ".reboot", ".crash",
     # Shell escapes
     ".shell", "!shell",
-    # Extension and script lifecycle (prevent untrusted binary or script execution)
-    ".load", ".unload", ".loadby", ".scriptload", ".scriptunload",
     # Networking / remote server commands
     ".server", ".endsrv", ".remote"
 }
@@ -88,13 +86,6 @@ def get_cache_ttl(command: str) -> float:
 
 def validate_command(command: str) -> tuple[bool, str]:
     """Checks if a command is safe to execute. Returns (is_safe, error_message)."""
-    # Guardrail: Reject compound blocks using curly braces (used for scripts/loops in WinDbg)
-    if "{" in command or "}" in command:
-        return False, (
-            "The use of curly braces '{' and '}' is prohibited by the gateway "
-            "guardrails to prevent compound script blocks and potential command injection."
-        )
-
     # Guardrail: Reject sourcing/nesting commands from disk files to prevent arbitrary code/file execution
     if any(pattern in command for pattern in ["$<", "$>", "$$<", "$$>"]):
         return False, (
@@ -231,6 +222,51 @@ def send_response(output_stream, data):
         log(f"SEND ERROR: {e}")
 
 
+def send_notification(output_stream, method, params=None):
+    """Sends a JSON-RPC notification to stdout thread-safely."""
+    try:
+        data = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            data["params"] = params
+        line = json.dumps(data)
+        with _stdout_lock:
+            output_stream.write(line + "\n")
+            output_stream.flush()
+        log(f"NOTIFICATION SENT: {method}")
+    except Exception as e:
+        log(f"NOTIFICATION ERROR: {e}")
+
+
+_last_known_sessions = None
+
+def session_watcher_loop(output_stream):
+    """Monitors active WinDbg sessions and notifies Zed when sessions come online/offline."""
+    global _last_known_sessions, _current_port
+    check_count = 0
+    while True:
+        try:
+            time.sleep(2.0)
+            check_count += 1
+
+            # Fast check: if current session is healthy, do full scan only every 6 seconds
+            if _last_known_sessions and check_count % 3 != 0:
+                quick_res = scan_port(_current_port)
+                if quick_res:
+                    continue  # Session is healthy and unchanged
+
+            current_sessions = get_sessions()
+            curr_ports = sorted([s.get("port", 9999) for s in current_sessions])
+
+            if _last_known_sessions is not None and curr_ports != _last_known_sessions:
+                log(f"Session list changed: {_last_known_sessions} -> {curr_ports}. Sending notifications/tools/list_changed.")
+                if curr_ports:
+                    _current_port = curr_ports[0]
+                send_notification(output_stream, "notifications/tools/list_changed")
+            _last_known_sessions = curr_ports
+        except Exception as e:
+            log(f"Session watcher error: {e}")
+
+
 def get_connection(host, port, timeout=60.0):
     """Retrieves or creates a persistent HTTP connection (thread-safe)."""
     key = f"{host}:{port}"
@@ -301,7 +337,7 @@ def forward_post(host, port, path, body_bytes, timeout=60.0):
 
 
 def scan_port(port):
-    """Scans a single port for an active WinDbg MCP guest session."""
+    """Scans a single port for active WinDbg MCP guest sessions."""
     url = f"http://{GUEST_IP}:{port}/sessions"
     try:
         req = urllib.request.Request(url, method="GET")
@@ -309,8 +345,6 @@ def scan_port(port):
             if f.getcode() == 200:
                 data = json.loads(f.read().decode("utf-8"))
                 if isinstance(data, list):
-                    for s in data:
-                        s["port"] = port
                     return data
     except Exception:
         pass
@@ -320,14 +354,16 @@ def scan_port(port):
 def get_sessions():
     """Discover all active WinDbg MCP sessions in the guest VM."""
     ports_to_try = [BASE_PORT] + [p for p in range(BASE_PORT + 1, BASE_PORT + 11)]
-    sessions = []
+    unique_sessions = {}
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=len(ports_to_try)
     ) as executor:
         results = executor.map(scan_port, ports_to_try)
         for res in results:
-            sessions.extend(res)
-    return sessions
+            for s in res:
+                if isinstance(s, dict) and "port" in s:
+                    unique_sessions[s["port"]] = s
+    return list(unique_sessions.values())
 
 
 def handle_list_sessions(req_id):
@@ -385,8 +421,7 @@ def handle_request(line, output_stream):
 
                     if "capabilities" in resp_data["result"]:
                         caps = resp_data["result"]["capabilities"]
-                        if "tools" not in caps:
-                            caps["tools"] = {}
+                        caps["tools"] = {"listChanged": True}
                         log(f"Backend init successful on :{_current_port}")
 
                 send_response(output_stream, resp_data)
@@ -399,7 +434,7 @@ def handle_request(line, output_stream):
                     "id": req_id,
                     "result": {
                         "protocolVersion": requested_version,
-                        "capabilities": {"tools": {}},
+                        "capabilities": {"tools": {"listChanged": True}},
                         "serverInfo": {
                             "name": "windbg-bridge-gateway",
                             "version": "1.1.0",
@@ -674,14 +709,15 @@ def main():
     atexit.register(release_global_mutex)
 
     if not acquire_global_mutex():
-        msg = "CRITICAL: Another WinDbg MCP launcher already owns Local\\dbgxmcp. Exiting."
-        log(msg)
-        sys.stderr.write(msg + "\n")
-        sys.exit(1)
+        log("Notice: Another WinDbg MCP launcher mutex exists. Continuing multi-client stdio bridge session.")
 
     log(f"Bridge Gateway started (Guest: {GUEST_IP})")
     input_stream = sys.stdin
     output_stream = sys.stdout
+
+    # Start background session watcher thread to auto-notify Zed on session changes
+    watcher_thread = threading.Thread(target=session_watcher_loop, args=(output_stream,), daemon=True)
+    watcher_thread.start()
 
     while True:
         try:

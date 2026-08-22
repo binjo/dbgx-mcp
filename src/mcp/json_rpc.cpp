@@ -1,6 +1,7 @@
 #include "dbgx/mcp/json_rpc.hpp"
 #include "dbgx/windbg/catalog.hpp"
 #include "dbgx/mcp/syntypes_js.hpp"
+#include <atomic>
 #include <algorithm>
 #include <cstdlib>
 #include <utility>
@@ -325,6 +326,83 @@ MethodOutcome HandleToolsList() {
       "\"required\":[\"struct_definition\",\"struct_name\",\"address\"],"
       "\"additionalProperties\":false"
       "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.get_modules\","
+      "\"description\":\"List all loaded PE modules with base address, size, checksum, timestamp, and symbol status in structured JSON format.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.get_breakpoints\","
+      "\"description\":\"List all set breakpoints with ID, address, symbol, command, enabled status, and hit count in structured JSON format.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.disassemble\","
+      "\"description\":\"Disassemble code at specified address for N instructions, returning structured JSON array of instructions.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address to disassemble from\"},"
+      "\"count\":{\"type\":\"integer\",\"description\":\"Number of instructions to disassemble (default 10, max 200)\"}"
+      "},"
+      "\"required\":[\"address\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.read_string\","
+      "\"description\":\"Read ASCII or UTF-16 string at specified virtual memory address.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address of string in virtual memory\"},"
+      "\"max_length\":{\"type\":\"integer\",\"description\":\"Maximum characters to read (default 256, max 4096)\"},"
+      "\"wide\":{\"type\":\"boolean\",\"description\":\"True for UTF-16 (wchar_t), false for ASCII/UTF-8 (default false)\"}"
+      "},"
+      "\"required\":[\"address\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.step\","
+      "\"description\":\"Step execution. Set step_over=true (default) to step over ('p'), or false to step in ('t').\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"step_over\":{\"type\":\"boolean\",\"description\":\"True to step over ('p'), false to step into ('t'). Default true.\"}"
+      "},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.continue\","
+      "\"description\":\"Continue target execution ('g').\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.set_breakpoint\","
+      "\"description\":\"Set a breakpoint at specified expression/address ('bp').\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"expression\":{\"type\":\"string\",\"description\":\"Address or symbol expression for breakpoint (e.g. 'main' or '0x7ff7a8811000')\"}"
+      "},"
+      "\"required\":[\"expression\"],"
+      "\"additionalProperties\":false"
+      "}"
       "}"
       "]"
       "}";
@@ -609,9 +687,11 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     std::string module_name = "bootmgr";
     json::TryGetStringField(arguments_fields, "module_name", &module_name);
 
-    // 1. Resolve %TEMP%\synthetic_inline.h path on guest
+    // 1. Resolve unique %TEMP%\synthetic_inline_<PID>_<SEQ>.h path on guest
+    static std::atomic<uint64_t> s_inline_header_seq{0};
+    std::string temp_var = "%TEMP%\\synthetic_inline_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(++s_inline_header_seq) + ".h";
     char expanded_temp[MAX_PATH];
-    DWORD temp_size = ExpandEnvironmentStringsA("%TEMP%\\synthetic_inline.h", expanded_temp, MAX_PATH);
+    DWORD temp_size = ExpandEnvironmentStringsA(temp_var.c_str(), expanded_temp, MAX_PATH);
     std::string inline_h_path = (temp_size > 0 && temp_size <= MAX_PATH) ? std::string(expanded_temp) : "C:\\temp\\synthetic_inline.h";
 
     // 2. Write the struct_definition inline to %TEMP%\synthetic_inline.h
@@ -710,6 +790,52 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
       execution.error_message = std::string("Filesystem exception: ") + e.what();
     }
     is_json_output = true;
+  } else if (tool_name == "windbg.get_modules") {
+    execution = executor->GetModules();
+    is_json_output = true;
+  } else if (tool_name == "windbg.get_breakpoints") {
+    execution = executor->GetBreakpoints();
+    is_json_output = true;
+  } else if (tool_name == "windbg.disassemble") {
+    std::string addr_str;
+    if (!json::TryGetStringField(arguments_fields, "address", &addr_str)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: address is required";
+      return outcome;
+    }
+    int count = 10;
+    json::TryGetIntField(arguments_fields, "count", &count);
+    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
+    execution = executor->Disassemble(address, (uint32_t)count);
+    is_json_output = true;
+  } else if (tool_name == "windbg.read_string") {
+    std::string addr_str;
+    if (!json::TryGetStringField(arguments_fields, "address", &addr_str)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: address is required";
+      return outcome;
+    }
+    int max_length = 256;
+    json::TryGetIntField(arguments_fields, "max_length", &max_length);
+    bool wide = false;
+    json::TryGetBoolField(arguments_fields, "wide", &wide);
+    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
+    execution = executor->ReadString(address, (uint32_t)max_length, wide);
+    is_json_output = true;
+  } else if (tool_name == "windbg.step") {
+    bool step_over = true;
+    json::TryGetBoolField(arguments_fields, "step_over", &step_over);
+    execution = executor->Step(step_over);
+  } else if (tool_name == "windbg.continue") {
+    execution = executor->ContinueTarget();
+  } else if (tool_name == "windbg.set_breakpoint") {
+    std::string expr;
+    if (!json::TryGetStringField(arguments_fields, "expression", &expr) || expr.empty()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: expression is required";
+      return outcome;
+    }
+    execution = executor->SetBreakpoint(expr);
   } else {
     outcome.error_code = -32602;
     outcome.error_message = "Invalid params: unknown tool name";

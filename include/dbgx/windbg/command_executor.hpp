@@ -47,6 +47,13 @@ class IWinDbgCommandExecutor {
   virtual SessionMetadata GetSessionMetadata() = 0;
   virtual DebuggerExecutionState GetExecutionState() = 0;
   virtual bool InterruptTarget() = 0;
+  virtual CommandExecutionResult GetModules() = 0;
+  virtual CommandExecutionResult GetBreakpoints() = 0;
+  virtual CommandExecutionResult Disassemble(std::uint64_t address, std::uint32_t count = 10) = 0;
+  virtual CommandExecutionResult ReadString(std::uint64_t address, std::uint32_t max_length = 256, bool wide = false) = 0;
+  virtual CommandExecutionResult Step(bool step_over = true) = 0;
+  virtual CommandExecutionResult ContinueTarget() = 0;
+  virtual CommandExecutionResult SetBreakpoint(const std::string& expression) = 0;
 };
 
 }  // namespace dbgx::windbg

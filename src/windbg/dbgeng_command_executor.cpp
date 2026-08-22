@@ -146,18 +146,6 @@ DbgEngCommandExecutor::DbgEngCommandExecutor() {
     (void)client_.As(&control_);
   }
 
-  // Create a separate IDebugControl in the MTA so background HTTP threads can call SetInterrupt 
-  // directly without COM marshalling to the main thread (which lacks a message pump in headless cdb.exe).
-  std::thread init_thread([this]() {
-    (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    Microsoft::WRL::ComPtr<IDebugClient> mta_client;
-    if (SUCCEEDED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(mta_client.GetAddressOf())))) {
-      (void)mta_client.As(&interrupt_control_);
-    }
-    CoUninitialize();
-  });
-  init_thread.join();
-
   worker_thread_ = std::thread(&DbgEngCommandExecutor::WorkerThreadProc, this);
 }
 
@@ -173,14 +161,22 @@ DbgEngCommandExecutor::~DbgEngCommandExecutor() {
 }
 
 CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command, const CommandExecutionOptions& options) {
-  auto state = GetExecutionState();
-  if (!state.ready_for_commands) {
-    return {
-        false,
-        "",
-        "Debugger is not ready for commands (status: " + state.status_name + "). "
-        "Query execution state first and call windbg.interrupt if you need to break in."
-    };
+  return DispatchToWorker([this, command, options]() {
+    return ExecuteSynchronously(command, options);
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::DispatchToWorker(TaskFunction func, bool check_ready) {
+  if (check_ready) {
+    auto state = GetExecutionState();
+    if (!state.ready_for_commands) {
+      return {
+          false,
+          "",
+          "Debugger is not ready for commands (status: " + state.status_name + "). "
+          "Query execution state first and call windbg.interrupt if you need to break in."
+      };
+    }
   }
 
   std::promise<CommandExecutionResult> promise;
@@ -188,7 +184,7 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
 
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
-    task_queue_.push(ExecutionTask{command, options, std::move(promise)});
+    task_queue_.push(ExecutionTask{std::move(func), std::move(promise)});
   }
   cv_.notify_one();
   return future.get();
@@ -196,6 +192,11 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
 
 void DbgEngCommandExecutor::WorkerThreadProc() {
   (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  Microsoft::WRL::ComPtr<IDebugClient> mta_client;
+  if (SUCCEEDED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(mta_client.GetAddressOf())))) {
+    (void)mta_client.As(&interrupt_control_);
+  }
+
   while (true) {
     ExecutionTask task;
     {
@@ -208,7 +209,7 @@ void DbgEngCommandExecutor::WorkerThreadProc() {
       task_queue_.pop();
     }
 
-    CommandExecutionResult result = ExecuteSynchronously(task.command, task.options);
+    CommandExecutionResult result = task.func();
     task.promise.set_value(result);
   }
   CoUninitialize();
@@ -330,6 +331,12 @@ DebuggerExecutionState DbgEngCommandExecutor::ParseRawStatus(std::uint32_t raw_s
 }
 
 CommandExecutionResult DbgEngCommandExecutor::EvaluateModel(const std::string& expression, int max_depth) {
+  return DispatchToWorker([this, expression, max_depth]() {
+    return EvaluateModelSynchronously(expression, max_depth);
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::EvaluateModelSynchronously(const std::string& expression, int max_depth) {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
@@ -367,6 +374,12 @@ CommandExecutionResult DbgEngCommandExecutor::EvaluateModel(const std::string& e
 }
 
 CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshot() {
+  return DispatchToWorker([this]() {
+    return GetContextSnapshotSynchronously();
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously() {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
@@ -435,6 +448,12 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshot() {
 }
 
 CommandExecutionResult DbgEngCommandExecutor::ReadMemory(std::uint64_t address, std::uint32_t length) {
+  return DispatchToWorker([this, address, length]() {
+    return ReadMemorySynchronously(address, length);
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::ReadMemorySynchronously(std::uint64_t address, std::uint32_t length) {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
@@ -466,6 +485,12 @@ CommandExecutionResult DbgEngCommandExecutor::ReadMemory(std::uint64_t address, 
 }
 
 CommandExecutionResult DbgEngCommandExecutor::CarvePE(std::uint64_t address, std::uint32_t length) {
+  return DispatchToWorker([this, address, length]() {
+    return CarvePESynchronously(address, length);
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::CarvePESynchronously(std::uint64_t address, std::uint32_t length) {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
@@ -583,6 +608,12 @@ CommandExecutionResult DbgEngCommandExecutor::CarvePE(std::uint64_t address, std
 }
 
 CommandExecutionResult DbgEngCommandExecutor::WriteMemory(std::uint64_t address, const std::string& hex_data) {
+  return DispatchToWorker([this, address, hex_data]() {
+    return WriteMemorySynchronously(address, hex_data);
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::WriteMemorySynchronously(std::uint64_t address, const std::string& hex_data) {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
@@ -628,6 +659,15 @@ CommandExecutionResult DbgEngCommandExecutor::SearchMemory(
     std::uint64_t start_address,
     std::uint64_t end_address,
     const std::string& pattern) {
+  return DispatchToWorker([this, start_address, end_address, pattern]() {
+    return SearchMemorySynchronously(start_address, end_address, pattern);
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::SearchMemorySynchronously(
+    std::uint64_t start_address,
+    std::uint64_t end_address,
+    const std::string& pattern) {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
@@ -668,10 +708,301 @@ CommandExecutionResult DbgEngCommandExecutor::SearchMemory(
   }
 
   writer.EndArray();
+
   return {true, writer.GetJSON(), ""};
 }
 
+CommandExecutionResult DbgEngCommandExecutor::GetModules() {
+  return DispatchToWorker([this]() {
+    return GetModulesSynchronously();
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::GetModulesSynchronously() {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugSymbols3> symbols;
+  if (FAILED(client.As(&symbols))) {
+    return {false, "", "IDebugSymbols3 not available"};
+  }
+
+  ULONG loaded = 0, unloaded = 0;
+  if (FAILED(symbols->GetNumberModules(&loaded, &unloaded))) {
+    return {false, "", "GetNumberModules failed"};
+  }
+
+  mcp::JsonWriter writer;
+  writer.StartArray();
+  for (ULONG i = 0; i < loaded; ++i) {
+    ULONG64 base = 0;
+    if (SUCCEEDED(symbols->GetModuleByIndex(i, &base))) {
+      DEBUG_MODULE_PARAMETERS params{};
+      if (SUCCEEDED(symbols->GetModuleParameters(1, &base, 0, &params))) {
+        char name[MAX_PATH] = {0};
+        char image_name[MAX_PATH] = {0};
+        symbols->GetModuleNameString(DEBUG_MODNAME_MODULE, i, base, name, sizeof(name), nullptr);
+        symbols->GetModuleNameString(DEBUG_MODNAME_IMAGE, i, base, image_name, sizeof(image_name), nullptr);
+
+        writer.StartObject();
+        writer.Key("name");
+        writer.StringValue(name[0] ? name : "unknown");
+        writer.Key("image_name");
+        writer.StringValue(image_name[0] ? image_name : "");
+        writer.Key("base");
+        writer.HexValue(params.Base);
+        writer.Key("size");
+        writer.IntValue(params.Size);
+        writer.Key("checksum");
+        writer.HexValue(params.Checksum);
+        writer.Key("timestamp");
+        writer.HexValue(params.TimeDateStamp);
+        writer.Key("symbol_type");
+        switch (params.SymbolType) {
+          case DEBUG_SYMTYPE_NONE: writer.StringValue("None"); break;
+          case DEBUG_SYMTYPE_COFF: writer.StringValue("COFF"); break;
+          case DEBUG_SYMTYPE_CODEVIEW: writer.StringValue("CodeView"); break;
+          case DEBUG_SYMTYPE_PDB: writer.StringValue("PDB"); break;
+          case DEBUG_SYMTYPE_EXPORT: writer.StringValue("Export"); break;
+          case DEBUG_SYMTYPE_DEFERRED: writer.StringValue("Deferred"); break;
+          case DEBUG_SYMTYPE_SYM: writer.StringValue("SYM"); break;
+          case DEBUG_SYMTYPE_DIA: writer.StringValue("DIA"); break;
+          default: writer.StringValue("Other"); break;
+        }
+        writer.EndObject();
+      }
+    }
+  }
+  writer.EndArray();
+  return {true, writer.GetJSON(), ""};
+}
+
+CommandExecutionResult DbgEngCommandExecutor::GetBreakpoints() {
+  return DispatchToWorker([this]() {
+    return GetBreakpointsSynchronously();
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::GetBreakpointsSynchronously() {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugControl> control;
+  if (FAILED(client.As(&control))) {
+    return {false, "", "IDebugControl not available"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugSymbols> symbols;
+  client.As(&symbols);
+
+  ULONG num_bps = 0;
+  if (FAILED(control->GetNumberBreakpoints(&num_bps))) {
+    return {false, "", "GetNumberBreakpoints failed"};
+  }
+
+  mcp::JsonWriter writer;
+  writer.StartArray();
+  for (ULONG i = 0; i < num_bps; ++i) {
+    Microsoft::WRL::ComPtr<IDebugBreakpoint> bp;
+    if (SUCCEEDED(control->GetBreakpointByIndex(i, &bp))) {
+      ULONG id = 0;
+      ULONG flags = 0;
+      ULONG64 offset = 0;
+      ULONG hit_count = 0;
+      char cmd[512] = {0};
+
+      bp->GetId(&id);
+      bp->GetFlags(&flags);
+      bp->GetOffset(&offset);
+      bp->GetCurrentPassCount(&hit_count);
+      bp->GetCommand(cmd, sizeof(cmd), nullptr);
+
+      writer.StartObject();
+      writer.Key("id");
+      writer.IntValue(id);
+      writer.Key("enabled");
+      writer.BoolValue((flags & DEBUG_BREAKPOINT_ENABLED) != 0);
+      writer.Key("address");
+      writer.HexValue(offset);
+
+      if (symbols && offset != 0) {
+        char sym_name[256] = {0};
+        ULONG64 disp = 0;
+        if (SUCCEEDED(symbols->GetNameByOffset(offset, sym_name, sizeof(sym_name), nullptr, &disp))) {
+          std::string sym = sym_name;
+          if (disp > 0) sym += "+0x" + std::to_string(disp);
+          writer.Key("symbol");
+          writer.StringValue(sym);
+        }
+      }
+
+      writer.Key("command");
+      writer.StringValue(cmd);
+      writer.Key("hit_count");
+      writer.IntValue(hit_count);
+      writer.EndObject();
+    }
+  }
+  writer.EndArray();
+  return {true, writer.GetJSON(), ""};
+}
+
+CommandExecutionResult DbgEngCommandExecutor::Disassemble(std::uint64_t address, std::uint32_t count) {
+  return DispatchToWorker([this, address, count]() {
+    return DisassembleSynchronously(address, count);
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::DisassembleSynchronously(std::uint64_t address, std::uint32_t count) {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugControl> control;
+  if (FAILED(client.As(&control))) {
+    return {false, "", "IDebugControl not available"};
+  }
+
+  if (count > 200) count = 200;
+
+  ULONG64 current_offset = address;
+  mcp::JsonWriter writer;
+  writer.StartArray();
+
+  for (std::uint32_t i = 0; i < count; ++i) {
+    char buffer[256] = {0};
+    ULONG disasm_size = 0;
+    ULONG64 next_offset = 0;
+    HRESULT hr = control->Disassemble(current_offset, 0, buffer, sizeof(buffer), &disasm_size, &next_offset);
+    if (FAILED(hr)) {
+      break;
+    }
+
+    std::string line = buffer;
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+      line.pop_back();
+    }
+
+    writer.StartObject();
+    writer.Key("address");
+    writer.HexValue(current_offset);
+    writer.Key("disassembly");
+    writer.StringValue(line);
+    writer.EndObject();
+
+    if (next_offset == current_offset) break;
+    current_offset = next_offset;
+  }
+  writer.EndArray();
+  return {true, writer.GetJSON(), ""};
+}
+
+CommandExecutionResult DbgEngCommandExecutor::ReadString(std::uint64_t address, std::uint32_t max_length, bool wide) {
+  return DispatchToWorker([this, address, max_length, wide]() {
+    return ReadStringSynchronously(address, max_length, wide);
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::ReadStringSynchronously(std::uint64_t address, std::uint32_t max_length, bool wide) {
+  Microsoft::WRL::ComPtr<IDebugClient> client;
+  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+    return {false, "", "DebugCreate failed"};
+  }
+
+  Microsoft::WRL::ComPtr<IDebugDataSpaces> data;
+  if (FAILED(client.As(&data))) {
+    return {false, "", "IDebugDataSpaces not available"};
+  }
+
+  if (max_length > 4096) max_length = 4096;
+
+  mcp::JsonWriter writer;
+  writer.StartObject();
+  writer.Key("address");
+  writer.HexValue(address);
+
+  if (wide) {
+    std::vector<wchar_t> buf(max_length + 1, 0);
+    ULONG bytes_read = 0;
+    HRESULT hr = data->ReadVirtual(address, buf.data(), max_length * sizeof(wchar_t), &bytes_read);
+    size_t chars_read = bytes_read / sizeof(wchar_t);
+    size_t len = 0;
+    while (len < chars_read && buf[len] != L'\0') {
+      len++;
+    }
+    std::vector<char> utf8(len * 4 + 1, 0);
+    int u8_len = WideCharToMultiByte(CP_UTF8, 0, buf.data(), static_cast<int>(len), utf8.data(), static_cast<int>(utf8.size()), nullptr, nullptr);
+    std::string str_val(utf8.data(), u8_len > 0 ? u8_len : 0);
+
+    writer.Key("string");
+    writer.StringValue(str_val);
+    writer.Key("length");
+    writer.IntValue(static_cast<int>(len));
+    writer.Key("truncated");
+    writer.BoolValue(len >= max_length);
+  } else {
+    std::vector<char> buf(max_length + 1, 0);
+    ULONG bytes_read = 0;
+    HRESULT hr = data->ReadVirtual(address, buf.data(), max_length, &bytes_read);
+    size_t len = 0;
+    while (len < bytes_read && buf[len] != '\0') {
+      len++;
+    }
+    std::string str_val;
+    str_val.reserve(len);
+    for (size_t i = 0; i < len; ++i) {
+      unsigned char c = static_cast<unsigned char>(buf[i]);
+      if (c >= 0x20 && c <= 0x7e) {
+        str_val.push_back(c);
+      } else if (c == '\t' || c == '\n' || c == '\r') {
+        str_val.push_back(c);
+      } else {
+        str_val.push_back('?');
+      }
+    }
+
+    writer.Key("string");
+    writer.StringValue(str_val);
+    writer.Key("length");
+    writer.IntValue(static_cast<int>(len));
+    writer.Key("truncated");
+    writer.BoolValue(len >= max_length);
+  }
+  writer.EndObject();
+
+  return {true, writer.GetJSON(), ""};
+}
+
+CommandExecutionResult DbgEngCommandExecutor::Step(bool step_over) {
+  return DispatchToWorker([this, step_over]() {
+    return ExecuteSynchronously(step_over ? "p" : "t", {});
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::ContinueTarget() {
+  return DispatchToWorker([this]() {
+    return ExecuteSynchronously("g", {});
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::SetBreakpoint(const std::string& expression) {
+  return DispatchToWorker([this, expression]() {
+    return ExecuteSynchronously("bp " + expression, {});
+  }, true);
+}
+
 CommandExecutionResult DbgEngCommandExecutor::GetThreads() {
+  return DispatchToWorker([this]() {
+    return GetThreadsSynchronously();
+  }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::GetThreadsSynchronously() {
   Microsoft::WRL::ComPtr<IDebugClient> client;
   if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
     return {false, "", "DebugCreate failed"};
@@ -714,65 +1045,75 @@ CommandExecutionResult DbgEngCommandExecutor::GetThreads() {
 }
 
 SessionMetadata DbgEngCommandExecutor::GetSessionMetadata() {
-  SessionMetadata metadata;
-  metadata.process_id = GetCurrentProcessId();
+  std::promise<SessionMetadata> promise;
+  auto future = promise.get_future();
 
-  Microsoft::WRL::ComPtr<IDebugClient> client;
-  if (FAILED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
-    return metadata;
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    task_queue_.push(ExecutionTask{
+        [this, &promise]() -> CommandExecutionResult {
+          SessionMetadata metadata;
+          metadata.process_id = GetCurrentProcessId();
+
+          Microsoft::WRL::ComPtr<IDebugClient> client;
+          if (SUCCEEDED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(client.GetAddressOf())))) {
+            Microsoft::WRL::ComPtr<IDebugSystemObjects> systems;
+            if (SUCCEEDED(client.As(&systems))) {
+              ULONG pid = 0;
+              if (SUCCEEDED(systems->GetCurrentProcessSystemId(&pid))) {
+                metadata.process_id = static_cast<std::uint32_t>(pid);
+              }
+
+              char exe_name[MAX_PATH];
+              if (SUCCEEDED(systems->GetCurrentProcessExecutableName(exe_name, sizeof(exe_name), nullptr))) {
+                metadata.executable_name = exe_name;
+              }
+            }
+
+            Microsoft::WRL::ComPtr<IDebugControl> control;
+            if (SUCCEEDED(client.As(&control))) {
+              ULONG type = 0;
+              ULONG qual = 0;
+              if (SUCCEEDED(control->GetDebuggeeType(&type, &qual))) {
+                metadata.target_info = "Type=" + std::to_string(type) + ", Qual=" + std::to_string(qual);
+                if (type == DEBUG_CLASS_USER_WINDOWS) {
+                  metadata.debuggee_class = "user";
+                } else if (type == DEBUG_CLASS_KERNEL) {
+                  metadata.debuggee_class = "kernel";
+                } else {
+                  metadata.debuggee_class = "other (" + std::to_string(type) + ")";
+                }
+              }
+
+              ULONG proc_type = 0;
+              if (SUCCEEDED(control->GetEffectiveProcessorType(&proc_type))) {
+                switch (proc_type) {
+                  case IMAGE_FILE_MACHINE_I386:
+                    metadata.architecture = "x86";
+                    break;
+                  case IMAGE_FILE_MACHINE_AMD64:
+                    metadata.architecture = "x64";
+                    break;
+                  case IMAGE_FILE_MACHINE_ARM64:
+                    metadata.architecture = "arm64";
+                    break;
+                  case IMAGE_FILE_MACHINE_ARM:
+                    metadata.architecture = "arm";
+                    break;
+                  default:
+                    metadata.architecture = "unknown (0x" + std::to_string(proc_type) + ")";
+                    break;
+                }
+              }
+            }
+          }
+          promise.set_value(metadata);
+          return {true, "", ""};
+        },
+        std::promise<CommandExecutionResult>()});
   }
-
-  Microsoft::WRL::ComPtr<IDebugSystemObjects> systems;
-  if (SUCCEEDED(client.As(&systems))) {
-    ULONG pid = 0;
-    if (SUCCEEDED(systems->GetCurrentProcessSystemId(&pid))) {
-      metadata.process_id = static_cast<std::uint32_t>(pid);
-    }
-
-    char exe_name[MAX_PATH];
-    if (SUCCEEDED(systems->GetCurrentProcessExecutableName(exe_name, sizeof(exe_name), nullptr))) {
-      metadata.executable_name = exe_name;
-    }
-  }
-
-  Microsoft::WRL::ComPtr<IDebugControl> control;
-  if (SUCCEEDED(client.As(&control))) {
-    ULONG type = 0;
-    ULONG qual = 0;
-    if (SUCCEEDED(control->GetDebuggeeType(&type, &qual))) {
-      metadata.target_info = "Type=" + std::to_string(type) + ", Qual=" + std::to_string(qual);
-      if (type == DEBUG_CLASS_USER_WINDOWS) {
-        metadata.debuggee_class = "user";
-      } else if (type == DEBUG_CLASS_KERNEL) {
-        metadata.debuggee_class = "kernel";
-      } else {
-        metadata.debuggee_class = "other (" + std::to_string(type) + ")";
-      }
-    }
-
-    ULONG proc_type = 0;
-    if (SUCCEEDED(control->GetEffectiveProcessorType(&proc_type))) {
-      switch (proc_type) {
-        case IMAGE_FILE_MACHINE_I386:
-          metadata.architecture = "x86";
-          break;
-        case IMAGE_FILE_MACHINE_AMD64:
-          metadata.architecture = "x64";
-          break;
-        case IMAGE_FILE_MACHINE_ARM64:
-          metadata.architecture = "arm64";
-          break;
-        case IMAGE_FILE_MACHINE_ARM:
-          metadata.architecture = "arm";
-          break;
-        default:
-          metadata.architecture = "unknown (0x" + std::to_string(proc_type) + ")";
-          break;
-      }
-    }
-  }
-
-  return metadata;
+  cv_.notify_one();
+  return future.get();
 }
 
 }  // namespace dbgx::windbg
