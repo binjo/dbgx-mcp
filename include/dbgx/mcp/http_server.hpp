@@ -43,26 +43,21 @@ using HttpRequestHandler = std::function<HttpResponse(const HttpRequest& request
 bool IsOriginAllowed(std::string_view origin_header);
 
 class HttpServer {
- public:
+public:
   HttpServer();
   ~HttpServer();
 
   HttpServer(const HttpServer&) = delete;
   HttpServer& operator=(const HttpServer&) = delete;
 
-  bool Start(
-      const std::string& host,
-      std::uint16_t port,
-      HttpRequestHandler handler,
-      std::string* error_message,
-      HttpServerStartReport* start_report = nullptr,
-      const HttpServerStartOptions* start_options = nullptr);
+  bool Start(const std::string& host, std::uint16_t port, HttpRequestHandler handler, std::string* error_message,
+             HttpServerStartReport* start_report = nullptr, const HttpServerStartOptions* start_options = nullptr);
   void Stop();
 
   bool IsRunning() const;
   std::uint16_t BoundPort() const;
 
- private:
+private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

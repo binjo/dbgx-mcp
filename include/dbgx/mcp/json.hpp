@@ -12,11 +12,8 @@ bool ParseObjectFields(std::string_view json_text, FieldMap* out_fields, std::st
 bool TryGetStringField(const FieldMap& fields, const std::string& key, std::string* out_value);
 bool TryGetIntField(const FieldMap& fields, const std::string& key, int* out_value);
 bool TryGetBoolField(const FieldMap& fields, const std::string& key, bool* out_value);
-bool TryGetObjectField(
-    const FieldMap& fields,
-    const std::string& key,
-    FieldMap* out_fields,
-    std::string* error_message);
+bool TryGetObjectField(const FieldMap& fields, const std::string& key, FieldMap* out_fields,
+                       std::string* error_message);
 bool TryGetRawField(const FieldMap& fields, const std::string& key, std::string* out_raw_value);
 
 std::string Escape(std::string_view text);

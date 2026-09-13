@@ -12,7 +12,8 @@ namespace dbgx::windbg {
 namespace {
 
 std::string WideToUtf8(std::wstring_view wide) {
-  if (wide.empty()) return "";
+  if (wide.empty())
+    return "";
   int size_needed = WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(), NULL, 0, NULL, NULL);
   std::string strTo(size_needed, 0);
   WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(), &strTo[0], size_needed, NULL, NULL);
@@ -89,7 +90,8 @@ void ModelSerializer::Serialize(IModelObject* object, mcp::JsonWriter& writer, i
   SerializeRecursive(object, writer, 0, max_depth);
 }
 
-void ModelSerializer::SerializeRecursive(IModelObject* object, mcp::JsonWriter& writer, int current_depth, int max_depth) {
+void ModelSerializer::SerializeRecursive(IModelObject* object, mcp::JsonWriter& writer, int current_depth,
+                                         int max_depth) {
   if (object == nullptr) {
     writer.NullValue();
     return;
@@ -147,7 +149,8 @@ void ModelSerializer::SerializeRecursive(IModelObject* object, mcp::JsonWriter& 
   SerializeDisplayString(object, writer);
 }
 
-void ModelSerializer::SerializeIntrinsic(IModelObject* object, const VARIANT& vt, mcp::JsonWriter& writer, int current_depth, int max_depth) {
+void ModelSerializer::SerializeIntrinsic(IModelObject* object, const VARIANT& vt, mcp::JsonWriter& writer,
+                                         int current_depth, int max_depth) {
   switch (vt.vt) {
     case VT_BSTR:
       writer.StringValue(WideToUtf8(vt.bstrVal ? vt.bstrVal : L""));
@@ -192,7 +195,8 @@ void ModelSerializer::SerializeIntrinsic(IModelObject* object, const VARIANT& vt
   }
 }
 
-bool ModelSerializer::TrySerializeIterable(IModelObject* object, mcp::JsonWriter& writer, int current_depth, int max_depth) {
+bool ModelSerializer::TrySerializeIterable(IModelObject* object, mcp::JsonWriter& writer, int current_depth,
+                                           int max_depth) {
   ComPtr<IIterableConcept> iter_concept;
   if (FAILED(GetConceptSafe(object, __uuidof(IIterableConcept), &iter_concept))) {
     return false;
@@ -213,7 +217,8 @@ bool ModelSerializer::TrySerializeIterable(IModelObject* object, mcp::JsonWriter
   return true;
 }
 
-bool ModelSerializer::TrySerializeKeys(IModelObject* object, mcp::JsonWriter& writer, int current_depth, int max_depth) {
+bool ModelSerializer::TrySerializeKeys(IModelObject* object, mcp::JsonWriter& writer, int current_depth,
+                                       int max_depth) {
   ComPtr<IKeyEnumerator> keys;
   // Use EnumerateKeyValuesSafe to get the actual property values rather than just names
   if (FAILED(EnumerateKeyValuesSafe(object, &keys))) {
@@ -282,7 +287,8 @@ void ModelSerializer::SerializeDisplayString(IModelObject* object, mcp::JsonWrit
     BSTR display_str = nullptr;
     if (SUCCEEDED(ToDisplayStringSafe(display_concept.Get(), object, &display_str))) {
       writer.StringValue(WideToUtf8(display_str ? display_str : L""));
-      if (display_str) SysFreeString(display_str);
+      if (display_str)
+        SysFreeString(display_str);
       return;
     }
   }

@@ -222,10 +222,8 @@ void AppendTraceContext(const IoTraceContext* trace_context, std::string* summar
   }
 }
 
-void AppendRpcRequestMeta(
-    const RequestIoMeta& request_meta,
-    const IoTraceContext* trace_context,
-    std::string* summary) {
+void AppendRpcRequestMeta(const RequestIoMeta& request_meta, const IoTraceContext* trace_context,
+                          std::string* summary) {
   std::string rpc_method = "(missing)";
   if (trace_context != nullptr && !trace_context->rpc_method.empty()) {
     rpc_method = trace_context->rpc_method;
@@ -264,10 +262,8 @@ void AppendRpcRequestMeta(
   }
 }
 
-void AppendRpcResponseMeta(
-    const ResponseIoMeta& response_meta,
-    const IoTraceContext* trace_context,
-    std::string* summary) {
+void AppendRpcResponseMeta(const ResponseIoMeta& response_meta, const IoTraceContext* trace_context,
+                           std::string* summary) {
   std::string rpc_id;
   if (trace_context != nullptr && !trace_context->rpc_id.empty()) {
     rpc_id = trace_context->rpc_id;

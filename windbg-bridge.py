@@ -1,8 +1,8 @@
 """Bridge Gateway for WinDbg Model Context Protocol (MCP).
 
 This script acts as a proxy between MCP clients (like Zed or Claude Desktop)
-and a remote WinDbg session running the dbgx-mcp extension. It handles
-Stdio-to-HTTP translation, multi-session discovery, protocol stability,
+and a remote or local WinDbg session running the dbgx-mcp extension. It handles
+Stdio-to-HTTP/Pipe translation, multi-session discovery, protocol stability,
 command guardrails, smart TTL caching, and error enrichment.
 """
 
@@ -24,13 +24,21 @@ GUEST_IP = next(
     (v for k, v in os.environ.items() if k.lower() in ("windbg_mcp_bind", "windbg_mcp_host")),
     "127.0.0.1",
 )
+# Transport mode: "auto" (prefers Named Pipe if local Windows, otherwise HTTP), "pipe", or "http"
+TRANSPORT_MODE = next(
+    (v.lower() for k, v in os.environ.items() if k.lower() == "windbg_mcp_transport"),
+    "auto",
+)
 # Well-known base port for the WinDbg MCP server
 BASE_PORT = 5678
 # Path to the diagnostic log file
 LOG_FILE = os.path.join(tempfile.gettempdir(), "windbg-bridge.log")
 
-# Global state to track the currently selected backend port
+# Global state to track the currently selected backend port and sessions
 _current_port = BASE_PORT
+_current_pipe_name = None
+_session_map = {}  # { port: session_dict }
+_session_map_lock = threading.Lock()
 
 # Threading locks and pools
 _stdout_lock = threading.Lock()
@@ -116,7 +124,9 @@ def get_timeout_for_request(req_data) -> float:
         return 60.0
 
     params = req_data.get("params", {})
-    tool_name = params.get("name")
+    tool_name = params.get("name", "")
+    if tool_name.startswith("windbg_"):
+        tool_name = "windbg." + tool_name[7:]
     tool_args = params.get("arguments", {})
 
     if tool_name == "windbg.eval":
@@ -241,26 +251,21 @@ _last_known_sessions = None
 
 def session_watcher_loop(output_stream):
     """Monitors active WinDbg sessions and notifies Zed when sessions come online/offline."""
-    global _last_known_sessions, _current_port
+    global _last_known_sessions, _current_port, _current_pipe_name
     check_count = 0
     while True:
         try:
             time.sleep(2.0)
             check_count += 1
 
-            # Fast check: if current session is healthy, do full scan only every 6 seconds
-            if _last_known_sessions and check_count % 3 != 0:
-                quick_res = scan_port(_current_port)
-                if quick_res:
-                    continue  # Session is healthy and unchanged
-
             current_sessions = get_sessions()
             curr_ports = sorted([s.get("port", 9999) for s in current_sessions])
 
             if _last_known_sessions is not None and curr_ports != _last_known_sessions:
                 log(f"Session list changed: {_last_known_sessions} -> {curr_ports}. Sending notifications/tools/list_changed.")
-                if curr_ports:
-                    _current_port = curr_ports[0]
+                if current_sessions:
+                    _current_port = current_sessions[0].get("port", BASE_PORT)
+                    _current_pipe_name = current_sessions[0].get("pipe_name")
                 send_notification(output_stream, "notifications/tools/list_changed")
             _last_known_sessions = curr_ports
         except Exception as e:
@@ -288,6 +293,80 @@ def get_connection_lock(key):
             lock = threading.Lock()
             _conn_locks[key] = lock
         return lock
+
+
+def forward_pipe(pipe_name, body_bytes, timeout=60.0):
+    """Forwards a JSON-RPC request over a local Windows Named Pipe with ultra-low latency."""
+    if not pipe_name.startswith(r"\\.\pipe"):
+        full_pipe_path = r"\\.\pipe" + "\\" + pipe_name
+    else:
+        full_pipe_path = pipe_name
+
+    if sys.platform != "win32":
+        raise NotImplementedError("Named Pipe transport is only supported on Windows")
+
+    import ctypes
+    from ctypes import wintypes
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    ERROR_PIPE_BUSY = 231
+    ERROR_FILE_NOT_FOUND = 2
+
+    CreateFileW = ctypes.windll.kernel32.CreateFileW
+    CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    CreateFileW.restype = wintypes.HANDLE
+
+    WaitNamedPipeW = ctypes.windll.kernel32.WaitNamedPipeW
+    WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+    WaitNamedPipeW.restype = wintypes.BOOL
+
+    CloseHandle = ctypes.windll.kernel32.CloseHandle
+    ReadFile = ctypes.windll.kernel32.ReadFile
+    WriteFile = ctypes.windll.kernel32.WriteFile
+
+    deadline = time.time() + timeout
+    handle = None
+
+    while time.time() < deadline:
+        h = CreateFileW(full_pipe_path, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
+        if h != wintypes.HANDLE(-1).value and h != 0:
+            handle = h
+            break
+
+        err = ctypes.windll.kernel32.GetLastError()
+        if err == ERROR_PIPE_BUSY:
+            WaitNamedPipeW(full_pipe_path, 1000)
+            continue
+        elif err == ERROR_FILE_NOT_FOUND:
+            time.sleep(0.05)
+            continue
+        else:
+            raise IOError(f"Failed to open named pipe '{full_pipe_path}' (Error {err})")
+
+    if handle is None:
+        raise IOError(f"Timeout waiting for named pipe '{full_pipe_path}'")
+
+    try:
+        msg = body_bytes if body_bytes.endswith(b"\n") else body_bytes + b"\n"
+        written = wintypes.DWORD(0)
+        if not WriteFile(handle, msg, len(msg), ctypes.byref(written), None):
+            err = ctypes.windll.kernel32.GetLastError()
+            raise IOError(f"WriteFile failed on pipe '{full_pipe_path}' (Error {err})")
+
+        resp_buf = bytearray()
+        chunk = ctypes.create_string_buffer(4096)
+        read_bytes = wintypes.DWORD(0)
+        while True:
+            if not ReadFile(handle, chunk, 4096, ctypes.byref(read_bytes), None) or read_bytes.value == 0:
+                break
+            resp_buf.extend(chunk.raw[:read_bytes.value])
+            if b"\n" in resp_buf:
+                break
+        return bytes(resp_buf).strip(), 200
+    finally:
+        CloseHandle(handle)
 
 
 def forward_post(host, port, path, body_bytes, timeout=60.0):
@@ -336,6 +415,52 @@ def forward_post(host, port, path, body_bytes, timeout=60.0):
             return data, resp.status
 
 
+def forward_mcp_message(session, body_bytes, timeout=60.0):
+    """Dispatches a JSON-RPC message to the session via Named Pipe or HTTP based on availability and settings."""
+    pipe_name = session.get("pipe_name") if isinstance(session, dict) else None
+    port = session.get("port", BASE_PORT) if isinstance(session, dict) else session
+
+    use_pipe = (
+        sys.platform == "win32"
+        and GUEST_IP == "127.0.0.1"
+        and TRANSPORT_MODE in ("auto", "pipe")
+        and pipe_name is not None
+    )
+
+    if use_pipe:
+        try:
+            return forward_pipe(pipe_name, body_bytes, timeout=timeout)
+        except Exception as e:
+            log(f"Pipe dispatch to '{pipe_name}' failed ({e}). Falling back to HTTP.")
+            if TRANSPORT_MODE == "pipe":
+                raise
+
+    return forward_post(GUEST_IP, port, "/mcp", body_bytes, timeout=timeout)
+
+
+def is_process_alive(pid: int) -> bool:
+    """Checks if a process ID is currently running on the system."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ctypes.windll.kernel32.GetLastError() == 5  # Access Denied means alive
+        exit_code = wintypes.DWORD(0)
+        if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return exit_code.value == 259  # STILL_ACTIVE
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+
 def scan_port(port):
     """Scans a single port for active WinDbg MCP guest sessions."""
     url = f"http://{GUEST_IP}:{port}/sessions"
@@ -352,7 +477,42 @@ def scan_port(port):
 
 
 def get_sessions():
-    """Discover all active WinDbg MCP sessions in the guest VM."""
+    """Discover all active WinDbg MCP sessions (instant local registry read or remote HTTP scan)."""
+    global _session_map
+
+    # Fast local filesystem registry discovery (< 0.1 ms)
+    if GUEST_IP == "127.0.0.1":
+        registry_dir = os.path.join(tempfile.gettempdir(), "dbgx-mcp-registry")
+        if os.path.exists(registry_dir):
+            sessions = []
+            try:
+                for entry in os.listdir(registry_dir):
+                    if entry.endswith(".json"):
+                        fpath = os.path.join(registry_dir, entry)
+                        try:
+                            with open(fpath, "r", encoding="utf-8") as f:
+                                data = json.load(f)
+                            if isinstance(data, dict):
+                                host_pid = data.get("pid")
+                                if host_pid and not is_process_alive(host_pid):
+                                    try:
+                                        os.remove(fpath)
+                                    except Exception:
+                                        pass
+                                    continue
+                                sessions.append(data)
+                        except Exception:
+                            pass
+                if sessions:
+                    with _session_map_lock:
+                        for s in sessions:
+                            if "port" in s:
+                                _session_map[s["port"]] = s
+                    return sorted(sessions, key=lambda x: x.get("port", 9999))
+            except Exception as e:
+                log(f"Local registry scan error: {e}")
+
+    # Fallback to parallel HTTP scanning for remote VMs
     ports_to_try = [BASE_PORT] + [p for p in range(BASE_PORT + 1, BASE_PORT + 11)]
     unique_sessions = {}
     with concurrent.futures.ThreadPoolExecutor(
@@ -363,7 +523,43 @@ def get_sessions():
             for s in res:
                 if isinstance(s, dict) and "port" in s:
                     unique_sessions[s["port"]] = s
-    return list(unique_sessions.values())
+
+    result_list = list(unique_sessions.values())
+    with _session_map_lock:
+        for s in result_list:
+            if "port" in s:
+                _session_map[s["port"]] = s
+    return sorted(result_list, key=lambda x: x.get("port", 9999))
+
+
+def get_default_tools_list():
+    """Returns the full static tool definition catalog to ensure Zed registers all tools immediately."""
+    tools = [
+        {"name": "windbg.eval", "description": "Execute WinDbg command. Results returned as filtered/truncated text. Supports optional max_lines and pattern filters.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}, "max_lines": {"type": "integer"}, "pattern": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["command"]}},
+        {"name": "windbg.dx", "description": "Evaluate WinDbg C++ Data Model expressions (dx) and serialize directly to structured JSON.", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "max_depth": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["expression"]}},
+        {"name": "windbg.get_context", "description": "Get structured CPU register snapshot and call stack frames with symbol resolution.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
+        {"name": "windbg.get_modules", "description": "Get structured list of all loaded modules, base addresses, sizes, checksums, and symbol statuses.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
+        {"name": "windbg.get_breakpoints", "description": "Get structured list of all active breakpoints, offsets, hit counts, and commands.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
+        {"name": "windbg.disassemble", "description": "Disassemble instructions at given address or current EIP/RIP.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "count": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
+        {"name": "windbg.read_memory", "description": "Read raw memory block at virtual address as hex string.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "length": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
+        {"name": "windbg.write_memory", "description": "Write raw bytes from hex string to virtual address.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "hex_data": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["address", "hex_data"]}},
+        {"name": "windbg.search", "description": "Search virtual memory range for byte pattern.", "inputSchema": {"type": "object", "properties": {"start_address": {"type": "string"}, "end_address": {"type": "string"}, "pattern": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["start_address", "end_address", "pattern"]}},
+        {"name": "windbg.read_string", "description": "Read ASCII or UTF-16 wide string from memory address.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "max_length": {"type": "integer"}, "wide": {"type": "boolean"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
+        {"name": "windbg.carve_pe", "description": "Reconstruct and carve mapped PE image from memory back to file-aligned raw bytes.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "length": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
+        {"name": "windbg.get_threads", "description": "Get list of all target threads with thread IDs and current active thread flag.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
+        {"name": "windbg.get_execution_state", "description": "Check if target is running, busy, or broken in and ready for commands.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
+        {"name": "windbg.interrupt", "description": "Send interrupt signal to break into running target.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
+        {"name": "windbg.step", "description": "Step single instruction (step-over by default, or step-into).", "inputSchema": {"type": "object", "properties": {"step_over": {"type": "boolean"}, "session_id": {"type": "integer"}}}},
+        {"name": "windbg.continue", "description": "Resume target execution (equivalent to 'g').", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
+        {"name": "windbg.set_breakpoint", "description": "Set breakpoint at symbol or expression.", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["expression"]}},
+        {"name": "windbg.search_catalog", "description": "Search built-in WinDbg command documentation catalog.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
+        {"name": "windbg.get_catalog_entry", "description": "Retrieve full documentation for command by ID.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+        {"name": "windbg.apply_struct", "description": "Dynamically apply C struct definition to memory address.", "inputSchema": {"type": "object", "properties": {"struct_definition": {"type": "string"}, "struct_name": {"type": "string"}, "address": {"type": "string"}, "module_name": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["struct_definition", "struct_name", "address"]}},
+        {"name": "windbg.write_file", "description": "Write file directly onto Windows filesystem.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+        {"name": "windbg.get_session_metadata", "description": "Get metadata about active debugging target.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
+        {"name": "windbg.list_sessions", "description": "List all active WinDbg MCP sessions in host/guest.", "inputSchema": {"type": "object", "properties": {}}}
+    ]
+    return tools
 
 
 def handle_list_sessions(req_id):
@@ -383,7 +579,7 @@ def handle_list_sessions(req_id):
 
 def handle_request(line, output_stream):
     """Processes an individual JSON-RPC request from start to finish."""
-    global _current_port
+    global _current_port, _current_pipe_name
     try:
         req_data = json.loads(line)
         req_id = req_data.get("id")
@@ -400,20 +596,22 @@ def handle_request(line, output_stream):
         if method == "initialize":
             requested_version = params.get("protocolVersion", "2024-11-05")
             log(
-                f"Searching for active WinDbg sessions (Requested version: {requested_version})..."
+                f"Searching for active WinDbg sessions (Requested version: {requested_version}, Transport: {TRANSPORT_MODE})..."
             )
             sessions = get_sessions()
+            active_session = None
             if sessions:
-                _current_port = sorted(sessions, key=lambda x: x.get("port", 9999))[0][
-                    "port"
-                ]
-                log(f"Found active session on port :{_current_port}. Using as default.")
+                active_session = sessions[0]
+                _current_port = active_session.get("port", BASE_PORT)
+                _current_pipe_name = active_session.get("pipe_name")
+                log(f"Found active session on port :{_current_port} (pipe: {_current_pipe_name}). Using as default.")
             else:
                 log(f"No active sessions found. Falling back to base port :{BASE_PORT}")
+                active_session = {"port": BASE_PORT, "pipe_name": f"dbgx-mcp-{BASE_PORT}"}
 
             try:
-                resp_bytes, status = forward_post(
-                    GUEST_IP, _current_port, "/mcp", line.encode("utf-8"), timeout=60.0
+                resp_bytes, status = forward_mcp_message(
+                    active_session, line.encode("utf-8"), timeout=60.0
                 )
                 resp_data = json.loads(resp_bytes.decode("utf-8"))
                 if "result" in resp_data:
@@ -437,7 +635,7 @@ def handle_request(line, output_stream):
                         "capabilities": {"tools": {"listChanged": True}},
                         "serverInfo": {
                             "name": "windbg-bridge-gateway",
-                            "version": "1.1.0",
+                            "version": "1.2.0",
                         },
                     },
                 }
@@ -446,14 +644,16 @@ def handle_request(line, output_stream):
 
         # 3. Handle Tool Discovery
         if method == "tools/list":
+            sessions = get_sessions()
+            active_session = sessions[0] if sessions else {"port": _current_port, "pipe_name": _current_pipe_name}
             try:
-                resp_bytes, status = forward_post(
-                    GUEST_IP, _current_port, "/mcp", line.encode("utf-8"), timeout=60.0
+                resp_bytes, status = forward_mcp_message(
+                    active_session, line.encode("utf-8"), timeout=60.0
                 )
                 resp_data = json.loads(resp_bytes.decode("utf-8"))
                 if "result" in resp_data and "tools" in resp_data["result"]:
                     for tool in resp_data["result"]["tools"]:
-                        if tool["name"].startswith("windbg."):
+                        if tool["name"].startswith("windbg.") or tool["name"].startswith("windbg_"):
                             props = tool.setdefault("inputSchema", {}).setdefault(
                                 "properties", {}
                             )
@@ -469,33 +669,21 @@ def handle_request(line, output_stream):
                         {
                             "name": "windbg.list_sessions",
                             "description": (
-                                "List all active WinDbg MCP sessions in the guest VM."
+                                "List all active WinDbg MCP sessions in the host/guest VM."
                             ),
                             "inputSchema": {"type": "object", "properties": {}},
                         }
                     )
                 send_response(output_stream, resp_data)
             except Exception as e:
-                log(f"TOOLS/LIST BACKEND FAIL on :{_current_port}: {e}")
+                log(f"TOOLS/LIST BACKEND FAIL on :{_current_port}: {e}. Returning full catalog.")
                 send_response(
                     output_stream,
                     {
                         "jsonrpc": "2.0",
                         "id": req_id,
                         "result": {
-                            "tools": [
-                                {
-                                    "name": "windbg.list_sessions",
-                                    "description": (
-                                        "List active sessions (Backend "
-                                        "currently unreachable)."
-                                    ),
-                                    "inputSchema": {
-                                        "type": "object",
-                                        "properties": {},
-                                    },
-                                }
-                            ]
+                            "tools": get_default_tools_list()
                         },
                     },
                 )
@@ -503,7 +691,14 @@ def handle_request(line, output_stream):
 
         # 4. Handle Execution
         if method == "tools/call":
-            tool_name = params.get("name")
+            raw_tool_name = params.get("name", "")
+            tool_name = raw_tool_name
+            # Normalize tool_name if client uses underscore notation
+            if tool_name.startswith("windbg_"):
+                tool_name = "windbg." + tool_name[7:]
+                req_data["params"]["name"] = tool_name
+                line = json.dumps(req_data)
+
             tool_args = params.get("arguments", {})
 
             if tool_name in ("windbg.list_sessions", "list_sessions"):
@@ -515,6 +710,10 @@ def handle_request(line, output_stream):
                 del tool_args["session_id"]
                 req_data["params"]["arguments"] = tool_args
                 line = json.dumps(req_data)
+
+            # Resolve target session metadata
+            with _session_map_lock:
+                target_session = _session_map.get(target_port, {"port": target_port, "pipe_name": f"dbgx-mcp-{target_port}"})
 
             # --- GUARDRAIL INTERCEPTOR ---
             if tool_name == "windbg.eval":
@@ -542,27 +741,29 @@ def handle_request(line, output_stream):
                             cache_time, cached_res = cached_item
                             if time.time() - cache_time < ttl:
                                 log(f"CACHE HIT: '{command}' on :{target_port}")
-                                # CRITICAL FIX: Clone and swap the ID to match current request context!
                                 resp_to_send = dict(cached_res)
                                 resp_to_send["id"] = req_id
                                 send_response(output_stream, resp_to_send)
                                 return
         else:
             target_port = _current_port
+            with _session_map_lock:
+                target_session = _session_map.get(target_port, {"port": target_port, "pipe_name": f"dbgx-mcp-{target_port}"})
 
-        # Generic Forwarding to Backend
+        # Forwarding to Backend via Pipe / HTTP
         try:
             req_timeout = get_timeout_for_request(req_data)
-            log(f"FORWARD_POST: using adaptive timeout {req_timeout}s for tool/command")
-            resp_bytes, status = forward_post(
-                GUEST_IP, target_port, "/mcp", line.encode("utf-8"), timeout=req_timeout
+            log(f"FORWARD: using adaptive timeout {req_timeout}s for tool/command on target {target_port}")
+            resp_bytes, status = forward_mcp_message(
+                target_session, line.encode("utf-8"), timeout=req_timeout
             )
             if resp_bytes:
                 resp_json = json.loads(resp_bytes.decode("utf-8"))
 
                 # Intercept results to cache or enrich errors
                 if method == "tools/call":
-                    tool_name = params.get("name")
+                    raw_tool_name = params.get("name", "")
+                    tool_name = "windbg." + raw_tool_name[7:] if raw_tool_name.startswith("windbg_") else raw_tool_name
 
                     if tool_name == "windbg.eval":
                         command = tool_args.get("command", "")
@@ -593,7 +794,7 @@ def handle_request(line, output_stream):
                         {"jsonrpc": "2.0", "id": req_id, "result": {}},
                     )
         except Exception as e:
-            log(f"FORWARD ERROR to :{target_port}: {e}")
+            log(f"FORWARD ERROR to target {target_port}: {e}")
             if req_id is not None:
                 send_response(
                     output_stream,
@@ -616,23 +817,14 @@ _posix_lock_file = None
 
 
 def acquire_global_mutex() -> bool:
-    """Acquires a system-wide single ownership lock.
-    
-    On Windows, uses the system-wide 'Local\\dbgxmcp' named mutex.
-    On macOS/Linux, uses standard POSIX fcntl file locking on a temporary file.
-    
-    Returns True if the lock was successfully acquired,
-    otherwise False if another bridge instance is already running.
-    """
+    """Acquires a system-wide single ownership lock."""
     global _global_mutex_handle, _posix_lock_file
 
     if sys.platform != "win32":
         try:
             import fcntl
             lock_path = os.path.join(tempfile.gettempdir(), "dbgxmcp.lock")
-            # Open the file for writing (create if not exists)
             _posix_lock_file = open(lock_path, "w")
-            # Try to acquire an exclusive, non-blocking file lock
             fcntl.flock(_posix_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             log(f"Acquired system-wide POSIX file lock at '{lock_path}'")
             return True
@@ -647,7 +839,7 @@ def acquire_global_mutex() -> bool:
             return False
         except Exception as e:
             log(f"POSIX file locking failed: {e}")
-            return True  # Fallback to True if something fails unexpectedly
+            return True
 
     try:
         import ctypes
@@ -678,7 +870,7 @@ def acquire_global_mutex() -> bool:
         return True
     except Exception as e:
         log(f"Mutex creation failed: {e}")
-        return True  # Fallback to True if something fails unexpectedly in ctypes loading
+        return True
 
 
 def release_global_mutex():
@@ -705,13 +897,12 @@ def release_global_mutex():
 
 def main():
     """Main execution loop for the bridge gateway."""
-    # Register the clean-up handler for the mutex lock
     atexit.register(release_global_mutex)
 
     if not acquire_global_mutex():
         log("Notice: Another WinDbg MCP launcher mutex exists. Continuing multi-client stdio bridge session.")
 
-    log(f"Bridge Gateway started (Guest: {GUEST_IP})")
+    log(f"Bridge Gateway started (Guest: {GUEST_IP}, Transport: {TRANSPORT_MODE})")
     input_stream = sys.stdin
     output_stream = sys.stdout
 

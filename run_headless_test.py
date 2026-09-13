@@ -46,15 +46,15 @@ def run_reload():
 def main():
     ts_print("Launching cdb.exe in the background with the user-mode dump...")
     cmd = [cdb_path, "-z", dmp_path, "-c", ".load dbgx-mcp"]
-    
+
     # We use DEVNULL to prevent OS pipe buffers from filling up and blocking cdb.exe
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
-    
+
     try:
         # Wait 4 seconds for the HTTP server to initialize
         ts_print("Waiting 4 seconds for HTTP server to spin up...")
         time.sleep(4)
-        
+
         # Verify the session is up
         ts_print("Verifying session status via /sessions...")
         try:
@@ -107,7 +107,7 @@ def main():
         # Wait for the reload thread to join
         ts_print("Waiting for reload thread to join...")
         t.join()
-        
+
     finally:
         ts_print("Terminating cdb.exe...")
         proc.terminate()

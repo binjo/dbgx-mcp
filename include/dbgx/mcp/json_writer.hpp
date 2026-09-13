@@ -1,13 +1,13 @@
 #pragma once
 
 #include <string>
-#include <vector>
 #include <string_view>
+#include <vector>
 
 namespace dbgx::mcp {
 
 class JsonWriter {
- public:
+public:
   JsonWriter();
 
   void StartArray();
@@ -30,7 +30,7 @@ class JsonWriter {
 
   std::string GetJSON() const { return json_; }
 
- private:
+private:
   struct Scope {
     bool is_array;
     bool has_items;
@@ -140,7 +140,8 @@ inline void JsonWriter::RawValue(std::string_view json) {
 }
 
 inline void JsonWriter::MaybeComma() {
-  if (stack_.size() <= 1) return;
+  if (stack_.size() <= 1)
+    return;
   auto& scope = stack_.back();
   if (scope.has_items && (scope.is_array || !scope.is_key_pending)) {
     json_ += ',';

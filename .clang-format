@@ -1,0 +1,14 @@
+BasedOnStyle: Google
+Language: Cpp
+Standard: c++17
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+ColumnLimit: 120
+AccessModifierOffset: -2
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+DerivePointerAlignment: false
+PointerAlignment: Left
+SpacesBeforeTrailingComments: 2

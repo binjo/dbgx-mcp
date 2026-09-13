@@ -15,12 +15,12 @@ struct JsonRpcHttpResult {
 };
 
 class JsonRpcRouter {
- public:
+public:
   explicit JsonRpcRouter(windbg::IWinDbgCommandExecutor* executor);
 
   JsonRpcHttpResult HandleJsonRpcPost(std::string_view request_body) const;
 
- private:
+private:
   windbg::IWinDbgCommandExecutor* executor_;
 };
 

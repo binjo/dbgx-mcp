@@ -45,6 +45,7 @@ string(REPLACE ";" "|" WINDBG_REQUIRED_EXPORTS_WITH_SENTINEL_ARG "${WINDBG_REQUI
 
 add_library(dbgx-mcp SHARED
   src/mcp/http_server.cpp
+  src/mcp/pipe_server.cpp
   src/mcp/io_echo.cpp
   src/mcp/json.cpp
   src/mcp/json_rpc.cpp
@@ -100,6 +101,7 @@ enable_testing()
 
 add_executable(unit_tests
   src/mcp/http_server.cpp
+  src/mcp/pipe_server.cpp
   src/mcp/io_echo.cpp
   src/mcp/json.cpp
   src/mcp/json_rpc.cpp

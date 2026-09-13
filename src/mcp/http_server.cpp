@@ -8,13 +8,14 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <objbase.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <objbase.h>
 
 namespace dbgx::mcp {
 
@@ -41,9 +42,8 @@ std::string FormatSocketError(int error_code) {
 
 std::string ToLower(std::string_view value) {
   std::string lowered(value);
-  std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
-    return static_cast<char>(std::tolower(ch));
-  });
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   return lowered;
 }
 
@@ -85,11 +85,7 @@ std::string StatusText(int status_code) {
 bool SendAll(SOCKET socket, const std::string& text) {
   std::size_t sent_total = 0;
   while (sent_total < text.size()) {
-    const int sent = send(
-        socket,
-        text.data() + sent_total,
-        static_cast<int>(text.size() - sent_total),
-        0);
+    const int sent = send(socket, text.data() + sent_total, static_cast<int>(text.size() - sent_total), 0);
     if (sent <= 0) {
       return false;
     }
@@ -139,12 +135,8 @@ bool ParseContentLength(std::string_view value, std::size_t* out_content_length)
   return true;
 }
 
-bool ParseHttpRequest(
-    const std::string& raw,
-    std::size_t header_end,
-    std::size_t body_length,
-    HttpRequest* out_request,
-    std::string* error_message) {
+bool ParseHttpRequest(const std::string& raw, std::size_t header_end, std::size_t body_length, HttpRequest* out_request,
+                      std::string* error_message) {
   if (out_request == nullptr) {
     if (error_message != nullptr) {
       *error_message = "Request output is null";
@@ -203,65 +195,79 @@ bool ParseHttpRequest(
   return true;
 }
 
-bool ReceiveRequest(SOCKET socket, HttpRequest* out_request, std::string* error_message) {
-  std::string received;
-  received.reserve(8192);
+bool TryParseBufferedRequest(std::string& received, HttpRequest* out_request, std::string* error_message,
+                             bool* request_ready) {
+  *request_ready = false;
+  std::size_t header_end = received.find("\r\n\r\n");
+  if (header_end == std::string::npos) {
+    return true;  // Need more data
+  }
 
-  char buffer[4096];
-  std::size_t header_end = std::string::npos;
+  const std::string header_text(received.data(), header_end);
   std::size_t content_length = 0;
+  std::size_t line_start = 0;
 
-  while (true) {
-    const int bytes = recv(socket, buffer, static_cast<int>(sizeof(buffer)), 0);
-    if (bytes <= 0) {
-      break;
-    }
+  while (line_start < header_text.size()) {
+    const std::size_t line_end = header_text.find("\r\n", line_start);
+    const std::size_t this_end = line_end == std::string_view::npos ? header_text.size() : line_end;
+    const std::string_view line(header_text.data() + line_start, this_end - line_start);
 
-    received.append(buffer, static_cast<std::size_t>(bytes));
-
-    if (received.size() > (kMaxHeaderBytes + kMaxBodyBytes + 4)) {
-      if (error_message != nullptr) {
-        *error_message = "Request is too large";
-      }
-      return false;
-    }
-
-    if (header_end == std::string::npos) {
-      header_end = received.find("\r\n\r\n");
-      if (header_end != std::string::npos) {
-        const std::string header_text(received.data(), header_end);
-        std::size_t line_start = 0;
-        while (line_start < header_text.size()) {
-          const std::size_t line_end = header_text.find("\r\n", line_start);
-          const std::size_t this_end = line_end == std::string::npos ? header_text.size() : line_end;
-          const std::string_view line(header_text.data() + line_start, this_end - line_start);
-
-          const std::size_t colon = line.find(':');
-          if (colon != std::string_view::npos) {
-            const std::string key = ToLower(Trim(line.substr(0, colon)));
-            if (key == "content-length") {
-              if (!ParseContentLength(line.substr(colon + 1), &content_length)) {
-                if (error_message != nullptr) {
-                  *error_message = "Invalid Content-Length";
-                }
-                return false;
-              }
-            }
+    const std::size_t colon = line.find(':');
+    if (colon != std::string_view::npos) {
+      const std::string key = ToLower(Trim(line.substr(0, colon)));
+      if (key == "content-length") {
+        if (!ParseContentLength(line.substr(colon + 1), &content_length)) {
+          if (error_message != nullptr) {
+            *error_message = "Invalid Content-Length";
           }
-
-          if (line_end == std::string::npos) {
-            break;
-          }
-          line_start = line_end + 2;
+          return false;
         }
       }
     }
 
-    if (header_end != std::string::npos) {
-      const std::size_t needed = header_end + 4 + content_length;
-      if (received.size() >= needed) {
-        return ParseHttpRequest(received, header_end, content_length, out_request, error_message);
+    if (line_end == std::string::npos) {
+      break;
+    }
+    line_start = line_end + 2;
+  }
+
+  const std::size_t needed = header_end + 4 + content_length;
+  if (received.size() >= needed) {
+    if (!ParseHttpRequest(received, header_end, content_length, out_request, error_message)) {
+      return false;
+    }
+    received.erase(0, needed);
+    *request_ready = true;
+    return true;
+  }
+
+  return true;  // Need more data
+}
+
+bool ReceiveRequest(SOCKET socket, std::string& buffer, HttpRequest* out_request, std::string* error_message) {
+  char chunk[4096];
+
+  while (true) {
+    bool request_ready = false;
+    if (!TryParseBufferedRequest(buffer, out_request, error_message, &request_ready)) {
+      return false;
+    }
+    if (request_ready) {
+      return true;
+    }
+
+    const int bytes = recv(socket, chunk, static_cast<int>(sizeof(chunk)), 0);
+    if (bytes <= 0) {
+      break;
+    }
+
+    buffer.append(chunk, static_cast<std::size_t>(bytes));
+
+    if (buffer.size() > (kMaxHeaderBytes + kMaxBodyBytes + 4)) {
+      if (error_message != nullptr) {
+        *error_message = "Request is too large";
       }
+      return false;
     }
   }
 
@@ -271,15 +277,18 @@ bool ReceiveRequest(SOCKET socket, HttpRequest* out_request, std::string* error_
   return false;
 }
 
-std::string BuildHttpResponseText(const HttpResponse& response) {
+std::string BuildHttpResponseText(const HttpResponse& response, bool keep_alive) {
   std::ostringstream output;
   output << "HTTP/1.1 " << response.status_code << ' ' << StatusText(response.status_code) << "\r\n";
-  output << "Connection: close\r\n";
+  if (keep_alive) {
+    output << "Connection: keep-alive\r\n";
+  } else {
+    output << "Connection: close\r\n";
+  }
 
   if (response.has_body) {
     output << "Content-Type: "
-           << (response.content_type.empty() ? "application/json; charset=utf-8" : response.content_type)
-           << "\r\n";
+           << (response.content_type.empty() ? "application/json; charset=utf-8" : response.content_type) << "\r\n";
     output << "Content-Length: " << response.body.size() << "\r\n";
     output << "\r\n";
     output << response.body;
@@ -301,6 +310,10 @@ struct HttpServer::Impl {
   HttpRequestHandler handler;
   std::uint16_t bound_port = 0;
   bool wsa_initialized = false;
+
+  std::mutex clients_mutex;
+  std::vector<SOCKET> active_clients;
+  std::vector<std::thread> client_threads;
 };
 
 bool IsOriginAllowed(std::string_view origin_header) {
@@ -324,13 +337,9 @@ HttpServer::~HttpServer() {
   Stop();
 }
 
-bool HttpServer::Start(
-    const std::string& host,
-    std::uint16_t port,
-    HttpRequestHandler handler,
-    std::string* error_message,
-    HttpServerStartReport* start_report,
-    const HttpServerStartOptions* start_options) {
+bool HttpServer::Start(const std::string& host, std::uint16_t port, HttpRequestHandler handler,
+                       std::string* error_message, HttpServerStartReport* start_report,
+                       const HttpServerStartOptions* start_options) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
 
   std::uint16_t attempt_count = 0;
@@ -416,9 +425,7 @@ bool HttpServer::Start(
     SOCKET listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_socket == INVALID_SOCKET) {
       const int socket_error = WSAGetLastError();
-      return fail_start(
-          "Failed to create listening socket (" + FormatSocketError(socket_error) + ")",
-          socket_error);
+      return fail_start("Failed to create listening socket (" + FormatSocketError(socket_error) + ")", socket_error);
     }
 
     sockaddr_in address{};
@@ -437,8 +444,7 @@ bool HttpServer::Start(
       }
 
       return fail_start(
-          "Bind failed on port " + std::to_string(last_attempted_port) +
-              " (" + FormatSocketError(bind_error) + ")",
+          "Bind failed on port " + std::to_string(last_attempted_port) + " (" + FormatSocketError(bind_error) + ")",
           bind_error);
     }
 
@@ -446,8 +452,7 @@ bool HttpServer::Start(
       const int listen_error = WSAGetLastError();
       closesocket(listen_socket);
       return fail_start(
-          "Listen failed on port " + std::to_string(last_attempted_port) +
-              " (" + FormatSocketError(listen_error) + ")",
+          "Listen failed on port " + std::to_string(last_attempted_port) + " (" + FormatSocketError(listen_error) + ")",
           listen_error);
     }
 
@@ -458,8 +463,8 @@ bool HttpServer::Start(
   if (impl_->listen_socket == INVALID_SOCKET) {
     exhausted_conflicts = conflict_count > 0 && conflict_count == attempt_count;
     std::ostringstream error_stream;
-    error_stream << "Failed to bind HTTP server starting at port " << port << " after "
-                 << attempt_count << " attempt(s)";
+    error_stream << "Failed to bind HTTP server starting at port " << port << " after " << attempt_count
+                 << " attempt(s)";
     if (exhausted_conflicts) {
       error_stream << " (all attempts hit address-in-use)";
     } else if (last_error_code != 0) {
@@ -470,10 +475,7 @@ bool HttpServer::Start(
 
   sockaddr_in bound_address{};
   int bound_address_length = sizeof(bound_address);
-  if (getsockname(
-          impl_->listen_socket,
-          reinterpret_cast<sockaddr*>(&bound_address),
-          &bound_address_length) == 0) {
+  if (getsockname(impl_->listen_socket, reinterpret_cast<sockaddr*>(&bound_address), &bound_address_length) == 0) {
     impl_->bound_port = ntohs(bound_address.sin_port);
   } else {
     impl_->bound_port = last_attempted_port;
@@ -495,7 +497,7 @@ bool HttpServer::Start(
 
       timeval timeout{};
       timeout.tv_sec = 0;
-      timeout.tv_usec = 200000;
+      timeout.tv_usec = 100000;
 
       const int select_result = select(0, &read_set, nullptr, nullptr, &timeout);
       if (select_result <= 0) {
@@ -507,28 +509,74 @@ bool HttpServer::Start(
         continue;
       }
 
-      DWORD socket_timeout_ms = 10000; // 10 seconds timeout
-      setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&socket_timeout_ms), sizeof(socket_timeout_ms));
-      setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&socket_timeout_ms), sizeof(socket_timeout_ms));
+      // Disable Nagle's algorithm for low-latency JSON-RPC round-trips
+      int nodelay = 1;
+      setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
-      std::thread([this, client_socket]() {
+      DWORD socket_timeout_ms = 30000;  // 30 seconds keep-alive timeout
+      setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&socket_timeout_ms),
+                 sizeof(socket_timeout_ms));
+      setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&socket_timeout_ms),
+                 sizeof(socket_timeout_ms));
+
+      {
+        std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
+        impl_->active_clients.push_back(client_socket);
+      }
+
+      std::thread client_thread([this, client_socket]() {
         (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        HttpRequest request;
-        std::string parse_error;
-        HttpResponse response;
-        if (ReceiveRequest(client_socket, &request, &parse_error)) {
-          response = impl_->handler(request);
-        } else {
-          response.status_code = 400;
-          response.body = "{\"error\":\"" + parse_error + "\"}";
+        std::string buffer;
+        buffer.reserve(8192);
+
+        while (!impl_->stop_requested.load()) {
+          HttpRequest request;
+          std::string parse_error;
+          HttpResponse response;
+          if (ReceiveRequest(client_socket, buffer, &request, &parse_error)) {
+            response = impl_->handler(request);
+          } else {
+            // Socket closed or malformed request
+            break;
+          }
+
+          bool client_wants_close = false;
+          auto it = request.headers.find("connection");
+          if (it != request.headers.end()) {
+            if (ToLower(Trim(it->second)) == "close") {
+              client_wants_close = true;
+            }
+          }
+
+          const bool keep_alive = !client_wants_close && !impl_->stop_requested.load();
+          const std::string response_text = BuildHttpResponseText(response, keep_alive);
+          if (!SendAll(client_socket, response_text)) {
+            break;
+          }
+
+          if (!keep_alive) {
+            break;
+          }
         }
 
-        const std::string response_text = BuildHttpResponseText(response);
-        SendAll(client_socket, response_text);
         shutdown(client_socket, SD_BOTH);
         closesocket(client_socket);
+
+        {
+          std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
+          auto it = std::find(impl_->active_clients.begin(), impl_->active_clients.end(), client_socket);
+          if (it != impl_->active_clients.end()) {
+            impl_->active_clients.erase(it);
+          }
+        }
+
         CoUninitialize();
-      }).detach();
+      });
+
+      {
+        std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
+        impl_->client_threads.push_back(std::move(client_thread));
+      }
     }
 
     impl_->running.store(false);
@@ -555,8 +603,31 @@ void HttpServer::Stop() {
     impl_->listen_socket = INVALID_SOCKET;
   }
 
+  // Close all active client connections to unblock worker loops
+  {
+    std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
+    for (SOCKET client : impl_->active_clients) {
+      if (client != INVALID_SOCKET) {
+        shutdown(client, SD_BOTH);
+        closesocket(client);
+      }
+    }
+  }
+
   if (impl_->worker.joinable()) {
     impl_->worker.join();
+  }
+
+  // Join all client threads cleanly before unloading
+  {
+    std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
+    for (auto& th : impl_->client_threads) {
+      if (th.joinable()) {
+        th.join();
+      }
+    }
+    impl_->client_threads.clear();
+    impl_->active_clients.clear();
   }
 
   impl_->running.store(false);

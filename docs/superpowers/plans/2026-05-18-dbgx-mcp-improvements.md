@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 
+**Goal:**
 1. **Asynchronous Execution & Safe Target Interruption**: Move debugger command execution to a background worker thread to prevent blocking the HTTP server thread. Expose tools to check execution state and explicitly interrupt (`break`) the target debuggee.
 2. **Offline Command Catalog RAG Assistance**: Package a static WinDbg command documentation database within the DLL and expose search tools so AI agents can query exact debugger command syntax offline before execution, preventing hallucinations.
 
@@ -196,7 +196,7 @@ Currently, running command evaluations blocks the HTTP server thread. By running
   DebuggerExecutionState DbgEngCommandExecutor::ParseRawStatus(std::uint32_t raw_status) {
     DebuggerExecutionState state;
     state.raw_status = raw_status;
-    
+
     switch (raw_status) {
       case DEBUG_STATUS_GO:
         state.status_name = "go";
@@ -353,7 +353,7 @@ Providing documentation inside the DLL prevents AI clients from generating inval
       for (const auto& token : entry.tokens) {
         if (token == needle) score += 80;
       }
-      
+
       std::string title = entry.title;
       std::transform(title.begin(), title.end(), title.begin(), ::tolower);
       if (title.find(needle) != std::string::npos) score += 40;

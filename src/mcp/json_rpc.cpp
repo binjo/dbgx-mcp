@@ -1,15 +1,17 @@
 #include "dbgx/mcp/json_rpc.hpp"
-#include "dbgx/windbg/catalog.hpp"
-#include "dbgx/mcp/syntypes_js.hpp"
-#include <atomic>
-#include <algorithm>
-#include <cstdlib>
-#include <utility>
-#include <filesystem>
-#include <fstream>
+
 #include <windows.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <utility>
+
 #include "dbgx/mcp/json.hpp"
+#include "dbgx/mcp/syntypes_js.hpp"
+#include "dbgx/windbg/catalog.hpp"
 
 namespace dbgx::mcp {
 
@@ -113,9 +115,16 @@ MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
   outcome.ok = true;
   outcome.result_json =
       "{"
-      "\"protocolVersion\":\"" + json::Escape(requested_version) + "\","
-      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg.get_context\",\"windbg.read_memory\",\"windbg.carve_pe\",\"windbg.search\",\"windbg.get_execution_state\",\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\",\"windbg.get_session_metadata\",\"windbg.write_memory\",\"windbg.get_threads\",\"windbg.apply_synthetic_type\",\"windbg.write_file\",\"windbg.apply_struct\"]}},"
-      "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING "\"}"
+      "\"protocolVersion\":\"" +
+      json::Escape(requested_version) +
+      "\","
+      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg."
+      "get_context\",\"windbg.read_memory\",\"windbg.carve_pe\",\"windbg.search\",\"windbg.get_execution_state\","
+      "\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\",\"windbg.get_session_metadata\","
+      "\"windbg.write_memory\",\"windbg.get_threads\",\"windbg.apply_synthetic_type\",\"windbg.write_file\",\"windbg."
+      "apply_struct\"]}},"
+      "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING
+      "\"}"
       "}";
   return outcome;
 }
@@ -135,11 +144,14 @@ MethodOutcome HandleToolsList() {
       "\"tools\":["
       "{"
       "\"name\":\"windbg.eval\","
-      "\"description\":\"Execute WinDbg command. Results returned as filtered/truncated text. NOTE: WinDbg is inherently single-threaded for command execution; clients MUST run calls serially and wait for each call to finish before sending the next.\","
+      "\"description\":\"Execute WinDbg command. Results returned as filtered/truncated text. NOTE: WinDbg is "
+      "inherently single-threaded for command execution; clients MUST run calls serially and wait for each call to "
+      "finish before sending the next.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"command\":{\"type\":\"string\",\"description\":\"WinDbg command to execute. Because the debugger engine is single-threaded, clients should send commands one by one and wait for completion before the next command.\"},"
+      "\"command\":{\"type\":\"string\",\"description\":\"WinDbg command to execute. Because the debugger engine is "
+      "single-threaded, clients should send commands one by one and wait for completion before the next command.\"},"
       "\"max_lines\":{\"type\":\"integer\",\"description\":\"Max lines to return (default 100)\"},"
       "\"pattern\":{\"type\":\"string\",\"description\":\"Optional substring filter\"}"
       "},"
@@ -149,7 +161,9 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.dx\","
-      "\"description\":\"Evaluate WinDbg Data Model expression and return as structured JSON. NOTE: If a key/property contains non-identifier characters (like hyphens, spaces, or dots), query it using the @\\\"key\\\" syntax, e.g., Parent.@\\\"key-name\\\".\","
+      "\"description\":\"Evaluate WinDbg Data Model expression and return as structured JSON. NOTE: If a key/property "
+      "contains non-identifier characters (like hyphens, spaces, or dots), query it using the @\\\"key\\\" syntax, "
+      "e.g., Parent.@\\\"key-name\\\".\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
@@ -184,12 +198,14 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.carve_pe\","
-      "\"description\":\"Carve and reconstruct a Portable Executable (PE) image (DLL/EXE) directly from the target's virtual memory back into standard disk layout, resolving section offsets dynamically.\","
+      "\"description\":\"Carve and reconstruct a Portable Executable (PE) image (DLL/EXE) directly from the target's "
+      "virtual memory back into standard disk layout, resolving section offsets dynamically.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
       "\"address\":{\"type\":\"string\",\"description\":\"Hex base address of the mapped PE image in memory\"},"
-      "\"length\":{\"type\":\"integer\",\"description\":\"Estimated virtual size of the image to read (e.g. 40960 for 40KB)\"}"
+      "\"length\":{\"type\":\"integer\",\"description\":\"Estimated virtual size of the image to read (e.g. 40960 for "
+      "40KB)\"}"
       "},"
       "\"required\":[\"address\",\"length\"],"
       "\"additionalProperties\":false"
@@ -211,7 +227,8 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.get_execution_state\","
-      "\"description\":\"Query the current debugger execution state before deciding whether to interrupt or execute a command.\","
+      "\"description\":\"Query the current debugger execution state before deciding whether to interrupt or execute a "
+      "command.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{},"
@@ -220,7 +237,8 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.interrupt\","
-      "\"description\":\"Request a debugger break into the currently running target and wait until debugger commands are accepted again.\","
+      "\"description\":\"Request a debugger break into the currently running target and wait until debugger commands "
+      "are accepted again.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{},"
@@ -229,7 +247,8 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.search_catalog\","
-      "\"description\":\"Search the offline debugger command catalog (bp, dt, k, r, etc.) for exact syntax, parameters, and examples.\","
+      "\"description\":\"Search the offline debugger command catalog (bp, dt, k, r, etc.) for exact syntax, "
+      "parameters, and examples.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
@@ -254,7 +273,8 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.get_session_metadata\","
-      "\"description\":\"Get metadata for the current WinDbg session, such as process ID, architecture (e.g. x64, x86, arm64), debuggee class (user/kernel mode), executable name, and target info.\","
+      "\"description\":\"Get metadata for the current WinDbg session, such as process ID, architecture (e.g. x64, x86, "
+      "arm64), debuggee class (user/kernel mode), executable name, and target info.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{},"
@@ -263,12 +283,14 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.write_memory\","
-      "\"description\":\"Write virtual memory in the target process. Safe way to patch code, edit variables, or write memory structures directly.\","
+      "\"description\":\"Write virtual memory in the target process. Safe way to patch code, edit variables, or write "
+      "memory structures directly.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
       "\"address\":{\"type\":\"string\",\"description\":\"Hex address to write to\"},"
-      "\"data\":{\"type\":\"string\",\"description\":\"Hexadecimal representation of bytes to write (e.g. '9090' to write two NOP instructions)\"}"
+      "\"data\":{\"type\":\"string\",\"description\":\"Hexadecimal representation of bytes to write (e.g. '9090' to "
+      "write two NOP instructions)\"}"
       "},"
       "\"required\":[\"address\",\"data\"],"
       "\"additionalProperties\":false"
@@ -276,7 +298,8 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.get_threads\","
-      "\"description\":\"List all active threads in the current target process, including WinDbg index, system thread ID (TID), and whether it is the currently selected thread.\","
+      "\"description\":\"List all active threads in the current target process, including WinDbg index, system thread "
+      "ID (TID), and whether it is the currently selected thread.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{},"
@@ -285,15 +308,21 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.apply_synthetic_type\","
-      "\"description\":\"Apply a synthetic C-style structure definition (loaded from a header file) onto a virtual memory address, returning a fully structured, field-attributed view of the memory.\","
+      "\"description\":\"Apply a synthetic C-style structure definition (loaded from a header file) onto a virtual "
+      "memory address, returning a fully structured, field-attributed view of the memory.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"header_path\":{\"type\":\"string\",\"description\":\"Path to the C-style header (.h) file containing the struct definition\"},"
-      "\"struct_name\":{\"type\":\"string\",\"description\":\"Name of the struct definition to apply (e.g., 'ACPI_MCFG')\"},"
-      "\"address\":{\"type\":\"string\",\"description\":\"Hex address or expression representing the target memory location\"},"
-      "\"module_name\":{\"type\":\"string\",\"description\":\"The module name to bind the type to (default: 'bootmgr')\"},"
-      "\"syntypes_path\":{\"type\":\"string\",\"description\":\"Optional path to the SynTypes.js extension (default: '%TEMP%\\\\SynTypes.js')\"}"
+      "\"header_path\":{\"type\":\"string\",\"description\":\"Path to the C-style header (.h) file containing the "
+      "struct definition\"},"
+      "\"struct_name\":{\"type\":\"string\",\"description\":\"Name of the struct definition to apply (e.g., "
+      "'ACPI_MCFG')\"},"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address or expression representing the target memory "
+      "location\"},"
+      "\"module_name\":{\"type\":\"string\",\"description\":\"The module name to bind the type to (default: "
+      "'bootmgr')\"},"
+      "\"syntypes_path\":{\"type\":\"string\",\"description\":\"Optional path to the SynTypes.js extension (default: "
+      "'%TEMP%\\\\SynTypes.js')\"}"
       "},"
       "\"required\":[\"header_path\",\"struct_name\",\"address\"],"
       "\"additionalProperties\":false"
@@ -301,11 +330,14 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.write_file\","
-      "\"description\":\"Write a text file directly onto the Windows guest VM file system. Dynamically creates directories and resolves environment variables (like %TEMP% or %USERPROFILE%). Excellent for transferring custom C-struct headers or SynTypes.js scripts from the host to the guest VM.\","
+      "\"description\":\"Write a text file directly onto the Windows guest VM file system. Dynamically creates "
+      "directories and resolves environment variables (like %TEMP% or %USERPROFILE%). Excellent for transferring "
+      "custom C-struct headers or SynTypes.js scripts from the host to the guest VM.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"path\":{\"type\":\"string\",\"description\":\"Absolute path on the guest VM to write the file to (supports Windows environment variables like '%TEMP%\\\\mcfg.h')\"},"
+      "\"path\":{\"type\":\"string\",\"description\":\"Absolute path on the guest VM to write the file to (supports "
+      "Windows environment variables like '%TEMP%\\\\mcfg.h')\"},"
       "\"content\":{\"type\":\"string\",\"description\":\"Content of the file to write\"}"
       "},"
       "\"required\":[\"path\",\"content\"],"
@@ -314,14 +346,20 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.apply_struct\","
-      "\"description\":\"Apply an inline C-style struct definition directly onto a virtual memory address, returning a structured JSON view of the memory fields on-the-fly. Highly agentic: allows the agent to construct custom structures dynamically without needing any filesystem preparation.\","
+      "\"description\":\"Apply an inline C-style struct definition directly onto a virtual memory address, returning a "
+      "structured JSON view of the memory fields on-the-fly. Highly agentic: allows the agent to construct custom "
+      "structures dynamically without needing any filesystem preparation.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"struct_definition\":{\"type\":\"string\",\"description\":\"The C-style struct definition to apply (e.g., 'struct Header { char sig[4]; int len; };')\"},"
-      "\"struct_name\":{\"type\":\"string\",\"description\":\"The name of the struct inside the definition to instantiate (e.g., 'Header')\"},"
-      "\"address\":{\"type\":\"string\",\"description\":\"Hex address or expression representing the target memory location\"},"
-      "\"module_name\":{\"type\":\"string\",\"description\":\"The module name to bind the type to (default: 'bootmgr')\"}"
+      "\"struct_definition\":{\"type\":\"string\",\"description\":\"The C-style struct definition to apply (e.g., "
+      "'struct Header { char sig[4]; int len; };')\"},"
+      "\"struct_name\":{\"type\":\"string\",\"description\":\"The name of the struct inside the definition to "
+      "instantiate (e.g., 'Header')\"},"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address or expression representing the target memory "
+      "location\"},"
+      "\"module_name\":{\"type\":\"string\",\"description\":\"The module name to bind the type to (default: "
+      "'bootmgr')\"}"
       "},"
       "\"required\":[\"struct_definition\",\"struct_name\",\"address\"],"
       "\"additionalProperties\":false"
@@ -329,7 +367,8 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.get_modules\","
-      "\"description\":\"List all loaded PE modules with base address, size, checksum, timestamp, and symbol status in structured JSON format.\","
+      "\"description\":\"List all loaded PE modules with base address, size, checksum, timestamp, and symbol status in "
+      "structured JSON format.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{},"
@@ -338,7 +377,8 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.get_breakpoints\","
-      "\"description\":\"List all set breakpoints with ID, address, symbol, command, enabled status, and hit count in structured JSON format.\","
+      "\"description\":\"List all set breakpoints with ID, address, symbol, command, enabled status, and hit count in "
+      "structured JSON format.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{},"
@@ -347,7 +387,8 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.disassemble\","
-      "\"description\":\"Disassemble code at specified address for N instructions, returning structured JSON array of instructions.\","
+      "\"description\":\"Disassemble code at specified address for N instructions, returning structured JSON array of "
+      "instructions.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
@@ -366,7 +407,8 @@ MethodOutcome HandleToolsList() {
       "\"properties\":{"
       "\"address\":{\"type\":\"string\",\"description\":\"Hex address of string in virtual memory\"},"
       "\"max_length\":{\"type\":\"integer\",\"description\":\"Maximum characters to read (default 256, max 4096)\"},"
-      "\"wide\":{\"type\":\"boolean\",\"description\":\"True for UTF-16 (wchar_t), false for ASCII/UTF-8 (default false)\"}"
+      "\"wide\":{\"type\":\"boolean\",\"description\":\"True for UTF-16 (wchar_t), false for ASCII/UTF-8 (default "
+      "false)\"}"
       "},"
       "\"required\":[\"address\"],"
       "\"additionalProperties\":false"
@@ -378,7 +420,8 @@ MethodOutcome HandleToolsList() {
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"step_over\":{\"type\":\"boolean\",\"description\":\"True to step over ('p'), false to step into ('t'). Default true.\"}"
+      "\"step_over\":{\"type\":\"boolean\",\"description\":\"True to step over ('p'), false to step into ('t'). "
+      "Default true.\"}"
       "},"
       "\"additionalProperties\":false"
       "}"
@@ -398,7 +441,8 @@ MethodOutcome HandleToolsList() {
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"expression\":{\"type\":\"string\",\"description\":\"Address or symbol expression for breakpoint (e.g. 'main' or '0x7ff7a8811000')\"}"
+      "\"expression\":{\"type\":\"string\",\"description\":\"Address or symbol expression for breakpoint (e.g. 'main' "
+      "or '0x7ff7a8811000')\"}"
       "},"
       "\"required\":[\"expression\"],"
       "\"additionalProperties\":false"
@@ -431,6 +475,11 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     outcome.error_code = -32602;
     outcome.error_message = "Invalid params: missing tool name";
     return outcome;
+  }
+
+  // Normalize tool_name: accept both "windbg_xyz" and "windbg.xyz"
+  if (tool_name.rfind("windbg_", 0) == 0) {
+    tool_name = "windbg." + tool_name.substr(7);
   }
 
   json::FieldMap arguments_fields;
@@ -533,7 +582,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     auto results = windbg::Catalog::Search(query, limit);
     std::string json_out = "[";
     for (size_t i = 0; i < results.size(); ++i) {
-      if (i > 0) json_out += ",";
+      if (i > 0)
+        json_out += ",";
       json_out += "{";
       json_out += "\"id\":\"" + json::Escape(results[i].id) + "\",";
       json_out += "\"title\":\"" + json::Escape(results[i].title) + "\",";
@@ -541,7 +591,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
 
       json_out += "\"tokens\":[";
       for (size_t t = 0; t < results[i].tokens.size(); ++t) {
-        if (t > 0) json_out += ",";
+        if (t > 0)
+          json_out += ",";
         json_out += "\"" + json::Escape(results[i].tokens[t]) + "\"";
       }
       json_out += "],";
@@ -576,7 +627,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
 
     json_out += "\"tokens\":[";
     for (size_t t = 0; t < entry->tokens.size(); ++t) {
-      if (t > 0) json_out += ",";
+      if (t > 0)
+        json_out += ",";
       json_out += "\"" + json::Escape(entry->tokens[t]) + "\"";
     }
     json_out += "],";
@@ -632,7 +684,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     // Expand environment variables dynamically in syntypes_path (e.g. %TEMP% to C:\Users\...)
     char expanded_syntypes[MAX_PATH];
     DWORD syntypes_size = ExpandEnvironmentStringsA(syntypes_path.c_str(), expanded_syntypes, MAX_PATH);
-    std::string resolved_syntypes = (syntypes_size > 0 && syntypes_size <= MAX_PATH) ? std::string(expanded_syntypes) : syntypes_path;
+    std::string resolved_syntypes =
+        (syntypes_size > 0 && syntypes_size <= MAX_PATH) ? std::string(expanded_syntypes) : syntypes_path;
 
     // 1. Automatically unpack/write the embedded SynTypes.js script onto the Windows guest filesystem
     try {
@@ -655,7 +708,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     // Expand environment variables dynamically in header_path
     char expanded_header_path[MAX_PATH];
     DWORD header_size = ExpandEnvironmentStringsA(header_path.c_str(), expanded_header_path, MAX_PATH);
-    std::string resolved_header = (header_size > 0 && header_size <= MAX_PATH) ? std::string(expanded_header_path) : header_path;
+    std::string resolved_header =
+        (header_size > 0 && header_size <= MAX_PATH) ? std::string(expanded_header_path) : header_path;
 
     // 2. Escape backslashes in resolved_header for the JS string literal inside evaluate model
     std::string escaped_header = "";
@@ -668,11 +722,13 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     }
 
     // 3. Read the header file definition
-    std::string read_expr = "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + module_name + "\")";
+    std::string read_expr =
+        "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + module_name + "\")";
     executor->EvaluateModel(read_expr);
 
     // 4. Create the synthetic structure instance and serialize it to structured JSON
-    std::string instance_expr = "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + struct_name + "\", " + address_str + ")";
+    std::string instance_expr =
+        "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + struct_name + "\", " + address_str + ")";
     execution = executor->EvaluateModel(instance_expr);
     is_json_output = true;
   } else if (tool_name == "windbg.apply_struct") {
@@ -689,10 +745,12 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
 
     // 1. Resolve unique %TEMP%\synthetic_inline_<PID>_<SEQ>.h path on guest
     static std::atomic<uint64_t> s_inline_header_seq{0};
-    std::string temp_var = "%TEMP%\\synthetic_inline_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(++s_inline_header_seq) + ".h";
+    std::string temp_var = "%TEMP%\\synthetic_inline_" + std::to_string(GetCurrentProcessId()) + "_" +
+                           std::to_string(++s_inline_header_seq) + ".h";
     char expanded_temp[MAX_PATH];
     DWORD temp_size = ExpandEnvironmentStringsA(temp_var.c_str(), expanded_temp, MAX_PATH);
-    std::string inline_h_path = (temp_size > 0 && temp_size <= MAX_PATH) ? std::string(expanded_temp) : "C:\\temp\\synthetic_inline.h";
+    std::string inline_h_path =
+        (temp_size > 0 && temp_size <= MAX_PATH) ? std::string(expanded_temp) : "C:\\temp\\synthetic_inline.h";
 
     // 2. Write the struct_definition inline to %TEMP%\synthetic_inline.h
     try {
@@ -717,7 +775,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     // 3. Resolve %TEMP%\SynTypes.js path on guest
     char expanded_syntypes[MAX_PATH];
     DWORD syntypes_size = ExpandEnvironmentStringsA("%TEMP%\\SynTypes.js", expanded_syntypes, MAX_PATH);
-    std::string resolved_syntypes = (syntypes_size > 0 && syntypes_size <= MAX_PATH) ? std::string(expanded_syntypes) : "C:\\temp\\SynTypes.js";
+    std::string resolved_syntypes =
+        (syntypes_size > 0 && syntypes_size <= MAX_PATH) ? std::string(expanded_syntypes) : "C:\\temp\\SynTypes.js";
 
     // 4. Automatically unpack/write the embedded SynTypes.js script onto the Windows guest filesystem
     try {
@@ -730,7 +789,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
         out.write(kSynTypesJsCodeView.data(), kSynTypesJsCodeView.size());
         out.close();
       }
-    } catch (...) {}
+    } catch (...) {
+    }
 
     // 5. Try to load SynTypes.js (ignore failure if already loaded)
     executor->Execute(".scriptload \"" + resolved_syntypes + "\"");
@@ -746,11 +806,17 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     }
 
     // 7. Read the header file definition
-    std::string read_expr = "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + module_name + "\")";
+    std::string read_expr =
+        "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + module_name + "\")";
     executor->EvaluateModel(read_expr);
 
+    // Clean up temporary inline header file from disk
+    std::error_code remove_ec;
+    std::filesystem::remove(inline_h_path, remove_ec);
+
     // 8. Create the synthetic structure instance and serialize it to structured JSON
-    std::string instance_expr = "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + struct_name + "\", " + address_str + ")";
+    std::string instance_expr =
+        "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + struct_name + "\", " + address_str + ")";
     execution = executor->EvaluateModel(instance_expr);
     is_json_output = true;
   } else if (tool_name == "windbg.write_file") {
@@ -783,7 +849,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
         out_file.write(content_str.data(), content_str.size());
         out_file.close();
         execution.success = true;
-        execution.output = "{\"success\":true,\"resolved_path\":\"" + json::Escape(target_path) + "\",\"bytes_written\":" + std::to_string(content_str.size()) + "}";
+        execution.output = "{\"success\":true,\"resolved_path\":\"" + json::Escape(target_path) +
+                           "\",\"bytes_written\":" + std::to_string(content_str.size()) + "}";
       }
     } catch (const std::exception& e) {
       execution.success = false;
@@ -842,24 +909,21 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     return outcome;
   }
 
-  const std::string payload_text = execution.success
-                                       ? (execution.output.empty() ? "(no output)" :
-                                           (is_json_output ? PrettyPrintJson(execution.output) : execution.output))
-                                       : (execution.error_message.empty() ? "Command execution failed"
-                                                                          : execution.error_message);
+  const std::string payload_text =
+      execution.success
+          ? (execution.output.empty() ? "(no output)"
+                                      : (is_json_output ? PrettyPrintJson(execution.output) : execution.output))
+          : (execution.error_message.empty() ? "Command execution failed" : execution.error_message);
 
   outcome.ok = true;
-  outcome.result_json =
-      "{\"content\":[{\"type\":\"text\",\"text\":\"" + json::Escape(payload_text) +
-      "\"}],\"isError\":" + (execution.success ? "false" : "true") + "}";
+  outcome.result_json = "{\"content\":[{\"type\":\"text\",\"text\":\"" + json::Escape(payload_text) +
+                        "\"}],\"isError\":" + (execution.success ? "false" : "true") + "}";
 
   return outcome;
 }
 
-MethodOutcome DispatchMethod(
-    std::string_view method,
-    const json::FieldMap& root_fields,
-    windbg::IWinDbgCommandExecutor* executor) {
+MethodOutcome DispatchMethod(std::string_view method, const json::FieldMap& root_fields,
+                             windbg::IWinDbgCommandExecutor* executor) {
   if (method == "notifications/initialized" || method == "initialized") {
     return HandleInitializedNotification();
   }

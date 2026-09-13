@@ -54,11 +54,7 @@ void AppendUtf8(std::uint32_t code_point, std::string* out) {
   out->push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
 }
 
-bool ParseJsonString(
-    std::string_view text,
-    std::size_t* pos,
-    std::string* out,
-    std::string* error_message) {
+bool ParseJsonString(std::string_view text, std::size_t* pos, std::string* out, std::string* error_message) {
   if (*pos >= text.size() || text[*pos] != '"') {
     if (error_message != nullptr) {
       *error_message = "Expected JSON string";
@@ -478,11 +474,8 @@ bool TryGetBoolField(const FieldMap& fields, const std::string& key, bool* out_v
   return false;
 }
 
-bool TryGetObjectField(
-    const FieldMap& fields,
-    const std::string& key,
-    FieldMap* out_fields,
-    std::string* error_message) {
+bool TryGetObjectField(const FieldMap& fields, const std::string& key, FieldMap* out_fields,
+                       std::string* error_message) {
   const auto it = fields.find(key);
   if (it == fields.end() || out_fields == nullptr) {
     return false;

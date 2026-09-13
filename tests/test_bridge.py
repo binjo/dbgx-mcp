@@ -92,5 +92,11 @@ class TestBridge(unittest.TestCase):
             self.assertFalse(is_safe)
             self.assertIn("prohibited", err)
 
+    def test_is_process_alive_current(self):
+        self.assertTrue(bridge.is_process_alive(os.getpid()))
+
+    def test_is_process_alive_invalid(self):
+        self.assertFalse(bridge.is_process_alive(9999999))
+
 if __name__ == "__main__":
     unittest.main()

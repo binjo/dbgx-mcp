@@ -160,7 +160,7 @@ ctest --test-dir build -C Debug --output-on-failure -R verify_windbg_exports
 
 ```powershell
 dumpbin /dependents build\Debug\dbgx-mcp.dll
-``` 
+```
 
 Common errors:
 - `Win32 error 0n2`: wrong path or path separators were parsed incorrectly.

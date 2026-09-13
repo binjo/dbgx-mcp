@@ -1,23 +1,26 @@
-#include "dbgx/mcp/json_rpc.hpp"
-#include "dbgx/mcp/io_echo.hpp"
-#include "dbgx/mcp/http_server.hpp"
-#include "dbgx/mcp/json.hpp"
-#include "dbgx/windbg/catalog.hpp"
+#include <windows.h>
 
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
-#include <fstream>
-#include <filesystem>
-#include <windows.h>
+
+#include "dbgx/mcp/http_server.hpp"
+#include "dbgx/mcp/io_echo.hpp"
+#include "dbgx/mcp/json.hpp"
+#include "dbgx/mcp/json_rpc.hpp"
+#include "dbgx/mcp/pipe_server.hpp"
+#include "dbgx/windbg/catalog.hpp"
 
 namespace {
 
 namespace json = dbgx::json;
 
 class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
- public:
-  dbgx::windbg::CommandExecutionResult Execute(const std::string& command, const dbgx::windbg::CommandExecutionOptions& options) override {
+public:
+  dbgx::windbg::CommandExecutionResult Execute(const std::string& command,
+                                               const dbgx::windbg::CommandExecutionOptions& options) override {
     ++call_count;
     last_command = command;
     last_options = options;
@@ -44,21 +47,15 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
     return {true, "{\"field_name\":\"value\"}", ""};
   }
 
-  dbgx::windbg::CommandExecutionResult GetContextSnapshot() override {
-    return {true, "{}", ""};
-  }
+  dbgx::windbg::CommandExecutionResult GetContextSnapshot() override { return {true, "{}", ""}; }
 
-  dbgx::windbg::CommandExecutionResult ReadMemory(std::uint64_t, std::uint32_t) override {
-    return {true, "00", ""};
-  }
+  dbgx::windbg::CommandExecutionResult ReadMemory(std::uint64_t, std::uint32_t) override { return {true, "00", ""}; }
 
   dbgx::windbg::CommandExecutionResult WriteMemory(std::uint64_t, const std::string&) override {
     return {true, "{\"bytes_written\":2}", ""};
   }
 
-  dbgx::windbg::CommandExecutionResult CarvePE(std::uint64_t, std::uint32_t) override {
-    return {true, "4d5a0000", ""};
-  }
+  dbgx::windbg::CommandExecutionResult CarvePE(std::uint64_t, std::uint32_t) override { return {true, "4d5a0000", ""}; }
 
   dbgx::windbg::CommandExecutionResult SearchMemory(std::uint64_t, std::uint64_t, const std::string&) override {
     return {true, "[]", ""};
@@ -72,9 +69,7 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
     return {1, "break", false, false, true, "Broken in"};
   }
 
-  bool InterruptTarget() override {
-    return true;
-  }
+  bool InterruptTarget() override { return true; }
 
   dbgx::windbg::CommandExecutionResult GetModules() override {
     return {true, "[{\"name\":\"test.dll\",\"base\":\"0x1000\",\"size\":4096}]", ""};
@@ -92,13 +87,9 @@ class FakeExecutor final : public dbgx::windbg::IWinDbgCommandExecutor {
     return {true, "{\"address\":\"0x1000\",\"string\":\"test\",\"length\":4,\"truncated\":false}", ""};
   }
 
-  dbgx::windbg::CommandExecutionResult Step(bool) override {
-    return {true, "ok", ""};
-  }
+  dbgx::windbg::CommandExecutionResult Step(bool) override { return {true, "ok", ""}; }
 
-  dbgx::windbg::CommandExecutionResult ContinueTarget() override {
-    return {true, "ok", ""};
-  }
+  dbgx::windbg::CommandExecutionResult ContinueTarget() override { return {true, "ok", ""}; }
 
   dbgx::windbg::CommandExecutionResult SetBreakpoint(const std::string& expression) override {
     last_command = "bp " + expression;
@@ -153,8 +144,7 @@ void TestHttpServerStartBindsWithoutConflict(int* failures) {
   dbgx::mcp::HttpServerStartReport start_report;
   std::string error_message;
 
-  const bool started =
-      server.Start("127.0.0.1", 0, MakeNoopHttpResponse, &error_message, &start_report);
+  const bool started = server.Start("127.0.0.1", 0, MakeNoopHttpResponse, &error_message, &start_report);
   Expect(started, "server should start on an available port", failures);
   if (!started) {
     return;
@@ -183,16 +173,12 @@ void TestHttpServerFallbackAfterPortConflict(int* failures) {
   dbgx::mcp::HttpServerStartReport start_report;
   std::string error_message;
 
-  const bool started = candidate.Start(
-      "127.0.0.1",
-      blocked_port,
-      MakeNoopHttpResponse,
-      &error_message,
-      &start_report,
-      &start_options);
+  const bool started =
+      candidate.Start("127.0.0.1", blocked_port, MakeNoopHttpResponse, &error_message, &start_report, &start_options);
   Expect(started, "server should auto-fallback when initial port is occupied", failures);
   if (started) {
-    Expect(start_report.conflict_count >= 1, "fallback start should report at least one address-in-use conflict", failures);
+    Expect(start_report.conflict_count >= 1, "fallback start should report at least one address-in-use conflict",
+           failures);
     Expect(start_report.attempt_count >= 2, "fallback start should require at least two attempts", failures);
     Expect(start_report.fallback_used, "fallback start should be flagged as fallback_used", failures);
     Expect(candidate.BoundPort() != blocked_port, "fallback start should bind a different port", failures);
@@ -217,22 +203,15 @@ void TestHttpServerFailsAfterMaxConflictAttempts(int* failures) {
   dbgx::mcp::HttpServerStartReport start_report;
   std::string error_message;
 
-  const bool started = candidate.Start(
-      "127.0.0.1",
-      blocker.BoundPort(),
-      MakeNoopHttpResponse,
-      &error_message,
-      &start_report,
-      &start_options);
+  const bool started = candidate.Start("127.0.0.1", blocker.BoundPort(), MakeNoopHttpResponse, &error_message,
+                                       &start_report, &start_options);
 
   Expect(!started, "server should fail when max port attempts are exhausted", failures);
   Expect(start_report.attempt_count == 1, "single-attempt option should only attempt one bind", failures);
   Expect(start_report.conflict_count == 1, "single-attempt conflict should report one conflict", failures);
   Expect(start_report.exhausted_conflicts, "conflict-limited failure should report exhausted_conflicts", failures);
-  Expect(
-      Contains(error_message, "all attempts hit address-in-use"),
-      "failure message should explain conflict exhaustion",
-      failures);
+  Expect(Contains(error_message, "all attempts hit address-in-use"),
+         "failure message should explain conflict exhaustion", failures);
 
   blocker.Stop();
 }
@@ -244,18 +223,14 @@ void TestHttpServerNonRetryableBindFailureStopsImmediately(int* failures) {
   dbgx::mcp::HttpServerStartReport start_report;
   std::string error_message;
 
-  const bool started = server.Start(
-      "203.0.113.1",
-      5678,
-      MakeNoopHttpResponse,
-      &error_message,
-      &start_report,
-      &start_options);
+  const bool started =
+      server.Start("203.0.113.1", 5678, MakeNoopHttpResponse, &error_message, &start_report, &start_options);
 
   Expect(!started, "non-retryable bind failures should fail start", failures);
   Expect(start_report.attempt_count == 1, "non-retryable bind failures should stop after first attempt", failures);
   Expect(start_report.conflict_count == 0, "non-retryable bind failures should not be counted as conflicts", failures);
-  Expect(!start_report.exhausted_conflicts, "non-retryable bind failures should not mark exhausted_conflicts", failures);
+  Expect(!start_report.exhausted_conflicts, "non-retryable bind failures should not mark exhausted_conflicts",
+         failures);
   Expect(Contains(error_message, "Bind failed on port"), "failure should identify bind error context", failures);
 }
 
@@ -267,7 +242,8 @@ void TestInitialize(int* failures) {
       R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}})");
 
   Expect(result.status_code == 200, "initialize should return HTTP 200", failures);
-  Expect(Contains(result.body, "\"protocolVersion\":\"2025-11-25\""), "initialize should return protocol version", failures);
+  Expect(Contains(result.body, "\"protocolVersion\":\"2025-11-25\""), "initialize should return protocol version",
+         failures);
   Expect(Contains(result.body, "\"windbg.eval\""), "initialize should mention windbg.eval capability", failures);
   Expect(Contains(result.body, "\"version\":\"" DBGX_VERSION_STRING "\""),
          "initialize should return DBGX_VERSION_STRING in serverInfo", failures);
@@ -282,18 +258,12 @@ void TestToolsList(int* failures) {
 
   Expect(result.status_code == 200, "tools/list should return HTTP 200", failures);
   Expect(Contains(result.body, "\"name\":\"windbg.eval\""), "tools/list should include windbg.eval", failures);
-  Expect(
-      Contains(result.body, "clients MUST run calls serially"),
-      "tools/list should require clients to execute windbg.eval serially",
-      failures);
-  Expect(
-      Contains(result.body, "wait for each call to finish before sending the next"),
-      "tools/list should require waiting for each call before the next one",
-      failures);
-  Expect(
-      Contains(result.body, "send commands one by one and wait for completion before the next command"),
-      "tools/list command schema should include serial command guidance",
-      failures);
+  Expect(Contains(result.body, "clients MUST run calls serially"),
+         "tools/list should require clients to execute windbg.eval serially", failures);
+  Expect(Contains(result.body, "wait for each call to finish before sending the next"),
+         "tools/list should require waiting for each call before the next one", failures);
+  Expect(Contains(result.body, "send commands one by one and wait for completion before the next command"),
+         "tools/list command schema should include serial command guidance", failures);
 }
 
 void TestToolsCallSuccess(int* failures) {
@@ -379,8 +349,7 @@ void TestIoEchoSummaryTruncatesLongPayload(int* failures) {
   dbgx::mcp::HttpResponse response;
   response.status_code = 200;
   response.body =
-      "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" + long_text +
-      "\"}]}}";
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" + long_text + "\"}]}}";
 
   const std::string summary = dbgx::mcp::BuildResponseIoSummary(response);
   Expect(Contains(summary, "...(truncated)"), "long response summary should be truncated", failures);
@@ -417,7 +386,8 @@ void TestIoEchoParseRequestMetaMissingId(int* failures) {
 
   const dbgx::mcp::RequestIoMeta meta = dbgx::mcp::ParseRequestIoMeta(request);
   Expect(meta.parseable, "request meta should parse valid JSON", failures);
-  Expect(meta.has_rpc_method && meta.rpc_method == "tools/call", "request meta should include tools/call method", failures);
+  Expect(meta.has_rpc_method && meta.rpc_method == "tools/call", "request meta should include tools/call method",
+         failures);
   Expect(!meta.has_rpc_id, "request meta should detect missing id", failures);
   Expect(meta.has_tool_name && meta.tool_name == "windbg.eval", "request meta should include tool name", failures);
 }
@@ -441,15 +411,15 @@ void TestIoEchoLocalTraceIdConsistencyAcrossStages(int* failures) {
 
   dbgx::mcp::HttpResponse response;
   response.status_code = 200;
-  response.body =
-      R"({"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"ok"}],"isError":false}})";
+  response.body = R"({"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"ok"}],"isError":false}})";
 
   dbgx::mcp::IoTraceContext response_context = request_context;
   response_context.stage = "response_sent";
   response_context.duration_ms = 25;
 
   const std::string response_summary = dbgx::mcp::BuildResponseIoSummary(response, response_context);
-  Expect(Contains(response_summary, "trace_id=local-42"), "response summary should include same local trace id", failures);
+  Expect(Contains(response_summary, "trace_id=local-42"), "response summary should include same local trace id",
+         failures);
   Expect(Contains(response_summary, "stage=response_sent"), "response summary should include response stage", failures);
 }
 
@@ -464,8 +434,7 @@ void TestIoEchoResponseSummaryCoversSuccessAndError(int* failures) {
 
   dbgx::mcp::HttpResponse error_response;
   error_response.status_code = 200;
-  error_response.body =
-      "{\"jsonrpc\":\"2.0\",\"id\":10,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}";
+  error_response.body = "{\"jsonrpc\":\"2.0\",\"id\":10,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}";
 
   const std::string error_summary = dbgx::mcp::BuildResponseIoSummary(error_response);
   Expect(Contains(error_summary, "rpc_outcome=error"), "error response should be marked as error", failures);
@@ -475,8 +444,7 @@ void TestIoEchoResponseSummaryCoversSuccessAndError(int* failures) {
 void TestIoEchoResponseSummaryTreatsToolIsErrorAsError(int* failures) {
   dbgx::mcp::HttpResponse response;
   response.status_code = 200;
-  response.body =
-      R"({"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"failed"}],"isError":true}})";
+  response.body = R"({"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"failed"}],"isError":true}})";
 
   const std::string summary = dbgx::mcp::BuildResponseIoSummary(response);
   Expect(Contains(summary, "rpc_outcome=error"), "result.isError=true should be treated as error outcome", failures);
@@ -499,8 +467,7 @@ void TestIoEchoBlockingLocatabilityStageOrder(int* failures) {
 
   dbgx::mcp::HttpResponse response;
   response.status_code = 200;
-  response.body =
-      R"({"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}})";
+  response.body = R"({"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"ok"}],"isError":false}})";
 
   std::vector<std::string> logs;
   logs.push_back(dbgx::mcp::BuildLifecycleIoSummary(execute_start_context, "entering tool executor"));
@@ -602,9 +569,12 @@ void TestToolsCallApplySyntheticType(int* failures) {
   // Verify that ReadHeader and CreateInstance are evaluated
   Expect(executor.evaluated_expressions.size() == 2, "should evaluate exactly 2 expressions", failures);
   Expect(Contains(executor.evaluated_expressions[0], "ReadHeader"), "first expression should read header", failures);
-  Expect(Contains(executor.evaluated_expressions[0], "d:\\\\t\\\\mcfg.h"), "first expression should contain escaped header path", failures);
-  Expect(Contains(executor.evaluated_expressions[1], "CreateInstance"), "second expression should create instance", failures);
-  Expect(Contains(executor.evaluated_expressions[1], "0xAFFF2A00"), "second expression should contain target address", failures);
+  Expect(Contains(executor.evaluated_expressions[0], "d:\\\\t\\\\mcfg.h"),
+         "first expression should contain escaped header path", failures);
+  Expect(Contains(executor.evaluated_expressions[1], "CreateInstance"), "second expression should create instance",
+         failures);
+  Expect(Contains(executor.evaluated_expressions[1], "0xAFFF2A00"), "second expression should contain target address",
+         failures);
 }
 
 void TestToolsCallApplyStruct(int* failures) {
@@ -624,9 +594,12 @@ void TestToolsCallApplyStruct(int* failures) {
   // Verify that ReadHeader and CreateInstance are evaluated
   Expect(executor.evaluated_expressions.size() == 2, "should evaluate exactly 2 expressions", failures);
   Expect(Contains(executor.evaluated_expressions[0], "ReadHeader"), "first expression should read header", failures);
-  Expect(Contains(executor.evaluated_expressions[0], "synthetic_inline_"), "first expression should contain the inline header pattern", failures);
-  Expect(Contains(executor.evaluated_expressions[1], "CreateInstance"), "second expression should create instance", failures);
-  Expect(Contains(executor.evaluated_expressions[1], "0x7ff80000"), "second expression should contain target address", failures);
+  Expect(Contains(executor.evaluated_expressions[0], "synthetic_inline_"),
+         "first expression should contain the inline header pattern", failures);
+  Expect(Contains(executor.evaluated_expressions[1], "CreateInstance"), "second expression should create instance",
+         failures);
+  Expect(Contains(executor.evaluated_expressions[1], "0x7ff80000"), "second expression should contain target address",
+         failures);
 }
 
 void TestToolsCallWriteFile(int* failures) {
@@ -730,6 +703,46 @@ void TestToolsCallSetBreakpoint(int* failures) {
   Expect(executor.last_command == "bp main", "set_breakpoint should execute bp main", failures);
 }
 
+void TestPipeServerRoundTrip(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  dbgx::mcp::PipeServer pipe_server;
+  std::string pipe_name = "dbgx-mcp-test-" + std::to_string(GetCurrentProcessId());
+  std::string error_message;
+
+  bool started = pipe_server.Start(
+      pipe_name, [&router](const std::string& req) { return router.HandleJsonRpcPost(req).body; }, &error_message);
+
+  Expect(started, "PipeServer should start successfully: " + error_message, failures);
+  Expect(pipe_server.IsRunning(), "PipeServer should report running", failures);
+
+  // Client connects to pipe
+  std::string full_path = "\\\\.\\pipe\\" + pipe_name;
+  WaitNamedPipeA(full_path.c_str(), 2000);
+  HANDLE hPipe = CreateFileA(full_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+
+  Expect(hPipe != INVALID_HANDLE_VALUE, "Client should connect to named pipe", failures);
+
+  if (hPipe != INVALID_HANDLE_VALUE) {
+    std::string req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+    DWORD written = 0;
+    WriteFile(hPipe, req.data(), static_cast<DWORD>(req.size()), &written, NULL);
+
+    char buf[4096] = {0};
+    DWORD read_bytes = 0;
+    ReadFile(hPipe, buf, sizeof(buf) - 1, &read_bytes, NULL);
+    CloseHandle(hPipe);
+
+    std::string resp(buf, read_bytes);
+    Expect(Contains(resp, "\"result\""), "Pipe response should contain result", failures);
+    Expect(Contains(resp, "\"tools\""), "Pipe response should contain tools", failures);
+  }
+
+  pipe_server.Stop();
+  Expect(!pipe_server.IsRunning(), "PipeServer should report not running after Stop", failures);
+}
+
 }  // namespace
 
 int main() {
@@ -771,6 +784,7 @@ int main() {
   TestToolsCallStep(&failures);
   TestToolsCallContinue(&failures);
   TestToolsCallSetBreakpoint(&failures);
+  TestPipeServerRoundTrip(&failures);
 
   if (failures == 0) {
     std::cout << "All unit tests passed.\n";

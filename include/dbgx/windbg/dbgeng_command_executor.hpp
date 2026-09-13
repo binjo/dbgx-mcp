@@ -1,18 +1,20 @@
 #pragma once
-#include "dbgx/windbg/command_executor.hpp"
-#include <functional>
+#include <DbgEng.h>
+#include <wrl/client.h>
+
 #include <condition_variable>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <queue>
 #include <thread>
-#include <DbgEng.h>
-#include <wrl/client.h>
+
+#include "dbgx/windbg/command_executor.hpp"
 
 namespace dbgx::windbg {
 
 class DbgEngCommandExecutor final : public IWinDbgCommandExecutor {
- public:
+public:
   DbgEngCommandExecutor();
   ~DbgEngCommandExecutor() override;
 
@@ -22,10 +24,8 @@ class DbgEngCommandExecutor final : public IWinDbgCommandExecutor {
   CommandExecutionResult ReadMemory(std::uint64_t address, std::uint32_t length) override;
   CommandExecutionResult WriteMemory(std::uint64_t address, const std::string& hex_data) override;
   CommandExecutionResult CarvePE(std::uint64_t address, std::uint32_t length) override;
-  CommandExecutionResult SearchMemory(
-      std::uint64_t start_address,
-      std::uint64_t end_address,
-      const std::string& pattern) override;
+  CommandExecutionResult SearchMemory(std::uint64_t start_address, std::uint64_t end_address,
+                                      const std::string& pattern) override;
   CommandExecutionResult GetThreads() override;
   SessionMetadata GetSessionMetadata() override;
   DebuggerExecutionState GetExecutionState() override;
@@ -38,12 +38,13 @@ class DbgEngCommandExecutor final : public IWinDbgCommandExecutor {
   CommandExecutionResult ContinueTarget() override;
   CommandExecutionResult SetBreakpoint(const std::string& expression) override;
 
- private:
+private:
   using TaskFunction = std::function<CommandExecutionResult()>;
 
   struct ExecutionTask {
     TaskFunction func;
     std::promise<CommandExecutionResult> promise;
+    bool has_promise = true;
   };
 
   std::thread worker_thread_;
@@ -52,9 +53,15 @@ class DbgEngCommandExecutor final : public IWinDbgCommandExecutor {
   std::queue<ExecutionTask> task_queue_;
   bool shutdown_ = false;
 
-  Microsoft::WRL::ComPtr<IDebugClient> client_;
-  Microsoft::WRL::ComPtr<IDebugControl> control_;
   Microsoft::WRL::ComPtr<IDebugControl> interrupt_control_;
+
+  // Worker-thread local cached COM interfaces
+  Microsoft::WRL::ComPtr<IDebugClient> worker_client_;
+  Microsoft::WRL::ComPtr<IDebugControl> worker_control_;
+  Microsoft::WRL::ComPtr<IDebugDataSpaces> worker_data_;
+  Microsoft::WRL::ComPtr<IDebugSymbols3> worker_symbols_;
+  Microsoft::WRL::ComPtr<IDebugRegisters> worker_registers_;
+  Microsoft::WRL::ComPtr<IDebugSystemObjects> worker_systems_;
 
   void WorkerThreadProc();
   CommandExecutionResult DispatchToWorker(TaskFunction func, bool check_ready = true);
@@ -64,7 +71,8 @@ class DbgEngCommandExecutor final : public IWinDbgCommandExecutor {
   CommandExecutionResult ReadMemorySynchronously(std::uint64_t address, std::uint32_t length);
   CommandExecutionResult WriteMemorySynchronously(std::uint64_t address, const std::string& hex_data);
   CommandExecutionResult CarvePESynchronously(std::uint64_t address, std::uint32_t length);
-  CommandExecutionResult SearchMemorySynchronously(std::uint64_t start_address, std::uint64_t end_address, const std::string& pattern);
+  CommandExecutionResult SearchMemorySynchronously(std::uint64_t start_address, std::uint64_t end_address,
+                                                   const std::string& pattern);
   CommandExecutionResult GetThreadsSynchronously();
   CommandExecutionResult GetModulesSynchronously();
   CommandExecutionResult GetBreakpointsSynchronously();

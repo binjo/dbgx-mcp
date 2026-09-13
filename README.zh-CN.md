@@ -132,7 +132,7 @@ ctest --test-dir build -C Debug --output-on-failure -R verify_windbg_exports
 
 ```powershell
 dumpbin /dependents build\Debug\dbgx-mcp.dll
-``` 
+```
 
 常见错误：
 - `Win32 error 0n2`：路径错误，或路径分隔符被错误解析。
