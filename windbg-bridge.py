@@ -92,6 +92,29 @@ def get_cache_ttl(command: str) -> float:
     return 0.0  # Bypass cache (write operations, execution control, etc.)
 
 
+def split_commands_safe(command: str) -> list[str]:
+    """Splits commands by semicolon while respecting single and double quotes."""
+    parts = []
+    current = []
+    in_quote = None
+    for c in command:
+        if in_quote:
+            if c == in_quote:
+                in_quote = None
+            current.append(c)
+        elif c in ('"', "'"):
+            in_quote = c
+            current.append(c)
+        elif c == ';':
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(c)
+    if current:
+        parts.append("".join(current).strip())
+    return [p for p in parts if p]
+
+
 def validate_command(command: str) -> tuple[bool, str]:
     """Checks if a command is safe to execute. Returns (is_safe, error_message)."""
     # Guardrail: Reject sourcing/nesting commands from disk files to prevent arbitrary code/file execution
@@ -102,7 +125,7 @@ def validate_command(command: str) -> tuple[bool, str]:
         )
 
     # Split by semicolon to check each individual subcommand
-    subcommands = command.split(";")
+    subcommands = split_commands_safe(command)
     for sub in subcommands:
         parts = sub.strip().split()
         if not parts:
@@ -183,6 +206,22 @@ def get_timeout_for_request(req_data) -> float:
 
     elif tool_name == "windbg.read_memory":
         return 90.0   # 1.5 minutes for reading memory
+
+    elif tool_name in ("windbg.ttd_position", "windbg.time_travel"):
+        return 60.0   # 1 minute for TTD trace position seeks
+
+    elif tool_name == "windbg.resolve":
+        return 30.0   # 30 seconds for symbol resolution
+
+    elif tool_name == "windbg.clear_breakpoint":
+        return 10.0   # 10 seconds for clearing breakpoint
+
+    elif tool_name == "windbg.step":
+        count = tool_args.get("count", 1)
+        return min(300.0, 10.0 + count * 2.0)
+
+    elif tool_name == "windbg.continue":
+        return 180.0  # 3 minutes for continue / reverse continue
 
     return 60.0
 
@@ -537,23 +576,27 @@ def get_default_tools_list():
     tools = [
         {"name": "windbg.eval", "description": "Execute WinDbg command. Results returned as filtered/truncated text. Supports optional max_lines and pattern filters.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}, "max_lines": {"type": "integer"}, "pattern": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["command"]}},
         {"name": "windbg.dx", "description": "Evaluate WinDbg C++ Data Model expressions (dx) and serialize directly to structured JSON.", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "max_depth": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["expression"]}},
-        {"name": "windbg.get_context", "description": "Get structured CPU register snapshot and call stack frames with symbol resolution.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
+        {"name": "windbg.get_context", "description": "Get structured CPU register snapshot, current instruction, call stack frames with symbol resolution, and TTD position.", "inputSchema": {"type": "object", "properties": {"include_all_registers": {"type": "boolean", "description": "True to include all vector/debug/segment registers (default false, primary GPRs only)"}, "session_id": {"type": "integer"}}}},
         {"name": "windbg.get_modules", "description": "Get structured list of all loaded modules, base addresses, sizes, checksums, and symbol statuses.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
         {"name": "windbg.get_breakpoints", "description": "Get structured list of all active breakpoints, offsets, hit counts, and commands.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
-        {"name": "windbg.disassemble", "description": "Disassemble instructions at given address or current EIP/RIP.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "count": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
-        {"name": "windbg.read_memory", "description": "Read raw memory block at virtual address as hex string.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "length": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
-        {"name": "windbg.write_memory", "description": "Write raw bytes from hex string to virtual address.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "hex_data": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["address", "hex_data"]}},
+        {"name": "windbg.disassemble", "description": "Disassemble instructions at given address or current instruction pointer (if omitted/empty).", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "count": {"type": "integer"}, "session_id": {"type": "integer"}}}},
+        {"name": "windbg.read_memory", "description": "Read raw memory block at virtual address, symbol, or expression as hex string.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "length": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
+        {"name": "windbg.write_memory", "description": "Write raw bytes from hex string to virtual address or symbol.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "hex_data": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["address", "hex_data"]}},
         {"name": "windbg.search", "description": "Search virtual memory range for byte pattern.", "inputSchema": {"type": "object", "properties": {"start_address": {"type": "string"}, "end_address": {"type": "string"}, "pattern": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["start_address", "end_address", "pattern"]}},
-        {"name": "windbg.read_string", "description": "Read ASCII or UTF-16 wide string from memory address.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "max_length": {"type": "integer"}, "wide": {"type": "boolean"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
+        {"name": "windbg.read_string", "description": "Read ASCII or UTF-16 wide string from memory address or symbol.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "max_length": {"type": "integer"}, "wide": {"type": "boolean"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
         {"name": "windbg.carve_pe", "description": "Reconstruct and carve mapped PE image from memory back to file-aligned raw bytes.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "length": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
         {"name": "windbg.get_threads", "description": "Get list of all target threads with thread IDs and current active thread flag.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
         {"name": "windbg.get_execution_state", "description": "Check if target is running, busy, or broken in and ready for commands.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
         {"name": "windbg.interrupt", "description": "Send interrupt signal to break into running target.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
-        {"name": "windbg.step", "description": "Step single instruction (step-over by default, or step-into).", "inputSchema": {"type": "object", "properties": {"step_over": {"type": "boolean"}, "session_id": {"type": "integer"}}}},
-        {"name": "windbg.continue", "description": "Resume target execution (equivalent to 'g').", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
-        {"name": "windbg.set_breakpoint", "description": "Set breakpoint at symbol or expression.", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["expression"]}},
+        {"name": "windbg.step", "description": "Step execution forward or backward in time (TTD).", "inputSchema": {"type": "object", "properties": {"step_over": {"type": "boolean"}, "reverse": {"type": "boolean"}, "count": {"type": "integer"}, "session_id": {"type": "integer"}}}},
+        {"name": "windbg.continue", "description": "Resume target execution forward ('g') or backward in time ('g-' in TTD).", "inputSchema": {"type": "object", "properties": {"reverse": {"type": "boolean"}, "session_id": {"type": "integer"}}}},
+        {"name": "windbg.set_breakpoint", "description": "Set breakpoint at symbol or expression ('bp').", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["expression"]}},
+        {"name": "windbg.clear_breakpoint", "description": "Clear breakpoint by ID or '*' for all breakpoints ('bc').", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["id"]}},
+        {"name": "windbg.resolve", "description": "Resolve symbol expression to address or address to nearest symbol and module.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["query"]}},
+        {"name": "windbg.ttd_position", "description": "Query current Time Travel Debugging (TTD) position and thread positions or seek to a position (e.g. '1B:0').", "inputSchema": {"type": "object", "properties": {"position": {"type": "string"}, "session_id": {"type": "integer"}}}},
         {"name": "windbg.search_catalog", "description": "Search built-in WinDbg command documentation catalog.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
-        {"name": "windbg.get_catalog_entry", "description": "Retrieve full documentation for command by ID.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+        {"name": "windbg.get_command_docs", "description": "Retrieve full documentation for command by ID.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+        {"name": "windbg.get_catalog_entry", "description": "Retrieve full documentation for command by ID (alias for get_command_docs).", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
         {"name": "windbg.apply_struct", "description": "Dynamically apply C struct definition to memory address.", "inputSchema": {"type": "object", "properties": {"struct_definition": {"type": "string"}, "struct_name": {"type": "string"}, "address": {"type": "string"}, "module_name": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["struct_definition", "struct_name", "address"]}},
         {"name": "windbg.write_file", "description": "Write file directly onto Windows filesystem.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
         {"name": "windbg.get_session_metadata", "description": "Get metadata about active debugging target.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},

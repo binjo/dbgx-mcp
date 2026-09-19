@@ -120,9 +120,10 @@ MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
       "\","
       "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg."
       "get_context\",\"windbg.read_memory\",\"windbg.carve_pe\",\"windbg.search\",\"windbg.get_execution_state\","
-      "\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\",\"windbg.get_session_metadata\","
+      "\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\",\"windbg.get_catalog_entry\",\"windbg.get_session_metadata\","
       "\"windbg.write_memory\",\"windbg.get_threads\",\"windbg.apply_synthetic_type\",\"windbg.write_file\",\"windbg."
-      "apply_struct\"]}},"
+      "apply_struct\",\"windbg.get_modules\",\"windbg.get_breakpoints\",\"windbg.disassemble\",\"windbg.read_string\","
+      "\"windbg.step\",\"windbg.continue\",\"windbg.set_breakpoint\",\"windbg.clear_breakpoint\",\"windbg.resolve\",\"windbg.ttd_position\"]}},"
       "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING
       "\"}"
       "}";
@@ -176,23 +177,25 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.get_context\","
-      "\"description\":\"Get a comprehensive snapshot of the current debugger state (registers, stack). \","
+      "\"description\":\"Get a comprehensive snapshot of the current debugger state (registers, stack, current instruction, thread, TTD position).\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
-      "\"properties\":{},"
+      "\"properties\":{"
+      "\"include_all_registers\":{\"type\":\"boolean\",\"description\":\"True to include all vector/debug/segment registers. Default false (primary GPRs only).\"}"
+      "},"
       "\"additionalProperties\":false"
       "}"
       "},"
       "{"
       "\"name\":\"windbg.read_memory\","
-      "\"description\":\"Read virtual memory and return as hex string.\","
+      "\"description\":\"Read virtual memory and return as hex string. Address can be hex, symbol (e.g. 'ntdll!NtAllocateVirtualMemory'), or expression.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"address\":{\"type\":\"string\",\"description\":\"Hex address to read from\"},"
-      "\"length\":{\"type\":\"integer\",\"description\":\"Number of bytes to read\"}"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address, symbol, or expression to read from\"},"
+      "\"length\":{\"type\":\"integer\",\"description\":\"Number of bytes to read (default 64)\"}"
       "},"
-      "\"required\":[\"address\",\"length\"],"
+      "\"required\":[\"address\"],"
       "\"additionalProperties\":false"
       "}"
       "},"
@@ -387,15 +390,13 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.disassemble\","
-      "\"description\":\"Disassemble code at specified address for N instructions, returning structured JSON array of "
-      "instructions.\","
+      "\"description\":\"Disassemble code at specified address or current IP for N instructions, returning structured JSON array with symbols.\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"address\":{\"type\":\"string\",\"description\":\"Hex address to disassemble from\"},"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address, symbol, or expression (defaults to current instruction pointer if omitted or empty)\"},"
       "\"count\":{\"type\":\"integer\",\"description\":\"Number of instructions to disassemble (default 10, max 200)\"}"
       "},"
-      "\"required\":[\"address\"],"
       "\"additionalProperties\":false"
       "}"
       "},"
@@ -405,7 +406,7 @@ MethodOutcome HandleToolsList() {
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"address\":{\"type\":\"string\",\"description\":\"Hex address of string in virtual memory\"},"
+      "\"address\":{\"type\":\"string\",\"description\":\"Hex address, symbol, or expression of string in virtual memory\"},"
       "\"max_length\":{\"type\":\"integer\",\"description\":\"Maximum characters to read (default 256, max 4096)\"},"
       "\"wide\":{\"type\":\"boolean\",\"description\":\"True for UTF-16 (wchar_t), false for ASCII/UTF-8 (default "
       "false)\"}"
@@ -416,22 +417,25 @@ MethodOutcome HandleToolsList() {
       "},"
       "{"
       "\"name\":\"windbg.step\","
-      "\"description\":\"Step execution. Set step_over=true (default) to step over ('p'), or false to step in ('t').\","
+      "\"description\":\"Step execution forward or backward (TTD). Set step_over=true (default) to step over ('p'/'p-'), or false to step in ('t'/'t-').\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
       "\"properties\":{"
-      "\"step_over\":{\"type\":\"boolean\",\"description\":\"True to step over ('p'), false to step into ('t'). "
-      "Default true.\"}"
+      "\"step_over\":{\"type\":\"boolean\",\"description\":\"True to step over, false to step into. Default true.\"},"
+      "\"reverse\":{\"type\":\"boolean\",\"description\":\"True to step backwards in time (TTD 'p-'/'t-'). Default false.\"},"
+      "\"count\":{\"type\":\"integer\",\"description\":\"Number of steps to execute (default 1).\"}"
       "},"
       "\"additionalProperties\":false"
       "}"
       "},"
       "{"
       "\"name\":\"windbg.continue\","
-      "\"description\":\"Continue target execution ('g').\","
+      "\"description\":\"Continue target execution forward ('g') or backward ('g-' in TTD).\","
       "\"inputSchema\":{"
       "\"type\":\"object\","
-      "\"properties\":{},"
+      "\"properties\":{"
+      "\"reverse\":{\"type\":\"boolean\",\"description\":\"True to run backwards in time (TTD 'g-'). Default false.\"}"
+      "},"
       "\"additionalProperties\":false"
       "}"
       "},"
@@ -445,6 +449,40 @@ MethodOutcome HandleToolsList() {
       "or '0x7ff7a8811000')\"}"
       "},"
       "\"required\":[\"expression\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.clear_breakpoint\","
+      "\"description\":\"Clear/delete breakpoint by ID or '*' for all breakpoints ('bc').\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"id\":{\"type\":\"string\",\"description\":\"Breakpoint ID number or '*' to clear all breakpoints (default '*')\"}"
+      "},"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.resolve\","
+      "\"description\":\"Resolve a symbol expression to virtual memory address or address to nearest symbol and module.\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"query\":{\"type\":\"string\",\"description\":\"Symbol name (e.g. 'ntdll!LdrInitializeThunk'), expression ('x+0x3c73'), or hex address\"}"
+      "},"
+      "\"required\":[\"query\"],"
+      "\"additionalProperties\":false"
+      "}"
+      "},"
+      "{"
+      "\"name\":\"windbg.ttd_position\","
+      "\"description\":\"Query current Time Travel Debugging (TTD) position and thread positions, or seek to a specific position (e.g. '1B:0').\","
+      "\"inputSchema\":{"
+      "\"type\":\"object\","
+      "\"properties\":{"
+      "\"position\":{\"type\":\"string\",\"description\":\"Optional TTD position to seek to (e.g. '4615E:12CE')\"}"
+      "},"
       "\"additionalProperties\":false"
       "}"
       "}"
@@ -515,30 +553,46 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     execution = executor->EvaluateModel(expression, max_depth);
     is_json_output = true;
   } else if (tool_name == "windbg.get_context") {
-    execution = executor->GetContextSnapshot();
+    bool include_all_registers = false;
+    json::TryGetBoolField(arguments_fields, "include_all_registers", &include_all_registers);
+    execution = executor->GetContextSnapshot(include_all_registers);
     is_json_output = true;
   } else if (tool_name == "windbg.read_memory") {
     std::string addr_str;
-    int length = 0;
-    if (!json::TryGetStringField(arguments_fields, "address", &addr_str) ||
-        !json::TryGetIntField(arguments_fields, "length", &length)) {
+    if (!json::TryGetStringField(arguments_fields, "address", &addr_str)) {
       outcome.error_code = -32602;
-      outcome.error_message = "Invalid params: address and length are required";
+      outcome.error_message = "Invalid params: address is required";
       return outcome;
     }
-    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
-    execution = executor->ReadMemory(address, (uint32_t)length);
+    int length = 64;
+    json::TryGetIntField(arguments_fields, "length", &length);
+    if (length <= 0)
+      length = 64;
+    auto addr_opt = executor->ResolveAddress(addr_str);
+    if (!addr_opt.has_value()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid address or symbol expression: " + addr_str;
+      return outcome;
+    }
+    execution = executor->ReadMemory(*addr_opt, (uint32_t)length);
   } else if (tool_name == "windbg.carve_pe") {
     std::string addr_str;
-    int length = 0;
-    if (!json::TryGetStringField(arguments_fields, "address", &addr_str) ||
-        !json::TryGetIntField(arguments_fields, "length", &length)) {
+    if (!json::TryGetStringField(arguments_fields, "address", &addr_str)) {
       outcome.error_code = -32602;
-      outcome.error_message = "Invalid params: address and length are required";
+      outcome.error_message = "Invalid params: address is required";
       return outcome;
     }
-    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
-    execution = executor->CarvePE(address, (uint32_t)length);
+    int length = 0;
+    json::TryGetIntField(arguments_fields, "length", &length);
+    auto addr_opt = executor->ResolveAddress(addr_str);
+    if (!addr_opt.has_value()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid address or symbol expression: " + addr_str;
+      return outcome;
+    }
+    if (length <= 0)
+      length = 1024 * 1024;
+    execution = executor->CarvePE(*addr_opt, (uint32_t)length);
   } else if (tool_name == "windbg.search") {
     std::string start_str, end_str, pattern;
     if (!json::TryGetStringField(arguments_fields, "start_address", &start_str) ||
@@ -548,9 +602,14 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
       outcome.error_message = "Invalid params: start_address, end_address, and pattern are required";
       return outcome;
     }
-    uint64_t start = strtoull(start_str.c_str(), nullptr, 16);
-    uint64_t end = strtoull(end_str.c_str(), nullptr, 16);
-    execution = executor->SearchMemory(start, end, pattern);
+    auto start_opt = executor->ResolveAddress(start_str);
+    auto end_opt = executor->ResolveAddress(end_str);
+    if (!start_opt.has_value() || !end_opt.has_value()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid start_address or end_address expression";
+      return outcome;
+    }
+    execution = executor->SearchMemory(*start_opt, *end_opt, pattern);
     is_json_output = true;
   } else if (tool_name == "windbg.get_execution_state") {
     auto state = executor->GetExecutionState();
@@ -605,9 +664,11 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     execution.success = true;
     execution.output = json_out;
     is_json_output = true;
-  } else if (tool_name == "windbg.get_command_docs") {
+  } else if (tool_name == "windbg.get_command_docs" || tool_name == "windbg.get_catalog_entry") {
     std::string entry_id;
-    if (!json::TryGetStringField(arguments_fields, "id", &entry_id) || entry_id.empty()) {
+    if (!json::TryGetStringField(arguments_fields, "id", &entry_id) &&
+        !json::TryGetStringField(arguments_fields, "command_id", &entry_id) &&
+        !json::TryGetStringField(arguments_fields, "query", &entry_id)) {
       outcome.error_code = -32602;
       outcome.error_message = "Invalid params: missing id";
       return outcome;
@@ -647,7 +708,9 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     json_out += "\"executable_name\":\"" + json::Escape(meta.executable_name) + "\",";
     json_out += "\"target_info\":\"" + json::Escape(meta.target_info) + "\",";
     json_out += "\"architecture\":\"" + json::Escape(meta.architecture) + "\",";
-    json_out += "\"debuggee_class\":\"" + json::Escape(meta.debuggee_class) + "\"";
+    json_out += "\"debuggee_class\":\"" + json::Escape(meta.debuggee_class) + "\",";
+    json_out += "\"is_ttd\":" + std::string(meta.is_ttd ? "true" : "false") + ",";
+    json_out += "\"target_type\":\"" + json::Escape(meta.target_type) + "\"";
     json_out += "}";
 
     execution.success = true;
@@ -661,8 +724,13 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
       outcome.error_message = "Invalid params: address and data are required";
       return outcome;
     }
-    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
-    execution = executor->WriteMemory(address, hex_data);
+    auto addr_opt = executor->ResolveAddress(addr_str);
+    if (!addr_opt.has_value()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid address or symbol expression: " + addr_str;
+      return outcome;
+    }
+    execution = executor->WriteMemory(*addr_opt, hex_data);
     is_json_output = true;
   } else if (tool_name == "windbg.get_threads") {
     execution = executor->GetThreads();
@@ -725,6 +793,14 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     std::string read_expr =
         "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + module_name + "\")";
     executor->EvaluateModel(read_expr);
+
+    // Resolve address expression to numeric hex if not already a 0x hex literal
+    auto resolved_addr = executor->ResolveAddress(address_str);
+    if (resolved_addr.has_value() && address_str.rfind("0x", 0) != 0 && address_str.rfind("0X", 0) != 0) {
+      char addr_hex[32];
+      snprintf(addr_hex, sizeof(addr_hex), "0x%llx", *resolved_addr);
+      address_str = addr_hex;
+    }
 
     // 4. Create the synthetic structure instance and serialize it to structured JSON
     std::string instance_expr =
@@ -814,6 +890,14 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     std::error_code remove_ec;
     std::filesystem::remove(inline_h_path, remove_ec);
 
+    // Resolve address expression to numeric hex if not already a 0x hex literal
+    auto resolved_addr = executor->ResolveAddress(address_str);
+    if (resolved_addr.has_value() && address_str.rfind("0x", 0) != 0 && address_str.rfind("0X", 0) != 0) {
+      char addr_hex[32];
+      snprintf(addr_hex, sizeof(addr_hex), "0x%llx", *resolved_addr);
+      address_str = addr_hex;
+    }
+
     // 8. Create the synthetic structure instance and serialize it to structured JSON
     std::string instance_expr =
         "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + struct_name + "\", " + address_str + ")";
@@ -865,15 +949,16 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     is_json_output = true;
   } else if (tool_name == "windbg.disassemble") {
     std::string addr_str;
-    if (!json::TryGetStringField(arguments_fields, "address", &addr_str)) {
+    json::TryGetStringField(arguments_fields, "address", &addr_str);
+    auto addr_opt = executor->ResolveAddress(addr_str);
+    if (!addr_opt.has_value()) {
       outcome.error_code = -32602;
-      outcome.error_message = "Invalid params: address is required";
+      outcome.error_message = "Unable to resolve disassembly address: " + addr_str;
       return outcome;
     }
     int count = 10;
     json::TryGetIntField(arguments_fields, "count", &count);
-    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
-    execution = executor->Disassemble(address, (uint32_t)count);
+    execution = executor->Disassemble(*addr_opt, (uint32_t)count);
     is_json_output = true;
   } else if (tool_name == "windbg.read_string") {
     std::string addr_str;
@@ -882,19 +967,32 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
       outcome.error_message = "Invalid params: address is required";
       return outcome;
     }
+    auto addr_opt = executor->ResolveAddress(addr_str);
+    if (!addr_opt.has_value()) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Unable to resolve string address: " + addr_str;
+      return outcome;
+    }
     int max_length = 256;
     json::TryGetIntField(arguments_fields, "max_length", &max_length);
     bool wide = false;
     json::TryGetBoolField(arguments_fields, "wide", &wide);
-    uint64_t address = strtoull(addr_str.c_str(), nullptr, 16);
-    execution = executor->ReadString(address, (uint32_t)max_length, wide);
+    execution = executor->ReadString(*addr_opt, (uint32_t)max_length, wide);
     is_json_output = true;
   } else if (tool_name == "windbg.step") {
     bool step_over = true;
     json::TryGetBoolField(arguments_fields, "step_over", &step_over);
-    execution = executor->Step(step_over);
+    bool reverse = false;
+    json::TryGetBoolField(arguments_fields, "reverse", &reverse);
+    int count = 1;
+    json::TryGetIntField(arguments_fields, "count", &count);
+    if (count < 1)
+      count = 1;
+    execution = executor->Step(step_over, reverse, static_cast<std::uint32_t>(count));
   } else if (tool_name == "windbg.continue") {
-    execution = executor->ContinueTarget();
+    bool reverse = false;
+    json::TryGetBoolField(arguments_fields, "reverse", &reverse);
+    execution = executor->ContinueTarget(reverse);
   } else if (tool_name == "windbg.set_breakpoint") {
     std::string expr;
     if (!json::TryGetStringField(arguments_fields, "expression", &expr) || expr.empty()) {
@@ -903,6 +1001,28 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
       return outcome;
     }
     execution = executor->SetBreakpoint(expr);
+  } else if (tool_name == "windbg.clear_breakpoint") {
+    std::string id = "*";
+    json::TryGetStringField(arguments_fields, "id", &id);
+    execution = executor->ClearBreakpoint(id);
+    is_json_output = true;
+  } else if (tool_name == "windbg.resolve") {
+    std::string query;
+    if (!json::TryGetStringField(arguments_fields, "query", &query) &&
+        !json::TryGetStringField(arguments_fields, "expression", &query) &&
+        !json::TryGetStringField(arguments_fields, "symbol", &query) &&
+        !json::TryGetStringField(arguments_fields, "address", &query)) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Invalid params: query (symbol name, expression, or address) is required";
+      return outcome;
+    }
+    execution = executor->ResolveSymbol(query);
+    is_json_output = true;
+  } else if (tool_name == "windbg.ttd_position" || tool_name == "windbg.time_travel") {
+    std::string position;
+    json::TryGetStringField(arguments_fields, "position", &position);
+    execution = executor->GetOrSetTTDPosition(position);
+    is_json_output = true;
   } else {
     outcome.error_code = -32602;
     outcome.error_message = "Invalid params: unknown tool name";

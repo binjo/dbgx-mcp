@@ -22,6 +22,7 @@ public:
   void HexValue(std::uint64_t val);
   void IntValue(std::int64_t val);
   void UintValue(std::uint64_t val);
+  void DoubleValue(double val);
   void BoolValue(bool val);
   void NullValue();
 
@@ -114,6 +115,15 @@ inline void JsonWriter::IntValue(std::int64_t val) {
 inline void JsonWriter::UintValue(std::uint64_t val) {
   MaybeComma();
   json_ += std::to_string(val);
+  stack_.back().has_items = true;
+  stack_.back().is_key_pending = false;
+}
+
+inline void JsonWriter::DoubleValue(double val) {
+  MaybeComma();
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%g", val);
+  json_ += buf;
   stack_.back().has_items = true;
   stack_.back().is_key_pending = false;
 }

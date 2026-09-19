@@ -6,6 +6,7 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <thread>
 
@@ -20,7 +21,7 @@ public:
 
   CommandExecutionResult Execute(const std::string& command, const CommandExecutionOptions& options = {}) override;
   CommandExecutionResult EvaluateModel(const std::string& expression, int max_depth = 5) override;
-  CommandExecutionResult GetContextSnapshot() override;
+  CommandExecutionResult GetContextSnapshot(bool include_all_registers = false) override;
   CommandExecutionResult ReadMemory(std::uint64_t address, std::uint32_t length) override;
   CommandExecutionResult WriteMemory(std::uint64_t address, const std::string& hex_data) override;
   CommandExecutionResult CarvePE(std::uint64_t address, std::uint32_t length) override;
@@ -34,9 +35,13 @@ public:
   CommandExecutionResult GetBreakpoints() override;
   CommandExecutionResult Disassemble(std::uint64_t address, std::uint32_t count = 10) override;
   CommandExecutionResult ReadString(std::uint64_t address, std::uint32_t max_length = 256, bool wide = false) override;
-  CommandExecutionResult Step(bool step_over = true) override;
-  CommandExecutionResult ContinueTarget() override;
+  CommandExecutionResult Step(bool step_over = true, bool reverse = false, std::uint32_t count = 1) override;
+  CommandExecutionResult ContinueTarget(bool reverse = false) override;
   CommandExecutionResult SetBreakpoint(const std::string& expression) override;
+  CommandExecutionResult ClearBreakpoint(const std::string& id) override;
+  CommandExecutionResult ResolveSymbol(const std::string& expression) override;
+  CommandExecutionResult GetOrSetTTDPosition(const std::string& target_position = "") override;
+  std::optional<std::uint64_t> ResolveAddress(const std::string& expression) override;
 
 private:
   using TaskFunction = std::function<CommandExecutionResult()>;
@@ -67,7 +72,7 @@ private:
   CommandExecutionResult DispatchToWorker(TaskFunction func, bool check_ready = true);
   CommandExecutionResult ExecuteSynchronously(const std::string& command, const CommandExecutionOptions& options);
   CommandExecutionResult EvaluateModelSynchronously(const std::string& expression, int max_depth);
-  CommandExecutionResult GetContextSnapshotSynchronously();
+  CommandExecutionResult GetContextSnapshotSynchronously(bool include_all_registers);
   CommandExecutionResult ReadMemorySynchronously(std::uint64_t address, std::uint32_t length);
   CommandExecutionResult WriteMemorySynchronously(std::uint64_t address, const std::string& hex_data);
   CommandExecutionResult CarvePESynchronously(std::uint64_t address, std::uint32_t length);
@@ -78,6 +83,9 @@ private:
   CommandExecutionResult GetBreakpointsSynchronously();
   CommandExecutionResult DisassembleSynchronously(std::uint64_t address, std::uint32_t count);
   CommandExecutionResult ReadStringSynchronously(std::uint64_t address, std::uint32_t max_length, bool wide);
+  CommandExecutionResult ResolveSymbolSynchronously(const std::string& expression);
+  CommandExecutionResult GetOrSetTTDPositionSynchronously(const std::string& target_position);
+  std::optional<std::uint64_t> ResolveAddressSynchronously(const std::string& expression);
   static DebuggerExecutionState ParseRawStatus(std::uint32_t raw_status);
 };
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace dbgx::windbg {
@@ -22,6 +23,8 @@ struct SessionMetadata {
   std::string target_info;
   std::string architecture;
   std::string debuggee_class;
+  bool is_ttd = false;
+  std::string target_type;
 };
 
 struct DebuggerExecutionState {
@@ -38,7 +41,7 @@ public:
   virtual ~IWinDbgCommandExecutor() = default;
   virtual CommandExecutionResult Execute(const std::string& command, const CommandExecutionOptions& options = {}) = 0;
   virtual CommandExecutionResult EvaluateModel(const std::string& expression, int max_depth = 5) = 0;
-  virtual CommandExecutionResult GetContextSnapshot() = 0;
+  virtual CommandExecutionResult GetContextSnapshot(bool include_all_registers = false) = 0;
   virtual CommandExecutionResult ReadMemory(std::uint64_t address, std::uint32_t length) = 0;
   virtual CommandExecutionResult WriteMemory(std::uint64_t address, const std::string& hex_data) = 0;
   virtual CommandExecutionResult CarvePE(std::uint64_t address, std::uint32_t length) = 0;
@@ -53,9 +56,13 @@ public:
   virtual CommandExecutionResult Disassemble(std::uint64_t address, std::uint32_t count = 10) = 0;
   virtual CommandExecutionResult ReadString(std::uint64_t address, std::uint32_t max_length = 256,
                                             bool wide = false) = 0;
-  virtual CommandExecutionResult Step(bool step_over = true) = 0;
-  virtual CommandExecutionResult ContinueTarget() = 0;
+  virtual CommandExecutionResult Step(bool step_over = true, bool reverse = false, std::uint32_t count = 1) = 0;
+  virtual CommandExecutionResult ContinueTarget(bool reverse = false) = 0;
   virtual CommandExecutionResult SetBreakpoint(const std::string& expression) = 0;
+  virtual CommandExecutionResult ClearBreakpoint(const std::string& id) = 0;
+  virtual CommandExecutionResult ResolveSymbol(const std::string& expression) = 0;
+  virtual CommandExecutionResult GetOrSetTTDPosition(const std::string& target_position = "") = 0;
+  virtual std::optional<std::uint64_t> ResolveAddress(const std::string& expression) = 0;
 };
 
 }  // namespace dbgx::windbg

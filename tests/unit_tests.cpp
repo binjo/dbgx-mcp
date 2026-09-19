@@ -47,7 +47,7 @@ public:
     return {true, "{\"field_name\":\"value\"}", ""};
   }
 
-  dbgx::windbg::CommandExecutionResult GetContextSnapshot() override { return {true, "{}", ""}; }
+  dbgx::windbg::CommandExecutionResult GetContextSnapshot(bool) override { return {true, "{}", ""}; }
 
   dbgx::windbg::CommandExecutionResult ReadMemory(std::uint64_t, std::uint32_t) override { return {true, "00", ""}; }
 
@@ -87,13 +87,44 @@ public:
     return {true, "{\"address\":\"0x1000\",\"string\":\"test\",\"length\":4,\"truncated\":false}", ""};
   }
 
-  dbgx::windbg::CommandExecutionResult Step(bool) override { return {true, "ok", ""}; }
+  dbgx::windbg::CommandExecutionResult Step(bool step_over = true, bool reverse = false,
+                                            std::uint32_t count = 1) override {
+    last_command = (reverse ? (step_over ? "p-" : "t-") : (step_over ? "p" : "t"));
+    if (count > 1) last_command += " " + std::to_string(count);
+    return {true, "ok", ""};
+  }
 
-  dbgx::windbg::CommandExecutionResult ContinueTarget() override { return {true, "ok", ""}; }
+  dbgx::windbg::CommandExecutionResult ContinueTarget(bool reverse = false) override {
+    last_command = reverse ? "g-" : "g";
+    return {true, "ok", ""};
+  }
 
   dbgx::windbg::CommandExecutionResult SetBreakpoint(const std::string& expression) override {
     last_command = "bp " + expression;
     return {true, "ok", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult ClearBreakpoint(const std::string& id) override {
+    last_command = "bc " + id;
+    return {true, "{\"success\":true}", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult ResolveSymbol(const std::string& expression) override {
+    return {true, "{\"address\":\"0x1000\",\"symbol\":\"test_sym\"}", ""};
+  }
+
+  dbgx::windbg::CommandExecutionResult GetOrSetTTDPosition(const std::string& target_position = "") override {
+    last_command = target_position.empty() ? "!tt" : ("!tt " + target_position);
+    return {true, "{\"is_ttd\":true,\"current_position\":\"1B:0\"}", ""};
+  }
+
+  std::optional<std::uint64_t> ResolveAddress(const std::string& expression) override {
+    if (expression.empty() || expression == "." || expression == "$ip") return 0x1000;
+    if (expression == "invalid") return std::nullopt;
+    char* end = nullptr;
+    unsigned long long val = strtoull(expression.c_str(), &end, 16);
+    if (end != nullptr && *end == '\0') return val;
+    return 0x1000;
   }
 
   bool should_fail = false;
@@ -703,6 +734,62 @@ void TestToolsCallSetBreakpoint(int* failures) {
   Expect(executor.last_command == "bp main", "set_breakpoint should execute bp main", failures);
 }
 
+void TestToolsCallClearBreakpoint(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"windbg.clear_breakpoint","arguments":{"id":"0"}}})");
+
+  Expect(result.status_code == 200, "clear_breakpoint should return HTTP 200", failures);
+  Expect(executor.last_command == "bc 0", "clear_breakpoint should execute bc 0", failures);
+}
+
+void TestToolsCallResolve(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":108,"method":"tools/call","params":{"name":"windbg.resolve","arguments":{"query":"main"}}})");
+
+  Expect(result.status_code == 200, "resolve should return HTTP 200", failures);
+  Expect(Contains(result.body, "test_sym"), "resolve should return symbol information", failures);
+}
+
+void TestToolsCallTTDPosition(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":109,"method":"tools/call","params":{"name":"windbg.ttd_position","arguments":{"position":"1B:0"}}})");
+
+  Expect(result.status_code == 200, "ttd_position should return HTTP 200", failures);
+  Expect(Contains(result.body, "current_position"), "ttd_position should return position", failures);
+  Expect(executor.last_command == "!tt 1B:0", "ttd_position should execute !tt with target position", failures);
+}
+
+void TestToolsCallCatalogEntryAlias(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":110,"method":"tools/call","params":{"name":"windbg.get_catalog_entry","arguments":{"id":"bp_bu_bm_set_breakpoint"}}})");
+
+  Expect(result.status_code == 200, "get_catalog_entry should return HTTP 200", failures);
+  Expect(Contains(result.body, "bp_bu_bm_set_breakpoint"), "get_catalog_entry should return docs", failures);
+}
+
+void TestToolsCallStepReverseAndCount(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":111,"method":"tools/call","params":{"name":"windbg.step","arguments":{"step_over":true,"reverse":true,"count":5}}})");
+
+  Expect(result.status_code == 200, "step reverse should return HTTP 200", failures);
+  Expect(executor.last_command == "p- 5", "step reverse should execute p- 5", failures);
+}
+
 void TestPipeServerRoundTrip(int* failures) {
   FakeExecutor executor;
   dbgx::mcp::JsonRpcRouter router(&executor);
@@ -784,6 +871,11 @@ int main() {
   TestToolsCallStep(&failures);
   TestToolsCallContinue(&failures);
   TestToolsCallSetBreakpoint(&failures);
+  TestToolsCallClearBreakpoint(&failures);
+  TestToolsCallResolve(&failures);
+  TestToolsCallTTDPosition(&failures);
+  TestToolsCallCatalogEntryAlias(&failures);
+  TestToolsCallStepReverseAndCount(&failures);
   TestPipeServerRoundTrip(&failures);
 
   if (failures == 0) {

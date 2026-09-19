@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <optional>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 #include "dbgx/mcp/json_writer.hpp"
@@ -138,6 +140,27 @@ HRESULT EvaluateExtendedExpressionSafe(IDebugHostEvaluator2* evaluator, const wc
   }
 }
 
+bool IsPrimaryRegister(const std::string& name) {
+  static const std::unordered_set<std::string> kPrimary = {
+      // x86 / x64
+      "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip", "rflags",
+      "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+      "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "efl",
+      "cs", "ds", "es", "fs", "gs", "ss",
+      // arm / arm64
+      "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9",
+      "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19",
+      "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
+      "sp", "pc", "lr", "fp", "cpsr",
+      "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12"
+  };
+  std::string lower = name;
+  for (char& c : lower) {
+    c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+  }
+  return kPrimary.find(lower) != kPrimary.end();
+}
+
 }  // namespace
 
 DbgEngCommandExecutor::DbgEngCommandExecutor() {
@@ -169,6 +192,11 @@ CommandExecutionResult DbgEngCommandExecutor::DispatchToWorker(TaskFunction func
       if (worker_control_ != nullptr) {
         ULONG raw_status = 0;
         if (SUCCEEDED(worker_control_->GetExecutionStatus(&raw_status))) {
+          // If transiently stepping or busy, wait up to 2 seconds for target to break in
+          if (raw_status != DEBUG_STATUS_BREAK && raw_status != DEBUG_STATUS_NO_DEBUGGEE) {
+            (void)worker_control_->WaitForEvent(DEBUG_WAIT_DEFAULT, 2000);
+            (void)worker_control_->GetExecutionStatus(&raw_status);
+          }
           auto state = ParseRawStatus(raw_status);
           if (!state.ready_for_commands) {
             return {false, "",
@@ -268,12 +296,12 @@ CommandExecutionResult DbgEngCommandExecutor::ExecuteSynchronously(const std::st
     };
   }
 
-  control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL,
+  control->ControlledOutput(DEBUG_OUTCTL_ALL_OTHER_CLIENTS, DEBUG_OUTPUT_NORMAL,
                             "[windbg-mcp] [Background Job] Executing: %s\n", command.c_str());
 
   hr = control->Execute(DEBUG_OUTCTL_THIS_CLIENT, command.c_str(), DEBUG_EXECUTE_DEFAULT);
 
-  control->ControlledOutput(DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL,
+  control->ControlledOutput(DEBUG_OUTCTL_ALL_OTHER_CLIENTS, DEBUG_OUTPUT_NORMAL,
                             "[windbg-mcp] [Background Job] Completed. (Status: %s)\n",
                             SUCCEEDED(hr) ? "Success" : "Failed/Interrupted");
 
@@ -329,9 +357,22 @@ DebuggerExecutionState DbgEngCommandExecutor::ParseRawStatus(std::uint32_t raw_s
 
   switch (raw_status) {
     case DEBUG_STATUS_GO:
+    case DEBUG_STATUS_GO_HANDLED:
+    case DEBUG_STATUS_GO_NOT_HANDLED:
+    case DEBUG_STATUS_REVERSE_GO:
       state.status_name = "go";
       state.running = true;
       state.summary = "The target is running.";
+      break;
+    case DEBUG_STATUS_STEP_OVER:
+    case DEBUG_STATUS_STEP_INTO:
+    case DEBUG_STATUS_STEP_BRANCH:
+    case DEBUG_STATUS_REVERSE_STEP_OVER:
+    case DEBUG_STATUS_REVERSE_STEP_INTO:
+    case DEBUG_STATUS_REVERSE_STEP_BRANCH:
+      state.status_name = "stepping";
+      state.busy = true;
+      state.summary = "The target is stepping instructions.";
       break;
     case DEBUG_STATUS_BREAK:
       state.status_name = "break";
@@ -341,6 +382,11 @@ DebuggerExecutionState DbgEngCommandExecutor::ParseRawStatus(std::uint32_t raw_s
     case DEBUG_STATUS_NO_DEBUGGEE:
       state.status_name = "no_debuggee";
       state.summary = "No debuggee is active.";
+      break;
+    case DEBUG_STATUS_WAIT_INPUT:
+      state.status_name = "wait_input";
+      state.busy = true;
+      state.summary = "The debugger is waiting for input.";
       break;
     default:
       state.status_name = "busy";
@@ -395,11 +441,12 @@ CommandExecutionResult DbgEngCommandExecutor::EvaluateModelSynchronously(const s
   return {true, writer.GetJSON(), ""};
 }
 
-CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshot() {
-  return DispatchToWorker([this]() { return GetContextSnapshotSynchronously(); }, true);
+CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshot(bool include_all_registers) {
+  return DispatchToWorker([this, include_all_registers]() { return GetContextSnapshotSynchronously(include_all_registers); },
+                          true);
 }
 
-CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously() {
+CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously(bool include_all_registers) {
   Microsoft::WRL::ComPtr<IDebugClient> client = worker_client_;
   Microsoft::WRL::ComPtr<IDebugRegisters> registers = worker_registers_;
   Microsoft::WRL::ComPtr<IDebugControl> control = worker_control_;
@@ -419,7 +466,75 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously() 
   mcp::JsonWriter writer;
   writer.StartObject();
 
-  // 1. Registers
+  // 1. Thread Information
+  if (worker_systems_ != nullptr) {
+    ULONG tid = 0;
+    ULONG sys_tid = 0;
+    if (SUCCEEDED(worker_systems_->GetCurrentThreadId(&tid))) {
+      writer.Key("thread");
+      writer.StartObject();
+      writer.Key("index");
+      writer.IntValue(tid);
+      if (SUCCEEDED(worker_systems_->GetCurrentThreadSystemId(&sys_tid))) {
+        writer.Key("system_id");
+        writer.HexValue(sys_tid);
+      }
+      writer.EndObject();
+    }
+  }
+
+  // 2. Current Instruction Pointer and Disassembly
+  ULONG64 ip = 0;
+  if (registers != nullptr && SUCCEEDED(registers->GetInstructionOffset(&ip))) {
+    writer.Key("current_instruction");
+    writer.StartObject();
+    writer.Key("address");
+    writer.HexValue(ip);
+    if (symbols) {
+      char sym_name[256] = {0};
+      ULONG64 disp = 0;
+      if (SUCCEEDED(symbols->GetNameByOffset(ip, sym_name, sizeof(sym_name), nullptr, &disp))) {
+        std::string sym = sym_name;
+        if (disp > 0)
+          sym += "+0x" + std::to_string(disp);
+        writer.Key("symbol");
+        writer.StringValue(sym);
+      }
+    }
+    char disasm[256] = {0};
+    ULONG disasm_size = 0;
+    ULONG64 next_ip = 0;
+    if (SUCCEEDED(control->Disassemble(ip, 0, disasm, sizeof(disasm), &disasm_size, &next_ip))) {
+      std::string line = disasm;
+      while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+        line.pop_back();
+      writer.Key("disassembly");
+      writer.StringValue(line);
+    }
+    writer.EndObject();
+  }
+
+  // 3. Time Travel Debugging (TTD) Position if active
+  ULONG dbg_type = 0, dbg_qual = 0;
+  if (control != nullptr && SUCCEEDED(control->GetDebuggeeType(&dbg_type, &dbg_qual))) {
+    if (dbg_type == DEBUG_CLASS_USER_WINDOWS && dbg_qual == 2) {
+      CommandExecutionOptions opt;
+      opt.max_lines = 5;
+      auto tt_res = ExecuteSynchronously("!tt", opt);
+      if (tt_res.success) {
+        auto p = tt_res.output.find("Current position: ");
+        if (p != std::string::npos) {
+          size_t start = p + 18;
+          size_t end = tt_res.output.find_first_of("\r\n ", start);
+          writer.Key("ttd_position");
+          writer.StringValue(
+              tt_res.output.substr(start, (end == std::string::npos ? tt_res.output.size() : end) - start));
+        }
+      }
+    }
+  }
+
+  // 4. Registers
   if (registers != nullptr) {
     writer.Key("registers");
     writer.StartObject();
@@ -428,6 +543,9 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously() 
     for (ULONG i = 0; i < count; ++i) {
       char name[64];
       if (SUCCEEDED(registers->GetDescription(i, name, sizeof(name), nullptr, nullptr))) {
+        if (!include_all_registers && !IsPrimaryRegister(name)) {
+          continue;
+        }
         DEBUG_VALUE val;
         if (SUCCEEDED(registers->GetValue(i, &val))) {
           if (val.Type == DEBUG_VALUE_INT64) {
@@ -443,7 +561,7 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously() 
     writer.EndObject();
   }
 
-  // 2. Stack
+  // 5. Stack
   if (control != nullptr) {
     writer.Key("stack");
     writer.StartArray();
@@ -454,6 +572,8 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously() 
         writer.StartObject();
         writer.Key("instruction_offset");
         writer.HexValue(frames[i].InstructionOffset);
+        writer.Key("frame_offset");
+        writer.HexValue(frames[i].FrameOffset);
         if (symbols) {
           char name[256];
           ULONG64 disp = 0;
@@ -938,6 +1058,17 @@ CommandExecutionResult DbgEngCommandExecutor::DisassembleSynchronously(std::uint
     writer.StartObject();
     writer.Key("address");
     writer.HexValue(current_offset);
+    if (worker_symbols_ != nullptr) {
+      char sym_name[256] = {0};
+      ULONG64 disp = 0;
+      if (SUCCEEDED(worker_symbols_->GetNameByOffset(current_offset, sym_name, sizeof(sym_name), nullptr, &disp))) {
+        std::string sym = sym_name;
+        if (disp > 0)
+          sym += "+0x" + std::to_string(disp);
+        writer.Key("symbol");
+        writer.StringValue(sym);
+      }
+    }
     writer.Key("disassembly");
     writer.StringValue(line);
     writer.EndObject();
@@ -1030,12 +1161,290 @@ CommandExecutionResult DbgEngCommandExecutor::ReadStringSynchronously(std::uint6
   return {true, writer.GetJSON(), ""};
 }
 
-CommandExecutionResult DbgEngCommandExecutor::Step(bool step_over) {
-  return DispatchToWorker([this, step_over]() { return ExecuteSynchronously(step_over ? "p" : "t", {}); }, true);
+CommandExecutionResult DbgEngCommandExecutor::Step(bool step_over, bool reverse, std::uint32_t count) {
+  return DispatchToWorker(
+      [this, step_over, reverse, count]() {
+        std::string cmd;
+        if (reverse) {
+          cmd = step_over ? "p-" : "t-";
+        } else {
+          cmd = step_over ? "p" : "t";
+        }
+        if (count > 1) {
+          cmd += " " + std::to_string(count);
+        }
+        auto res = ExecuteSynchronously(cmd, {});
+        if (worker_control_ != nullptr) {
+          ULONG timeout_ms = (std::max)(5000U, count * 1000U);
+          (void)worker_control_->WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms);
+        }
+        return res;
+      },
+      true);
 }
 
-CommandExecutionResult DbgEngCommandExecutor::ContinueTarget() {
-  return DispatchToWorker([this]() { return ExecuteSynchronously("g", {}); }, true);
+CommandExecutionResult DbgEngCommandExecutor::ContinueTarget(bool reverse) {
+  return DispatchToWorker([this, reverse]() { return ExecuteSynchronously(reverse ? "g-" : "g", {}); }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::ClearBreakpoint(const std::string& id) {
+  return DispatchToWorker(
+      [this, id]() {
+        std::string cmd = (id.empty() || id == "*") ? "bc *" : ("bc " + id);
+        auto res = ExecuteSynchronously(cmd, {});
+        if (res.success) {
+          mcp::JsonWriter writer;
+          writer.StartObject();
+          writer.Key("success");
+          writer.BoolValue(true);
+          writer.Key("cleared");
+          writer.StringValue(id.empty() ? "*" : id);
+          writer.EndObject();
+          return CommandExecutionResult{true, writer.GetJSON(), ""};
+        }
+        return res;
+      },
+      true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::ResolveSymbol(const std::string& expression) {
+  return DispatchToWorker([this, expression]() { return ResolveSymbolSynchronously(expression); }, true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::ResolveSymbolSynchronously(const std::string& expression) {
+  auto addr_opt = ResolveAddressSynchronously(expression);
+  if (!addr_opt.has_value()) {
+    return {false, "", "Unable to resolve expression or address: " + expression};
+  }
+
+  std::uint64_t addr = *addr_opt;
+  Microsoft::WRL::ComPtr<IDebugSymbols3> symbols = worker_symbols_;
+  if (symbols == nullptr && worker_client_ != nullptr) {
+    worker_client_.As(&symbols);
+  }
+
+  char sym_name[256] = {0};
+  ULONG64 disp = 0;
+  std::string sym_str;
+  if (symbols != nullptr && SUCCEEDED(symbols->GetNameByOffset(addr, sym_name, sizeof(sym_name), nullptr, &disp))) {
+    sym_str = sym_name;
+  }
+
+  char mod_name[MAX_PATH] = {0};
+  ULONG64 mod_base = 0;
+  if (symbols != nullptr) {
+    (void)symbols->GetModuleByOffset(addr, 0, nullptr, &mod_base);
+    if (mod_base != 0) {
+      (void)symbols->GetModuleNameString(DEBUG_MODNAME_MODULE, DEBUG_ANY_ID, mod_base, mod_name, sizeof(mod_name),
+                                         nullptr);
+    }
+  }
+
+  mcp::JsonWriter writer;
+  writer.StartObject();
+  writer.Key("address");
+  writer.HexValue(addr);
+  if (!sym_str.empty()) {
+    writer.Key("symbol");
+    writer.StringValue(sym_str);
+    writer.Key("displacement");
+    writer.HexValue(disp);
+  }
+  if (mod_name[0]) {
+    writer.Key("module");
+    writer.StringValue(mod_name);
+    writer.Key("module_base");
+    writer.HexValue(mod_base);
+  }
+  writer.EndObject();
+
+  return {true, writer.GetJSON(), ""};
+}
+
+CommandExecutionResult DbgEngCommandExecutor::GetOrSetTTDPosition(const std::string& target_position) {
+  return DispatchToWorker([this, target_position]() { return GetOrSetTTDPositionSynchronously(target_position); },
+                          true);
+}
+
+CommandExecutionResult DbgEngCommandExecutor::GetOrSetTTDPositionSynchronously(const std::string& target_position) {
+  ULONG dbg_type = 0, dbg_qual = 0;
+  if (worker_control_ != nullptr && SUCCEEDED(worker_control_->GetDebuggeeType(&dbg_type, &dbg_qual))) {
+    if (dbg_type != DEBUG_CLASS_USER_WINDOWS || dbg_qual != 2) {
+      return {false, "", "Target is not a Time Travel Debugging (TTD) session."};
+    }
+  }
+
+  if (!target_position.empty()) {
+    auto res = ExecuteSynchronously("!tt " + target_position, {});
+    if (worker_control_ != nullptr) {
+      (void)worker_control_->WaitForEvent(DEBUG_WAIT_DEFAULT, 10000);
+    }
+    if (!res.success) {
+      return {false, "", "Failed to seek to position: " + res.error_message};
+    }
+  }
+
+  auto pos_res = ExecuteSynchronously("!positions", {});
+  std::string curr_pos;
+  std::string active_tid;
+  struct ThreadPos {
+    std::string tid;
+    std::string pos;
+    bool is_current = false;
+  };
+  std::vector<ThreadPos> thread_positions;
+
+  if (pos_res.success) {
+    std::istringstream stream(pos_res.output);
+    std::string line;
+    while (std::getline(stream, line)) {
+      auto tid_pos = line.find("Thread ID=");
+      auto p_pos = line.find("- Position: ");
+      if (tid_pos != std::string::npos && p_pos != std::string::npos) {
+        bool is_act = (line.find('>') != std::string::npos || line.find('*') != std::string::npos);
+        std::string tid = line.substr(tid_pos + 10, p_pos - (tid_pos + 10));
+        while (!tid.empty() && tid.back() == ' ')
+          tid.pop_back();
+
+        std::string p = line.substr(p_pos + 12);
+        while (!p.empty() && (p.back() == ' ' || p.back() == '\r' || p.back() == '\n'))
+          p.pop_back();
+
+        if (is_act) {
+          curr_pos = p;
+          active_tid = tid;
+        }
+        thread_positions.push_back({tid, p, is_act});
+      }
+    }
+  }
+
+  if (curr_pos.empty()) {
+    auto tt_res = ExecuteSynchronously("!tt", {});
+    auto p = tt_res.output.find("Current position: ");
+    if (p != std::string::npos) {
+      size_t start = p + 18;
+      size_t end = tt_res.output.find_first_of("\r\n ", start);
+      curr_pos = tt_res.output.substr(start, (end == std::string::npos ? tt_res.output.size() : end) - start);
+    }
+  }
+
+  mcp::JsonWriter writer;
+  writer.StartObject();
+  writer.Key("is_ttd");
+  writer.BoolValue(true);
+  writer.Key("current_position");
+  writer.StringValue(curr_pos);
+  if (!active_tid.empty()) {
+    writer.Key("active_thread_id");
+    writer.StringValue(active_tid);
+  }
+  writer.Key("threads");
+  writer.StartArray();
+  for (const auto& tp : thread_positions) {
+    writer.StartObject();
+    writer.Key("thread_id");
+    writer.StringValue(tp.tid);
+    writer.Key("position");
+    writer.StringValue(tp.pos);
+    writer.Key("is_current");
+    writer.BoolValue(tp.is_current);
+    writer.EndObject();
+  }
+  writer.EndArray();
+  writer.EndObject();
+
+  return {true, writer.GetJSON(), ""};
+}
+
+std::optional<std::uint64_t> DbgEngCommandExecutor::ResolveAddress(const std::string& expression) {
+  std::promise<std::optional<std::uint64_t>> promise;
+  auto future = promise.get_future();
+
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (shutdown_) {
+      return std::nullopt;
+    }
+    task_queue_.push(ExecutionTask{
+        [this, &promise, expression]() -> CommandExecutionResult {
+          promise.set_value(ResolveAddressSynchronously(expression));
+          return {true, "", ""};
+        },
+        std::promise<CommandExecutionResult>(), false});
+  }
+  cv_.notify_one();
+  return future.get();
+}
+
+std::optional<std::uint64_t> DbgEngCommandExecutor::ResolveAddressSynchronously(const std::string& input) {
+  std::string str = input;
+  while (!str.empty() && (str.front() == ' ' || str.front() == '\t'))
+    str.erase(str.begin());
+  while (!str.empty() && (str.back() == ' ' || str.back() == '\t' || str.back() == '\r' || str.back() == '\n'))
+    str.pop_back();
+
+  if (str.empty() || str == "." || str == "$ip" || str == "@rip" || str == "@eip") {
+    if (worker_registers_ != nullptr) {
+      ULONG64 ip = 0;
+      if (SUCCEEDED(worker_registers_->GetInstructionOffset(&ip))) {
+        return ip;
+      }
+    }
+    if (str.empty()) {
+      return std::nullopt;
+    }
+  }
+
+  // Remove backticks often present in WinDbg 64-bit addresses like 00007ff9`8d40f650
+  std::string clean;
+  clean.reserve(str.size());
+  for (char c : str) {
+    if (c != '`') {
+      clean.push_back(c);
+    }
+  }
+
+  // Check if it's purely a hex string
+  std::string hex_str = clean;
+  if (hex_str.rfind("0x", 0) == 0 || hex_str.rfind("0X", 0) == 0) {
+    hex_str = hex_str.substr(2);
+  }
+
+  bool is_pure_hex = !hex_str.empty();
+  for (char c : hex_str) {
+    if (!isxdigit(static_cast<unsigned char>(c))) {
+      is_pure_hex = false;
+      break;
+    }
+  }
+
+  if (is_pure_hex) {
+    char* end_ptr = nullptr;
+    unsigned long long val = strtoull(hex_str.c_str(), &end_ptr, 16);
+    if (end_ptr != nullptr && *end_ptr == '\0') {
+      return val;
+    }
+  }
+
+  // Try to evaluate expression via IDebugControl::Evaluate
+  if (worker_control_ != nullptr) {
+    DEBUG_VALUE val{};
+    HRESULT hr = worker_control_->Evaluate(clean.c_str(), DEBUG_VALUE_INT64, &val, nullptr);
+    if (SUCCEEDED(hr)) {
+      return val.I64;
+    }
+  }
+
+  // Also try IDebugSymbols::GetOffsetByName
+  if (worker_symbols_ != nullptr) {
+    ULONG64 offset = 0;
+    if (SUCCEEDED(worker_symbols_->GetOffsetByName(clean.c_str(), &offset))) {
+      return offset;
+    }
+  }
+
+  return std::nullopt;
 }
 
 CommandExecutionResult DbgEngCommandExecutor::SetBreakpoint(const std::string& expression) {
@@ -1124,10 +1533,18 @@ SessionMetadata DbgEngCommandExecutor::GetSessionMetadata() {
               metadata.target_info = "Type=" + std::to_string(type) + ", Qual=" + std::to_string(qual);
               if (type == DEBUG_CLASS_USER_WINDOWS) {
                 metadata.debuggee_class = "user";
+                if (qual == 2) {
+                  metadata.is_ttd = true;
+                  metadata.target_type = "ttd_trace";
+                } else {
+                  metadata.target_type = "live_user";
+                }
               } else if (type == DEBUG_CLASS_KERNEL) {
                 metadata.debuggee_class = "kernel";
+                metadata.target_type = "live_kernel";
               } else {
                 metadata.debuggee_class = "other (" + std::to_string(type) + ")";
+                metadata.target_type = "other";
               }
             }
 

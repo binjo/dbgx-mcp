@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents (Zed, Codex, Claude Code, etc.) 
 
 ## Project Overview
 
-`dbgx-mcp` is a C++ WinDbg extension DLL that exposes an MCP (Model Context Protocol) HTTP endpoint at `/mcp` alongside `windbg-bridge.py` for Stdio-to-HTTP gateway translation. It provides a suite of 24 structured tools (`windbg.eval`, `windbg.dx`, `windbg.get_context`, `windbg.get_modules`, `windbg.get_breakpoints`, `windbg.disassemble`, `windbg.read_string`, `windbg.apply_struct`, `windbg.step`, `windbg.continue`, `windbg.set_breakpoint`, `windbg.list_sessions`, etc.) for agentic debugging and reverse engineering.
+`dbgx-mcp` is a C++ WinDbg extension DLL that exposes an MCP (Model Context Protocol) HTTP endpoint at `/mcp` alongside `windbg-bridge.py` for Stdio-to-HTTP gateway translation. It provides a suite of 27 structured tools (`windbg.eval`, `windbg.dx`, `windbg.get_context`, `windbg.get_modules`, `windbg.get_breakpoints`, `windbg.clear_breakpoint`, `windbg.disassemble`, `windbg.read_string`, `windbg.apply_struct`, `windbg.step`, `windbg.continue`, `windbg.set_breakpoint`, `windbg.resolve`, `windbg.ttd_position`, `windbg.list_sessions`, etc.) for agentic debugging and reverse engineering.
 
 Zero third-party dependencies — only Windows SDK and WinDbg SDK.
 
@@ -47,7 +47,7 @@ windbg-bridge.py      -- Stdio-to-HTTP proxy gateway for MCP clients (Zed / Clau
 dbgx-mcp.dll          -- Native WinDbg Extension DLL
   ├── src/dbgx-mcp.cpp            -- Extension lifecycle (DebugExtensionInitialize / Unload)
   ├── mcp/http_server            -- Winsock HTTP server with socket timeouts & port fallback
-  ├── mcp/json_rpc               -- JSON-RPC 2.0 router & 24 tool handlers
+  ├── mcp/json_rpc               -- JSON-RPC 2.0 router & 27 tool handlers
   ├── mcp/json                   -- Lightweight hand-rolled JSON parser & FieldMap
   ├── mcp/syntypes_js.hpp        -- Embedded SynTypes.js C-struct synthesizer engine
   └── windbg/

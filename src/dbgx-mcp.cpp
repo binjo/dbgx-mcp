@@ -132,6 +132,8 @@ void RegisterSession(std::uint16_t port, const std::string& pipe_name, const std
         << "\""
         << ",\"debuggee_class\":\"" << dbgx::json::Escape(meta.debuggee_class.empty() ? "user" : meta.debuggee_class)
         << "\""
+        << ",\"is_ttd\":" << (meta.is_ttd ? "true" : "false")
+        << ",\"target_type\":\"" << dbgx::json::Escape(meta.target_type.empty() ? "unknown" : meta.target_type) << "\""
         << "}";
       std::lock_guard<std::mutex> lock(state.mutex);
       state.registered_file_path = file_path.string();

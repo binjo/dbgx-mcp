@@ -92,6 +92,21 @@ class TestBridge(unittest.TestCase):
             self.assertFalse(is_safe)
             self.assertIn("prohibited", err)
 
+    def test_validate_command_semicolon_in_quotes(self):
+        is_safe, err = bridge.validate_command('dx @$calls("ntdll!foo;bar")')
+        self.assertTrue(is_safe)
+        self.assertEqual(err, "")
+
+    def test_get_timeout_for_request_ttd_and_resolve(self):
+        t_ttd = bridge.get_timeout_for_request({"method": "tools/call", "params": {"name": "windbg.ttd_position", "arguments": {}}})
+        self.assertEqual(t_ttd, 60.0)
+
+        t_res = bridge.get_timeout_for_request({"method": "tools/call", "params": {"name": "windbg.resolve", "arguments": {"query": "main"}}})
+        self.assertEqual(t_res, 30.0)
+
+        t_step = bridge.get_timeout_for_request({"method": "tools/call", "params": {"name": "windbg.step", "arguments": {"count": 10}}})
+        self.assertEqual(t_step, 30.0)
+
     def test_is_process_alive_current(self):
         self.assertTrue(bridge.is_process_alive(os.getpid()))
 

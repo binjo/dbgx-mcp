@@ -159,32 +159,41 @@ void ModelSerializer::SerializeIntrinsic(IModelObject* object, const VARIANT& vt
       writer.BoolValue(vt.boolVal != VARIANT_FALSE);
       break;
     case VT_I1:
+      writer.IntValue(vt.cVal);
+      break;
     case VT_I2:
+      writer.IntValue(vt.iVal);
+      break;
     case VT_I4:
+      writer.IntValue(vt.lVal);
+      break;
     case VT_I8:
-    case VT_INT: {
-      VARIANT vt_i8;
-      if (SUCCEEDED(VariantChangeType(&vt_i8, &vt, 0, VT_I8))) {
-        writer.IntValue(vt_i8.llVal);
-      } else {
-        writer.NullValue();
-      }
+      writer.IntValue(vt.llVal);
       break;
-    }
+    case VT_INT:
+      writer.IntValue(vt.intVal);
+      break;
     case VT_UI1:
-    case VT_UI2:
-    case VT_UI4:
-    case VT_UI8:
-    case VT_UINT: {
-      VARIANT vt_ui8;
-      if (SUCCEEDED(VariantChangeType(&vt_ui8, &vt, 0, VT_UI8))) {
-        // Many WinDbg numbers (addresses/handles) are best represented as hex strings for agents
-        writer.HexValue(vt_ui8.ullVal);
-      } else {
-        writer.NullValue();
-      }
+      writer.HexValue(vt.bVal);
       break;
-    }
+    case VT_UI2:
+      writer.HexValue(vt.uiVal);
+      break;
+    case VT_UI4:
+      writer.HexValue(vt.ulVal);
+      break;
+    case VT_UI8:
+      writer.HexValue(vt.ullVal);
+      break;
+    case VT_UINT:
+      writer.HexValue(vt.uintVal);
+      break;
+    case VT_R4:
+      writer.DoubleValue(vt.fltVal);
+      break;
+    case VT_R8:
+      writer.DoubleValue(vt.dblVal);
+      break;
     case VT_EMPTY:
     case VT_NULL:
       writer.NullValue();
@@ -209,9 +218,15 @@ bool ModelSerializer::TrySerializeIterable(IModelObject* object, mcp::JsonWriter
 
   writer.StartArray();
   ComPtr<IModelObject> item;
+  int item_count = 0;
   while (SUCCEEDED(GetNextItemSafe(iterator.Get(), &item)) && item) {
+    if (item_count >= 100) {
+      writer.StringValue("... [truncated after 100 items]");
+      break;
+    }
     SerializeRecursive(item.Get(), writer, current_depth + 1, max_depth);
     item.Reset();
+    ++item_count;
   }
   writer.EndArray();
   return true;
