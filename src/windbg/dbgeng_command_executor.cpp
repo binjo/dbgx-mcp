@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <optional>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -342,11 +344,39 @@ DebuggerExecutionState DbgEngCommandExecutor::GetExecutionState() {
 }
 
 bool DbgEngCommandExecutor::InterruptTarget() {
-  if (interrupt_control_ != nullptr) {
-    return SUCCEEDED(interrupt_control_->SetInterrupt(DEBUG_INTERRUPT_ACTIVE));
+  // Runs on the HTTP handler thread (not the worker) on purpose: the worker may be
+  // blocked and the whole point is to break the engine out of a running state.
+  // Only GetExecutionStatus / SetInterrupt are used here, both of which are safe to
+  // call from any thread on any client.
+  Microsoft::WRL::ComPtr<IDebugControl> control = interrupt_control_ != nullptr ? interrupt_control_ : worker_control_;
+  if (control == nullptr) {
+    return false;
   }
-  if (worker_control_ != nullptr) {
-    return SUCCEEDED(worker_control_->SetInterrupt(DEBUG_INTERRUPT_ACTIVE));
+
+  ULONG raw_status = 0;
+  if (SUCCEEDED(control->GetExecutionStatus(&raw_status)) && raw_status == DEBUG_STATUS_BREAK) {
+    return true;  // Already broken in; nothing to do.
+  }
+
+  if (FAILED(control->SetInterrupt(DEBUG_INTERRUPT_ACTIVE))) {
+    return false;
+  }
+
+  // Wait until the engine actually reports a break so callers can issue commands
+  // immediately after this returns (mirrors the tool description contract).
+  constexpr auto kInterruptTimeout = std::chrono::seconds(10);
+  constexpr auto kPollInterval = std::chrono::milliseconds(50);
+  const auto deadline = std::chrono::steady_clock::now() + kInterruptTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (SUCCEEDED(control->GetExecutionStatus(&raw_status))) {
+      if (raw_status == DEBUG_STATUS_BREAK) {
+        return true;
+      }
+      if (raw_status == DEBUG_STATUS_NO_DEBUGGEE) {
+        return false;
+      }
+    }
+    std::this_thread::sleep_for(kPollInterval);
   }
   return false;
 }

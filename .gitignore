@@ -36,3 +36,7 @@ __pycache__/
 
 # Git worktrees
 /.worktrees/
+
+# Decompiled Microsoft DbgX.Mcp reference material (not redistributable)
+/msft/
+/Dbgx.Mcp.7z

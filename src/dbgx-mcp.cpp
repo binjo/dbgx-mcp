@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -46,6 +48,8 @@ struct ExtensionState {
   std::uint16_t bound_port = 0;
   std::string bound_pipe_name;
   std::vector<std::string> active_transports;
+  // Bearer token required on the HTTP transport. Empty => no auth (loopback only).
+  std::string auth_token;
 };
 
 DWORD g_MainThreadId = 0;
@@ -53,6 +57,68 @@ DWORD g_MainThreadId = 0;
 ExtensionState& State() {
   static ExtensionState state;
   return state;
+}
+
+bool IsLoopbackHost(std::string_view host) {
+  return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
+}
+
+std::string GenerateAuthToken() {
+  // std::random_device is backed by a CSPRNG on MSVC (rand_s / BCrypt).
+  std::random_device rd;
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string token;
+  token.reserve(48);
+  for (int i = 0; i < 6; ++i) {
+    std::uint32_t word = rd();
+    for (int nibble = 0; nibble < 8; ++nibble) {
+      token.push_back(kHex[(word >> (nibble * 4)) & 0xF]);
+    }
+  }
+  return token;
+}
+
+// Constant-time-ish comparison so a timing side channel cannot be used to guess the token.
+bool TokensEqual(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+  }
+  return diff == 0;
+}
+
+bool IsHttpRequestAuthorized(const dbgx::mcp::HttpRequest& request, const std::string& expected_token) {
+  if (expected_token.empty()) {
+    return true;
+  }
+  const auto it = request.headers.find("authorization");
+  if (it == request.headers.end()) {
+    return false;
+  }
+  std::string_view value = it->second;
+  while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+    value.remove_prefix(1);
+  }
+  if (value.size() < 7) {
+    return false;
+  }
+  std::string scheme(value.substr(0, 7));
+  std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (scheme != "bearer ") {
+    return false;
+  }
+  value.remove_prefix(7);
+  while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+    value.remove_prefix(1);
+  }
+  while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r')) {
+    value.remove_suffix(1);
+  }
+  return TokensEqual(value, expected_token);
 }
 
 void LogMessage(const std::string& message) {
@@ -97,12 +163,13 @@ std::string GetRegistryDir() {
   return path.string();
 }
 
-void RegisterSession(std::uint16_t port, const std::string& pipe_name, const std::vector<std::string>& transports) {
+void RegisterSession(std::uint16_t port, const std::string& pipe_name, const std::vector<std::string>& transports,
+                     const std::string& auth_token) {
   std::string dir = GetRegistryDir();
   if (dir.empty())
     return;
 
-  std::thread([port, pipe_name, transports, dir]() {
+  std::thread([port, pipe_name, transports, dir, auth_token]() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ExtensionState& state = State();
     dbgx::windbg::SessionMetadata meta;
@@ -125,7 +192,11 @@ void RegisterSession(std::uint16_t port, const std::string& pipe_name, const std
           f << ",";
         f << "\"" << dbgx::json::Escape(transports[i]) << "\"";
       }
-      f << "],\"pid\":" << GetCurrentProcessId() << ",\"target_pid\":" << meta.process_id << ",\"executable\":\""
+      f << "]";
+      if (!auth_token.empty()) {
+        f << ",\"token\":\"" << dbgx::json::Escape(auth_token) << "\"";
+      }
+      f << ",\"pid\":" << GetCurrentProcessId() << ",\"target_pid\":" << meta.process_id << ",\"executable\":\""
         << dbgx::json::Escape(meta.executable_name.empty() ? "WinDbg Session" : meta.executable_name) << "\""
         << ",\"info\":\"" << dbgx::json::Escape(meta.target_info.empty() ? "Live Session" : meta.target_info) << "\""
         << ",\"architecture\":\"" << dbgx::json::Escape(meta.architecture.empty() ? "unknown" : meta.architecture)
@@ -308,6 +379,24 @@ dbgx::mcp::HttpResponse HandleSessionsRequest(const dbgx::mcp::HttpRequest& requ
 }
 
 dbgx::mcp::HttpResponse HandleHttpRequest(const dbgx::mcp::HttpRequest& request) {
+  // Bearer-token gate (applies to /mcp and /sessions alike when a token is configured).
+  {
+    std::string expected_token;
+    {
+      ExtensionState& state = State();
+      std::lock_guard<std::mutex> lock(state.mutex);
+      expected_token = state.auth_token;
+    }
+    if (!IsHttpRequestAuthorized(request, expected_token)) {
+      dbgx::mcp::HttpResponse denied;
+      denied.status_code = 401;
+      denied.body =
+          "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32001,\"message\":\"Unauthorized: missing or invalid "
+          "bearer token. Set WINDBG_MCP_TOKEN on the client to the token shown in the WinDbg console.\"}}";
+      return denied;
+    }
+  }
+
   if (request.path == "/sessions") {
     return HandleSessionsRequest(request);
   }
@@ -416,6 +505,7 @@ void Cleanup() {
   state.router.reset();
   state.executor.reset();
   state.active_transports.clear();
+  state.auth_token.clear();
 }
 
 }  // namespace
@@ -468,6 +558,25 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
     bind_host = bind_addr_buf;
   }
 
+  // HTTP authentication policy:
+  //   * WINDBG_MCP_TOKEN=<secret>  -> always require this bearer token.
+  //   * non-loopback bind, no token -> generate a random token (unless WINDBG_MCP_NO_AUTH=1).
+  //   * loopback bind, no token     -> no auth (Origin check + pipe ACL still apply).
+  state.auth_token.clear();
+  bool token_generated = false;
+  {
+    char token_buf[256] = {0};
+    char no_auth_buf[8] = {0};
+    const bool no_auth = GetEnvironmentVariableA("WINDBG_MCP_NO_AUTH", no_auth_buf, sizeof(no_auth_buf)) > 0 &&
+                         std::string(no_auth_buf) != "0";
+    if (GetEnvironmentVariableA("WINDBG_MCP_TOKEN", token_buf, sizeof(token_buf)) > 0) {
+      state.auth_token = token_buf;
+    } else if (enable_http && !IsLoopbackHost(bind_host) && !no_auth) {
+      state.auth_token = GenerateAuthToken();
+      token_generated = true;
+    }
+  }
+
   state.active_transports.clear();
   state.bound_port = 0;
   state.bound_pipe_name.clear();
@@ -482,6 +591,18 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
       state.active_transports.push_back("http");
       LogMessage("HTTP MCP server listening on http://" + bind_host + ":" + std::to_string(state.bound_port) +
                  "/mcp (Keep-Alive enabled)");
+      if (!state.auth_token.empty()) {
+        if (token_generated) {
+          LogMessage("HTTP bearer token (auto-generated for non-loopback bind): " + state.auth_token);
+          LogMessage("  * Set WINDBG_MCP_TOKEN=" + state.auth_token +
+                     " in the MCP client's environment (windbg-bridge.py) to authenticate.");
+          LogMessage("  * Set WINDBG_MCP_NO_AUTH=1 before loading the extension to disable this check.");
+        } else {
+          LogMessage("HTTP bearer token authentication enabled (WINDBG_MCP_TOKEN).");
+        }
+      } else if (!IsLoopbackHost(bind_host)) {
+        LogMessage("WARNING: HTTP server is reachable from the network WITHOUT authentication (WINDBG_MCP_NO_AUTH).");
+      }
     } else {
       LogMessage("HTTP server start failed: " + http_error);
       if (!enable_pipe) {
@@ -521,7 +642,7 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
     }
   }
 
-  RegisterSession(state.bound_port, state.bound_pipe_name, state.active_transports);
+  RegisterSession(state.bound_port, state.bound_pipe_name, state.active_transports, state.auth_token);
 
   LogMessage("  * Background request logs are written to %TEMP%\\dbgx-mcp-extension.log to prevent UI deadlocks.");
   LogMessage("  * AI background tool executions will display '[Background Job]' status indicators in this window.");

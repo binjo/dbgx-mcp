@@ -31,8 +31,24 @@ TRANSPORT_MODE = next(
 )
 # Well-known base port for the WinDbg MCP server
 BASE_PORT = 5678
+# Optional bearer token for the HTTP transport. Required when the DLL is bound to a
+# non-loopback address (it prints the auto-generated token in the WinDbg console).
+AUTH_TOKEN = next(
+    (v for k, v in os.environ.items() if k.lower() == "windbg_mcp_token"),
+    "",
+)
 # Path to the diagnostic log file
 LOG_FILE = os.path.join(tempfile.gettempdir(), "windbg-bridge.log")
+
+
+def auth_headers(session=None) -> dict:
+    """Returns the Authorization header for a session (per-session token wins over env)."""
+    token = ""
+    if isinstance(session, dict):
+        token = session.get("token") or ""
+    if not token:
+        token = AUTH_TOKEN
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 # Global state to track the currently selected backend port and sessions
 _current_port = BASE_PORT
@@ -334,16 +350,26 @@ def get_connection_lock(key):
         return lock
 
 
-def forward_pipe(pipe_name, body_bytes, timeout=60.0):
-    """Forwards a JSON-RPC request over a local Windows Named Pipe with ultra-low latency."""
+_pipe_handles: dict[str, int] = {}
+_pipe_handles_lock = threading.Lock()
+
+# Win32 error codes that mean the server side of the pipe went away.
+_PIPE_RECONNECT_ERRORS = {
+    109,  # ERROR_BROKEN_PIPE
+    232,  # ERROR_NO_DATA (pipe being closed)
+    233,  # ERROR_PIPE_NOT_CONNECTED
+    6,    # ERROR_INVALID_HANDLE
+}
+
+
+def _pipe_full_path(pipe_name: str) -> str:
     if not pipe_name.startswith(r"\\.\pipe"):
-        full_pipe_path = r"\\.\pipe" + "\\" + pipe_name
-    else:
-        full_pipe_path = pipe_name
+        return r"\\.\pipe" + "\\" + pipe_name
+    return pipe_name
 
-    if sys.platform != "win32":
-        raise NotImplementedError("Named Pipe transport is only supported on Windows")
 
+def _open_pipe_handle(full_pipe_path: str, timeout: float):
+    """Opens a client handle to the named pipe, waiting for a free instance."""
     import ctypes
     from ctypes import wintypes
 
@@ -361,18 +387,12 @@ def forward_pipe(pipe_name, body_bytes, timeout=60.0):
     WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
     WaitNamedPipeW.restype = wintypes.BOOL
 
-    CloseHandle = ctypes.windll.kernel32.CloseHandle
-    ReadFile = ctypes.windll.kernel32.ReadFile
-    WriteFile = ctypes.windll.kernel32.WriteFile
-
+    invalid = wintypes.HANDLE(-1).value
     deadline = time.time() + timeout
-    handle = None
-
     while time.time() < deadline:
         h = CreateFileW(full_pipe_path, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
-        if h != wintypes.HANDLE(-1).value and h != 0:
-            handle = h
-            break
+        if h != invalid and h != 0:
+            return h
 
         err = ctypes.windll.kernel32.GetLastError()
         if err == ERROR_PIPE_BUSY:
@@ -384,46 +404,103 @@ def forward_pipe(pipe_name, body_bytes, timeout=60.0):
         else:
             raise IOError(f"Failed to open named pipe '{full_pipe_path}' (Error {err})")
 
-    if handle is None:
-        raise IOError(f"Timeout waiting for named pipe '{full_pipe_path}'")
+    raise IOError(f"Timeout waiting for named pipe '{full_pipe_path}'")
 
-    try:
-        msg = body_bytes if body_bytes.endswith(b"\n") else body_bytes + b"\n"
-        written = wintypes.DWORD(0)
-        if not WriteFile(handle, msg, len(msg), ctypes.byref(written), None):
+
+def _close_pipe_handle(full_pipe_path: str):
+    """Closes and forgets the cached handle for a pipe (if any)."""
+    import ctypes
+
+    with _pipe_handles_lock:
+        handle = _pipe_handles.pop(full_pipe_path, None)
+    if handle is not None:
+        try:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _get_pipe_handle(full_pipe_path: str, timeout: float):
+    with _pipe_handles_lock:
+        handle = _pipe_handles.get(full_pipe_path)
+    if handle is not None:
+        return handle
+    handle = _open_pipe_handle(full_pipe_path, timeout)
+    with _pipe_handles_lock:
+        _pipe_handles[full_pipe_path] = handle
+    return handle
+
+
+def _pipe_round_trip(handle, full_pipe_path: str, body_bytes: bytes) -> bytes:
+    """Writes one newline-delimited request and reads one newline-delimited response."""
+    import ctypes
+    from ctypes import wintypes
+
+    ReadFile = ctypes.windll.kernel32.ReadFile
+    WriteFile = ctypes.windll.kernel32.WriteFile
+
+    msg = body_bytes if body_bytes.endswith(b"\n") else body_bytes + b"\n"
+    written = wintypes.DWORD(0)
+    if not WriteFile(handle, msg, len(msg), ctypes.byref(written), None):
+        err = ctypes.windll.kernel32.GetLastError()
+        raise OSError(err, f"WriteFile failed on pipe '{full_pipe_path}' (Error {err})")
+
+    resp_buf = bytearray()
+    chunk = ctypes.create_string_buffer(4096)
+    read_bytes = wintypes.DWORD(0)
+    while True:
+        if not ReadFile(handle, chunk, 4096, ctypes.byref(read_bytes), None):
             err = ctypes.windll.kernel32.GetLastError()
-            raise IOError(f"WriteFile failed on pipe '{full_pipe_path}' (Error {err})")
-
-        resp_buf = bytearray()
-        chunk = ctypes.create_string_buffer(4096)
-        read_bytes = wintypes.DWORD(0)
-        while True:
-            if not ReadFile(handle, chunk, 4096, ctypes.byref(read_bytes), None) or read_bytes.value == 0:
-                break
-            resp_buf.extend(chunk.raw[:read_bytes.value])
-            if b"\n" in resp_buf:
-                break
-        return bytes(resp_buf).strip(), 200
-    finally:
-        CloseHandle(handle)
+            raise OSError(err, f"ReadFile failed on pipe '{full_pipe_path}' (Error {err})")
+        if read_bytes.value == 0:
+            raise OSError(109, f"Pipe '{full_pipe_path}' closed by server")
+        resp_buf.extend(chunk.raw[:read_bytes.value])
+        if b"\n" in resp_buf:
+            break
+    return bytes(resp_buf).strip()
 
 
-def forward_post(host, port, path, body_bytes, timeout=60.0):
+def forward_pipe(pipe_name, body_bytes, timeout=60.0):
+    """Forwards a JSON-RPC request over a persistent local Windows Named Pipe connection.
+
+    One handle is kept open per pipe and all requests to that pipe are serialized
+    with a dedicated lock (WinDbg's engine is single-threaded anyway). If the
+    server side disconnects, the handle is reopened and the request retried once.
+    """
+    if sys.platform != "win32":
+        raise NotImplementedError("Named Pipe transport is only supported on Windows")
+
+    full_pipe_path = _pipe_full_path(pipe_name)
+    lock = get_connection_lock("pipe:" + full_pipe_path)
+    with lock:
+        for attempt in range(2):
+            handle = _get_pipe_handle(full_pipe_path, timeout)
+            try:
+                return _pipe_round_trip(handle, full_pipe_path, body_bytes), 200
+            except OSError as e:
+                _close_pipe_handle(full_pipe_path)
+                if attempt == 0 and e.errno in _PIPE_RECONNECT_ERRORS:
+                    log(f"Pipe '{full_pipe_path}' disconnected (Error {e.errno}). Reconnecting.")
+                    continue
+                raise IOError(str(e)) from e
+    raise IOError(f"Pipe dispatch to '{full_pipe_path}' failed")
+
+
+def forward_post(host, port, path, body_bytes, timeout=60.0, extra_headers=None):
     """Forwards a POST request using a persistent keep-alive connection with automatic reconnect."""
     key = f"{host}:{port}"
     lock = get_connection_lock(key)
+    headers = {
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
     with lock:
         conn = get_connection(host, port, timeout=timeout)
         try:
-            conn.request(
-                "POST",
-                path,
-                body=body_bytes,
-                headers={
-                    "Content-Type": "application/json",
-                    "Connection": "keep-alive",
-                },
-            )
+            conn.request("POST", path, body=body_bytes, headers=headers)
             resp = conn.getresponse()
             data = resp.read()
             return data, resp.status
@@ -440,15 +517,7 @@ def forward_post(host, port, path, body_bytes, timeout=60.0):
                     del _connections[key]
             # Retry once
             conn = get_connection(host, port, timeout=timeout)
-            conn.request(
-                "POST",
-                path,
-                body=body_bytes,
-                headers={
-                    "Content-Type": "application/json",
-                    "Connection": "keep-alive",
-                },
-            )
+            conn.request("POST", path, body=body_bytes, headers=headers)
             resp = conn.getresponse()
             data = resp.read()
             return data, resp.status
@@ -474,7 +543,7 @@ def forward_mcp_message(session, body_bytes, timeout=60.0):
             if TRANSPORT_MODE == "pipe":
                 raise
 
-    return forward_post(GUEST_IP, port, "/mcp", body_bytes, timeout=timeout)
+    return forward_post(GUEST_IP, port, "/mcp", body_bytes, timeout=timeout, extra_headers=auth_headers(session))
 
 
 def is_process_alive(pid: int) -> bool:
@@ -504,12 +573,15 @@ def scan_port(port):
     """Scans a single port for active WinDbg MCP guest sessions."""
     url = f"http://{GUEST_IP}:{port}/sessions"
     try:
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(url, method="GET", headers=auth_headers())
         with urllib.request.urlopen(req, timeout=0.3) as f:
             if f.getcode() == 200:
                 data = json.loads(f.read().decode("utf-8"))
                 if isinstance(data, list):
                     return data
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            log(f"Session scan of {url} rejected (401): set WINDBG_MCP_TOKEN to the token shown in WinDbg.")
     except Exception:
         pass
     return []
@@ -581,23 +653,24 @@ def get_default_tools_list():
         {"name": "windbg.get_breakpoints", "description": "Get structured list of all active breakpoints, offsets, hit counts, and commands.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
         {"name": "windbg.disassemble", "description": "Disassemble instructions at given address or current instruction pointer (if omitted/empty).", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "count": {"type": "integer"}, "session_id": {"type": "integer"}}}},
         {"name": "windbg.read_memory", "description": "Read raw memory block at virtual address, symbol, or expression as hex string.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "length": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
-        {"name": "windbg.write_memory", "description": "Write raw bytes from hex string to virtual address or symbol.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "hex_data": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["address", "hex_data"]}},
+        {"name": "windbg.write_memory", "description": "Write raw bytes from hex string to virtual address or symbol.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "data": {"type": "string", "description": "Hexadecimal representation of bytes to write (e.g. '9090')"}, "session_id": {"type": "integer"}}, "required": ["address", "data"]}},
         {"name": "windbg.search", "description": "Search virtual memory range for byte pattern.", "inputSchema": {"type": "object", "properties": {"start_address": {"type": "string"}, "end_address": {"type": "string"}, "pattern": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["start_address", "end_address", "pattern"]}},
         {"name": "windbg.read_string", "description": "Read ASCII or UTF-16 wide string from memory address or symbol.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "max_length": {"type": "integer"}, "wide": {"type": "boolean"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
-        {"name": "windbg.carve_pe", "description": "Reconstruct and carve mapped PE image from memory back to file-aligned raw bytes.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "length": {"type": "integer"}, "session_id": {"type": "integer"}}, "required": ["address"]}},
+        {"name": "windbg.carve_pe", "description": "Reconstruct and carve mapped PE image from memory back to file-aligned raw bytes.", "inputSchema": {"type": "object", "properties": {"address": {"type": "string"}, "length": {"type": "integer", "description": "Estimated virtual size of the image to read"}, "session_id": {"type": "integer"}}, "required": ["address", "length"]}},
         {"name": "windbg.get_threads", "description": "Get list of all target threads with thread IDs and current active thread flag.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
         {"name": "windbg.get_execution_state", "description": "Check if target is running, busy, or broken in and ready for commands.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
         {"name": "windbg.interrupt", "description": "Send interrupt signal to break into running target.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
         {"name": "windbg.step", "description": "Step execution forward or backward in time (TTD).", "inputSchema": {"type": "object", "properties": {"step_over": {"type": "boolean"}, "reverse": {"type": "boolean"}, "count": {"type": "integer"}, "session_id": {"type": "integer"}}}},
         {"name": "windbg.continue", "description": "Resume target execution forward ('g') or backward in time ('g-' in TTD).", "inputSchema": {"type": "object", "properties": {"reverse": {"type": "boolean"}, "session_id": {"type": "integer"}}}},
         {"name": "windbg.set_breakpoint", "description": "Set breakpoint at symbol or expression ('bp').", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["expression"]}},
-        {"name": "windbg.clear_breakpoint", "description": "Clear breakpoint by ID or '*' for all breakpoints ('bc').", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["id"]}},
+        {"name": "windbg.clear_breakpoint", "description": "Clear breakpoint by ID or '*' for all breakpoints ('bc'). Defaults to '*'.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "session_id": {"type": "integer"}}}},
         {"name": "windbg.resolve", "description": "Resolve symbol expression to address or address to nearest symbol and module.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["query"]}},
         {"name": "windbg.ttd_position", "description": "Query current Time Travel Debugging (TTD) position and thread positions or seek to a position (e.g. '1B:0').", "inputSchema": {"type": "object", "properties": {"position": {"type": "string"}, "session_id": {"type": "integer"}}}},
         {"name": "windbg.search_catalog", "description": "Search built-in WinDbg command documentation catalog.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
         {"name": "windbg.get_command_docs", "description": "Retrieve full documentation for command by ID.", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
         {"name": "windbg.get_catalog_entry", "description": "Retrieve full documentation for command by ID (alias for get_command_docs).", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
         {"name": "windbg.apply_struct", "description": "Dynamically apply C struct definition to memory address.", "inputSchema": {"type": "object", "properties": {"struct_definition": {"type": "string"}, "struct_name": {"type": "string"}, "address": {"type": "string"}, "module_name": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["struct_definition", "struct_name", "address"]}},
+        {"name": "windbg.apply_synthetic_type", "description": "Apply a synthetic C-style struct definition loaded from a header file on the guest onto a memory address.", "inputSchema": {"type": "object", "properties": {"header_path": {"type": "string"}, "struct_name": {"type": "string"}, "address": {"type": "string"}, "module_name": {"type": "string"}, "syntypes_path": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["header_path", "struct_name", "address"]}},
         {"name": "windbg.write_file", "description": "Write file directly onto Windows filesystem.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
         {"name": "windbg.get_session_metadata", "description": "Get metadata about active debugging target.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
         {"name": "windbg.list_sessions", "description": "List all active WinDbg MCP sessions in host/guest.", "inputSchema": {"type": "object", "properties": {}}}

@@ -9,6 +9,7 @@
 #include <fstream>
 #include <utility>
 
+#include "dbgx/mcp/guardrails.hpp"
 #include "dbgx/mcp/json.hpp"
 #include "dbgx/mcp/syntypes_js.hpp"
 #include "dbgx/windbg/catalog.hpp"
@@ -118,12 +119,7 @@ MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
       "\"protocolVersion\":\"" +
       json::Escape(requested_version) +
       "\","
-      "\"capabilities\":{\"tools\":{\"listChanged\":false,\"availableTools\":[\"windbg.eval\",\"windbg.dx\",\"windbg."
-      "get_context\",\"windbg.read_memory\",\"windbg.carve_pe\",\"windbg.search\",\"windbg.get_execution_state\","
-      "\"windbg.interrupt\",\"windbg.search_catalog\",\"windbg.get_command_docs\",\"windbg.get_catalog_entry\",\"windbg.get_session_metadata\","
-      "\"windbg.write_memory\",\"windbg.get_threads\",\"windbg.apply_synthetic_type\",\"windbg.write_file\",\"windbg."
-      "apply_struct\",\"windbg.get_modules\",\"windbg.get_breakpoints\",\"windbg.disassemble\",\"windbg.read_string\","
-      "\"windbg.step\",\"windbg.continue\",\"windbg.set_breakpoint\",\"windbg.clear_breakpoint\",\"windbg.resolve\",\"windbg.ttd_position\"]}},"
+      "\"capabilities\":{\"tools\":{\"listChanged\":false}},"
       "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING
       "\"}"
       "}";
@@ -530,11 +526,34 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
   windbg::CommandExecutionResult execution;
   bool is_json_output = false;
 
+  // Read-only mode (WINDBG_MCP_READONLY=1): reject anything that mutates the target.
+  if (IsReadOnlyModeEnabled() && IsMutatingTool(tool_name)) {
+    bool mutating = true;
+    if (tool_name == "windbg.ttd_position" || tool_name == "windbg.time_travel") {
+      std::string position;
+      json::TryGetStringField(arguments_fields, "position", &position);
+      mutating = !position.empty();  // Querying the position is fine; seeking is not.
+    }
+    if (mutating) {
+      outcome.error_code = -32602;
+      outcome.error_message = "Tool '" + tool_name +
+                              "' is disabled because the server is running in read-only mode "
+                              "(WINDBG_MCP_READONLY is set).";
+      return outcome;
+    }
+  }
+
   if (tool_name == "windbg.eval") {
     std::string command;
     if (!json::TryGetStringField(arguments_fields, "command", &command) || command.empty()) {
       outcome.error_code = -32602;
       outcome.error_message = "Invalid params: command must be a non-empty string";
+      return outcome;
+    }
+    std::string guard_error;
+    if (!ValidateDebuggerCommand(command, &guard_error)) {
+      outcome.error_code = -32602;
+      outcome.error_message = guard_error;
       return outcome;
     }
     windbg::CommandExecutionOptions options;
@@ -627,7 +646,19 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     is_json_output = true;
   } else if (tool_name == "windbg.interrupt") {
     bool success = executor->InterruptTarget();
-    std::string json_out = "{\"success\":" + std::string(success ? "true" : "false") + "}";
+    auto state = executor->GetExecutionState();
+    std::string json_out = "{";
+    json_out += "\"success\":" + std::string(success ? "true" : "false") + ",";
+    json_out += "\"ready_for_commands\":" + std::string(state.ready_for_commands ? "true" : "false") + ",";
+    json_out += "\"status_name\":\"" + json::Escape(state.status_name) + "\",";
+    json_out += "\"raw_status\":" + std::to_string(state.raw_status) + ",";
+    json_out += "\"summary\":\"" +
+                json::Escape(success ? state.summary
+                                     : "Interrupt requested but the target did not break in within the timeout. "
+                                       "Current state: " +
+                                           state.summary) +
+                "\"";
+    json_out += "}";
 
     execution.success = true;
     execution.output = json_out;

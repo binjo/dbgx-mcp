@@ -49,6 +49,7 @@ add_library(dbgx-mcp SHARED
   src/mcp/io_echo.cpp
   src/mcp/json.cpp
   src/mcp/json_rpc.cpp
+  src/mcp/guardrails.cpp
   src/mcp/json_writer.cpp
   src/windbg/catalog.cpp
   src/windbg/dbgeng_command_executor.cpp
@@ -84,6 +85,7 @@ target_compile_definitions(dbgx-mcp PRIVATE
 target_link_libraries(dbgx-mcp PRIVATE
   dbgeng
   ws2_32
+  advapi32
 )
 
 add_custom_target(check_windbg_exports
@@ -105,13 +107,14 @@ add_executable(unit_tests
   src/mcp/io_echo.cpp
   src/mcp/json.cpp
   src/mcp/json_rpc.cpp
+  src/mcp/guardrails.cpp
   src/mcp/json_writer.cpp
   src/windbg/catalog.cpp
   tests/unit_tests.cpp
 )
 
 target_include_directories(unit_tests PRIVATE include)
-target_link_libraries(unit_tests PRIVATE ws2_32)
+target_link_libraries(unit_tests PRIVATE ws2_32 advapi32)
 
 target_compile_definitions(unit_tests PRIVATE
   DBGX_VERSION_STRING="${DBGX_VERSION}"

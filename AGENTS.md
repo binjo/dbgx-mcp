@@ -48,6 +48,7 @@ dbgx-mcp.dll          -- Native WinDbg Extension DLL
   ├── src/dbgx-mcp.cpp            -- Extension lifecycle (DebugExtensionInitialize / Unload)
   ├── mcp/http_server            -- Winsock HTTP server with socket timeouts & port fallback
   ├── mcp/json_rpc               -- JSON-RPC 2.0 router & 27 tool handlers
+  ├── mcp/guardrails             -- Server-side command deny-list + WINDBG_MCP_READONLY enforcement
   ├── mcp/json                   -- Lightweight hand-rolled JSON parser & FieldMap
   ├── mcp/syntypes_js.hpp        -- Embedded SynTypes.js C-struct synthesizer engine
   └── windbg/

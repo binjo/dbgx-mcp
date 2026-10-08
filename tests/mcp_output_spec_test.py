@@ -132,75 +132,9 @@ def case_initialize(
         "initialize.result.capabilities.tools.listChanged must be bool",
     )
 
-    available_tools = tools_dict.get("availableTools")
     expect(
-        isinstance(available_tools, list),
-        "initialize.result.capabilities.tools.availableTools must be a list",
-    )
-    available_tools_list = cast(list[Any], available_tools)
-    expect(
-        "windbg.eval" in available_tools_list,
-        "initialize must advertise windbg.eval in availableTools",
-    )
-    expect(
-        "windbg.dx" in available_tools_list,
-        "initialize must advertise windbg.dx in availableTools",
-    )
-    expect(
-        "windbg.get_context" in available_tools_list,
-        "initialize must advertise windbg.get_context in availableTools",
-    )
-    expect(
-        "windbg.read_memory" in available_tools_list,
-        "initialize must advertise windbg.read_memory in availableTools",
-    )
-    expect(
-        "windbg.carve_pe" in available_tools_list,
-        "initialize must advertise windbg.carve_pe in availableTools",
-    )
-    expect(
-        "windbg.search" in available_tools_list,
-        "initialize must advertise windbg.search in availableTools",
-    )
-    expect(
-        "windbg.get_execution_state" in available_tools_list,
-        "initialize must advertise windbg.get_execution_state in availableTools",
-    )
-    expect(
-        "windbg.interrupt" in available_tools_list,
-        "initialize must advertise windbg.interrupt in availableTools",
-    )
-    expect(
-        "windbg.search_catalog" in available_tools_list,
-        "initialize must advertise windbg.search_catalog in availableTools",
-    )
-    expect(
-        "windbg.get_command_docs" in available_tools_list,
-        "initialize must advertise windbg.get_command_docs in availableTools",
-    )
-    expect(
-        "windbg.get_session_metadata" in available_tools_list,
-        "initialize must advertise windbg.get_session_metadata in availableTools",
-    )
-    expect(
-        "windbg.write_memory" in available_tools_list,
-        "initialize must advertise windbg.write_memory in availableTools",
-    )
-    expect(
-        "windbg.get_threads" in available_tools_list,
-        "initialize must advertise windbg.get_threads in availableTools",
-    )
-    expect(
-        "windbg.apply_synthetic_type" in available_tools_list,
-        "initialize must advertise windbg.apply_synthetic_type in availableTools",
-    )
-    expect(
-        "windbg.apply_struct" in available_tools_list,
-        "initialize must advertise windbg.apply_struct in availableTools",
-    )
-    expect(
-        "windbg.write_file" in available_tools_list,
-        "initialize must advertise windbg.write_file in availableTools",
+        "availableTools" not in tools_dict,
+        "initialize.result.capabilities.tools must not carry non-standard fields",
     )
 
     server_info = result.get("serverInfo")
@@ -239,6 +173,33 @@ def case_tools_list(
     expect(isinstance(tools, list), "tools/list.result.tools must be a list")
     tools_list = cast(list[Any], tools)
     expect(len(tools_list) > 0, "tools/list.result.tools must not be empty")
+
+    advertised_names = {
+        tool.get("name") for tool in tools_list if isinstance(tool, dict)
+    }
+    required_tools = [
+        "windbg.eval",
+        "windbg.dx",
+        "windbg.get_context",
+        "windbg.read_memory",
+        "windbg.carve_pe",
+        "windbg.search",
+        "windbg.get_execution_state",
+        "windbg.interrupt",
+        "windbg.search_catalog",
+        "windbg.get_command_docs",
+        "windbg.get_session_metadata",
+        "windbg.write_memory",
+        "windbg.get_threads",
+        "windbg.apply_synthetic_type",
+        "windbg.apply_struct",
+        "windbg.write_file",
+    ]
+    for required in required_tools:
+        expect(
+            required in advertised_names,
+            f"tools/list must advertise {required}",
+        )
 
     windbg_eval: dict[str, Any] | None = None
     for tool in tools_list:

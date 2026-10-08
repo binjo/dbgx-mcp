@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "dbgx/mcp/guardrails.hpp"
 #include "dbgx/mcp/http_server.hpp"
 #include "dbgx/mcp/io_echo.hpp"
 #include "dbgx/mcp/json.hpp"
@@ -275,7 +276,10 @@ void TestInitialize(int* failures) {
   Expect(result.status_code == 200, "initialize should return HTTP 200", failures);
   Expect(Contains(result.body, "\"protocolVersion\":\"2025-11-25\""), "initialize should return protocol version",
          failures);
-  Expect(Contains(result.body, "\"windbg.eval\""), "initialize should mention windbg.eval capability", failures);
+  Expect(Contains(result.body, "\"capabilities\":{\"tools\":{\"listChanged\":false}}"),
+         "initialize should advertise spec-conformant tools capability", failures);
+  Expect(!Contains(result.body, "availableTools"),
+         "initialize must not include non-standard availableTools (use tools/list)", failures);
   Expect(Contains(result.body, "\"version\":\"" DBGX_VERSION_STRING "\""),
          "initialize should return DBGX_VERSION_STRING in serverInfo", failures);
 }
@@ -830,6 +834,77 @@ void TestPipeServerRoundTrip(int* failures) {
   Expect(!pipe_server.IsRunning(), "PipeServer should report not running after Stop", failures);
 }
 
+void TestGuardrailsValidateDebuggerCommand(int* failures) {
+  std::string err;
+  Expect(dbgx::mcp::ValidateDebuggerCommand("r", &err), "plain 'r' should be allowed", failures);
+  Expect(dbgx::mcp::ValidateDebuggerCommand("r; bl; lm", &err), "chained safe commands should be allowed", failures);
+  Expect(dbgx::mcp::ValidateDebuggerCommand("quit_not_a_command", &err),
+         "only exact base-command matches should be blocked", failures);
+  Expect(dbgx::mcp::ValidateDebuggerCommand(".echo \"q; .kill\"", &err),
+         "dangerous tokens inside quotes should not trigger the deny-list", failures);
+
+  Expect(!dbgx::mcp::ValidateDebuggerCommand("q", &err), "'q' must be blocked", failures);
+  Expect(Contains(err, "prohibited"), "block message should say prohibited", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand("r; q", &err), "chained 'q' must be blocked", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand(".KILL", &err), "deny-list must be case-insensitive", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand("  .shell cmd", &err), "'.shell' must be blocked", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand(".unload dbgx-mcp", &err), "'.unload' must be blocked", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand("$<c:\\evil.txt", &err), "'$<' sourcing must be blocked", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand("$$>a<c:\\evil.txt", &err), "'$$>a<' sourcing must be blocked",
+         failures);
+}
+
+void TestGuardrailsRejectDangerousEvalViaRouter(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"windbg.eval","arguments":{"command":"r; .kill"}}})");
+
+  Expect(result.status_code == 200, "guardrail rejection should still be a JSON-RPC response", failures);
+  Expect(Contains(result.body, "\"code\":-32602"), "guardrail rejection should use invalid params code", failures);
+  Expect(Contains(result.body, "prohibited"), "guardrail rejection should explain why", failures);
+  Expect(executor.call_count == 0, "dangerous command must never reach the executor", failures);
+}
+
+void TestGuardrailsReadOnlyMode(int* failures) {
+  Expect(dbgx::mcp::IsMutatingTool("windbg.write_memory"), "write_memory is mutating", failures);
+  Expect(dbgx::mcp::IsMutatingTool("windbg_write_file"), "underscore alias is normalised", failures);
+  Expect(dbgx::mcp::IsMutatingTool("windbg.eval"), "eval is mutating (arbitrary commands)", failures);
+  Expect(!dbgx::mcp::IsMutatingTool("windbg.read_memory"), "read_memory is not mutating", failures);
+  Expect(!dbgx::mcp::IsMutatingTool("windbg.interrupt"), "interrupt is allowed in read-only mode", failures);
+
+  SetEnvironmentVariableA("WINDBG_MCP_READONLY", NULL);
+  Expect(!dbgx::mcp::IsReadOnlyModeEnabled(), "read-only mode is off by default", failures);
+  SetEnvironmentVariableA("WINDBG_MCP_READONLY", "0");
+  Expect(!dbgx::mcp::IsReadOnlyModeEnabled(), "WINDBG_MCP_READONLY=0 keeps read-only mode off", failures);
+  SetEnvironmentVariableA("WINDBG_MCP_READONLY", "1");
+  Expect(dbgx::mcp::IsReadOnlyModeEnabled(), "WINDBG_MCP_READONLY=1 enables read-only mode", failures);
+
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"windbg.write_memory","arguments":{"address":"0x1000","data":"90"}}})");
+  Expect(Contains(result.body, "\"code\":-32602"), "read-only mode must reject write_memory", failures);
+  Expect(Contains(result.body, "read-only mode"), "read-only rejection should name the mode", failures);
+  Expect(executor.call_count == 0, "read-only rejection must not reach executor", failures);
+
+  result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"windbg.ttd_position","arguments":{}}})");
+  Expect(!Contains(result.body, "read-only mode"), "querying TTD position is allowed in read-only mode", failures);
+
+  result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"windbg.ttd_position","arguments":{"position":"1B:0"}}})");
+  Expect(Contains(result.body, "read-only mode"), "seeking TTD position is rejected in read-only mode", failures);
+
+  result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"windbg.get_execution_state","arguments":{}}})");
+  Expect(!Contains(result.body, "read-only mode"), "read tools are allowed in read-only mode", failures);
+
+  SetEnvironmentVariableA("WINDBG_MCP_READONLY", NULL);
+}
+
 }  // namespace
 
 int main() {
@@ -877,6 +952,9 @@ int main() {
   TestToolsCallCatalogEntryAlias(&failures);
   TestToolsCallStepReverseAndCount(&failures);
   TestPipeServerRoundTrip(&failures);
+  TestGuardrailsValidateDebuggerCommand(&failures);
+  TestGuardrailsRejectDangerousEvalViaRouter(&failures);
+  TestGuardrailsReadOnlyMode(&failures);
 
   if (failures == 0) {
     std::cout << "All unit tests passed.\n";

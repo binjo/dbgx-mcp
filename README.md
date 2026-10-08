@@ -365,12 +365,28 @@ Safety behavior remains unchanged:
 }
 ```
 
-## Security Notes (MVP)
+## Security Notes
 
-- Binds to `127.0.0.1` only.
+- HTTP binds to `127.0.0.1` by default (`WINDBG_MCP_BIND` overrides).
 - Validates `Origin` when present, allowing only `http://localhost...` and `http://127.0.0.1...`.
+- **Bearer token on HTTP.** When `WINDBG_MCP_BIND` is not loopback, the DLL generates a random
+  token at load, prints it in the WinDbg console / `%TEMP%\dbgx-mcp-extension.log`, stores it in
+  the session registry file, and requires `Authorization: Bearer <token>` on `/mcp` and `/sessions`
+  (HTTP 401 otherwise). Set `WINDBG_MCP_TOKEN=<secret>` on both sides to use a fixed token, or
+  `WINDBG_MCP_NO_AUTH=1` before loading to disable (not recommended). The bridge reads
+  `WINDBG_MCP_TOKEN` and the per-session `token` field automatically.
+- **Named pipe ACL.** `\\.\pipe\dbgx-mcp-<port>` is created with a DACL limited to the current
+  user, SYSTEM and Administrators; when WinDbg runs elevated a High-integrity mandatory label is
+  added so a medium-IL process cannot drive an elevated debugger.
+- **Server-side guardrails.** `windbg.eval` rejects session-killing commands (`q`, `.kill`,
+  `.restart`, `.reboot`, `.shell`, `.server`, `.unload`, ...) and command-file sourcing (`$<`,
+  `$$<`) regardless of which client is talking to the DLL; the bridge applies the same list.
+- **Read-only mode.** Set `WINDBG_MCP_READONLY=1` before loading to reject every mutating tool
+  (`eval`, `write_memory`, `write_file`, `continue`, `step`, `set/clear_breakpoint`,
+  `apply_struct`, `apply_synthetic_type`, TTD seeks). Inspection tools and `interrupt` remain
+  available.
 - Supports HTTP `POST /mcp` for JSON-RPC.
-- `GET /mcp` returns 405 in this MVP (no SSE stream yet).
+- `GET /mcp` returns 405 (no SSE stream yet).
 
 ## Build and Test Details
 

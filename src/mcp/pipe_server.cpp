@@ -16,8 +16,67 @@
 #endif
 #include <objbase.h>
 #include <windows.h>
+#include <sddl.h>
 
 namespace dbgx::mcp {
+
+namespace {
+
+// Builds a security descriptor that grants read/write on the pipe only to the
+// user account owning this process (and SYSTEM/Administrators for manageability),
+// and -- when the host is elevated -- additionally requires High integrity so a
+// medium-IL process in the same session cannot drive an elevated debugger.
+// Returns nullptr on failure; callers then fall back to the default DACL.
+PSECURITY_DESCRIPTOR BuildCurrentUserPipeSecurityDescriptor() {
+  HANDLE token = NULL;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+    return nullptr;
+  }
+
+  std::string owner_sid;
+  bool elevated = false;
+  {
+    DWORD needed = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+    if (needed != 0) {
+      std::vector<unsigned char> buf(needed);
+      if (GetTokenInformation(token, TokenUser, buf.data(), needed, &needed)) {
+        auto* user = reinterpret_cast<TOKEN_USER*>(buf.data());
+        LPSTR sid_str = nullptr;
+        if (ConvertSidToStringSidA(user->User.Sid, &sid_str) && sid_str != nullptr) {
+          owner_sid = sid_str;
+          LocalFree(sid_str);
+        }
+      }
+    }
+
+    TOKEN_ELEVATION elevation{};
+    DWORD elevation_size = sizeof(elevation);
+    if (GetTokenInformation(token, TokenElevation, &elevation, elevation_size, &elevation_size)) {
+      elevated = elevation.TokenIsElevated != 0;
+    }
+  }
+  CloseHandle(token);
+
+  if (owner_sid.empty()) {
+    return nullptr;
+  }
+
+  // D: DACL  -> owner user, SYSTEM, built-in Administrators: generic read+write.
+  // S: SACL  -> mandatory label; NW = no-write-up for callers below High IL.
+  std::string sddl = "D:P(A;;GRGW;;;" + owner_sid + ")(A;;GRGW;;;SY)(A;;GRGW;;;BA)";
+  if (elevated) {
+    sddl += "S:(ML;;NW;;;HI)";
+  }
+
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
+    return nullptr;
+  }
+  return descriptor;
+}
+
+}  // namespace
 
 struct PipeServer::Impl {
   std::mutex mutex;
@@ -81,10 +140,17 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
   impl_->listener_thread = std::thread([this, ready_event]() {
     bool signaled_ready = false;
 
+    PSECURITY_DESCRIPTOR pipe_descriptor = BuildCurrentUserPipeSecurityDescriptor();
+    SECURITY_ATTRIBUTES pipe_security{};
+    pipe_security.nLength = sizeof(pipe_security);
+    pipe_security.lpSecurityDescriptor = pipe_descriptor;
+    pipe_security.bInheritHandle = FALSE;
+    LPSECURITY_ATTRIBUTES pipe_security_ptr = pipe_descriptor != nullptr ? &pipe_security : NULL;
+
     while (!impl_->stop_requested.load()) {
       HANDLE pipe_handle = CreateNamedPipeA(impl_->full_pipe_path.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
-                                            65536, 65536, 5000, NULL);
+                                            65536, 65536, 5000, pipe_security_ptr);
 
       if (pipe_handle == INVALID_HANDLE_VALUE) {
         if (impl_->stop_requested.load()) {
@@ -279,6 +345,10 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
 
     if (!signaled_ready && ready_event != NULL) {
       SetEvent(ready_event);
+    }
+
+    if (pipe_descriptor != nullptr) {
+      LocalFree(pipe_descriptor);
     }
 
     impl_->running.store(false);
