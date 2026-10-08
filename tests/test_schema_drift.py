@@ -25,7 +25,7 @@ JSON_RPC_CPP = os.path.join(ROOT, "src", "mcp", "json_rpc.cpp")
 
 # Tools that only exist on the bridge side (synthesised locally, never
 # forwarded) or that the server accepts as aliases without advertising.
-BRIDGE_ONLY_TOOLS = {"windbg.list_sessions"}
+BRIDGE_ONLY_TOOLS = {"windbg.list_sessions", "windbg.set_guest_host"}
 SERVER_ALIASES = {"windbg.get_catalog_entry": "windbg.get_command_docs"}
 
 # Parameter injected by the bridge for multi-session routing.

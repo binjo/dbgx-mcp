@@ -9,9 +9,11 @@ command guardrails, smart TTL caching, and error enrichment.
 import atexit
 import concurrent.futures
 import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -19,26 +21,114 @@ import time
 import urllib.error
 import urllib.request
 
+# ====================================================================
+# CONFIGURATION
+#
+# Precedence for every setting: explicit environment variable (as launched by the
+# MCP client) > optional env file (WINDBG_MCP_ENV_FILE, default ~/.windbg-mcp.env,
+# KEY=VALUE lines) > built-in default. The env file exists so the agent can make a
+# guest host "stick" across bridge restarts via windbg.set_guest_host(persist=true)
+# without anyone editing the MCP client's config.
+# ====================================================================
+
+
+def _env_lookup(names, default=""):
+    """Case-insensitive lookup of the first matching environment variable."""
+    wanted = {n.lower() for n in names}
+    for k, v in os.environ.items():
+        if k.lower() in wanted:
+            return v
+    return default
+
+
+ENV_FILE = _env_lookup(("windbg_mcp_env_file",)) or os.path.expanduser("~/.windbg-mcp.env")
+
+
+def load_env_file(path: str) -> dict:
+    """Parses a KEY=VALUE file into a dict with lower-cased keys. Missing file -> {}."""
+    values = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                values[k.strip().lower()] = v.strip().strip("\"'")
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # malformed file must never prevent the bridge from starting
+        sys.stderr.write(f"[windbg-bridge] ignoring unreadable env file {path}: {e}\n")
+    return values
+
+
+def _setting(names, default=""):
+    env_value = _env_lookup(names, None)
+    if env_value is not None:
+        return env_value
+    for n in names:
+        if n.lower() in _FILE_SETTINGS:
+            return _FILE_SETTINGS[n.lower()]
+    return default
+
+
+_FILE_SETTINGS = load_env_file(ENV_FILE)
+
 # Remote WinDbg MCP guest IP (defaults to 127.0.0.1 for local WinDbg)
-GUEST_IP = next(
-    (v for k, v in os.environ.items() if k.lower() in ("windbg_mcp_bind", "windbg_mcp_host")),
-    "127.0.0.1",
-)
+GUEST_IP = _setting(("windbg_mcp_host", "windbg_mcp_bind"), "127.0.0.1")
 # Transport mode: "auto" (prefers Named Pipe if local Windows, otherwise HTTP), "pipe", or "http"
-TRANSPORT_MODE = next(
-    (v.lower() for k, v in os.environ.items() if k.lower() == "windbg_mcp_transport"),
-    "auto",
-)
+TRANSPORT_MODE = _setting(("windbg_mcp_transport",), "auto").lower()
 # Well-known base port for the WinDbg MCP server
-BASE_PORT = 5678
+try:
+    BASE_PORT = int(_setting(("windbg_mcp_port",), "5678"))
+except ValueError:
+    BASE_PORT = 5678
 # Optional bearer token for the HTTP transport (opt-in). Must match WINDBG_MCP_TOKEN set in
 # WinDbg's environment; leave unset when the DLL was loaded without a token.
-AUTH_TOKEN = next(
-    (v for k, v in os.environ.items() if k.lower() == "windbg_mcp_token"),
-    "",
-)
+AUTH_TOKEN = _setting(("windbg_mcp_token",), "")
+# windbg.set_guest_host only accepts loopback / private / link-local hosts unless this is set,
+# so a prompt-injected "connect to <public host>" cannot redirect the bridge off the lab network.
+ALLOW_PUBLIC_HOST = _setting(("windbg_mcp_allow_public_host",), "0").lower() not in ("", "0", "false", "no")
 # Path to the diagnostic log file
 LOG_FILE = os.path.join(tempfile.gettempdir(), "windbg-bridge.log")
+
+# Guards runtime reconfiguration (GUEST_IP / BASE_PORT) and the pools that depend on it.
+_config_lock = threading.RLock()
+
+_HOST_CHARS = re.compile(r"^[A-Za-z0-9.\-_:\[\]]+$")
+
+
+def is_lab_host(host: str) -> bool:
+    """True if host is loopback, private (RFC1918/ULA) or link-local, resolving names if needed."""
+    h = host.strip().lower().strip("[]")
+    if h in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(h, None)
+    except OSError:
+        return False
+    addrs = [ipaddress.ip_address(info[4][0]) for info in infos]
+    return bool(addrs) and all(a.is_loopback or a.is_private or a.is_link_local for a in addrs)
+
+
+def validate_guest_host(host: str) -> str:
+    """Normalises and validates a host for set_guest_host. Raises ValueError when rejected."""
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("host must be a non-empty string (IP address or hostname)")
+    h = host.strip()
+    if "://" in h or "/" in h or not _HOST_CHARS.match(h):
+        raise ValueError("host must be a bare IP address or hostname (no scheme, port or path)")
+    if not ALLOW_PUBLIC_HOST and not is_lab_host(h):
+        raise ValueError(
+            f"host '{h}' is not a loopback/private/link-local address. Debugger VMs normally live on a "
+            "host-only or NAT network; set WINDBG_MCP_ALLOW_PUBLIC_HOST=1 to override."
+        )
+    return h
 
 
 def auth_headers(session=None) -> dict:
@@ -565,6 +655,8 @@ def is_process_alive(pid: int) -> bool:
         try:
             os.kill(pid, 0)
             return True
+        except PermissionError:
+            return True  # Exists but owned by another user
         except (OSError, ProcessLookupError):
             return False
 
@@ -673,21 +765,193 @@ def get_default_tools_list():
         {"name": "windbg.apply_synthetic_type", "description": "Apply a synthetic C-style struct definition loaded from a header file on the guest onto a memory address.", "inputSchema": {"type": "object", "properties": {"header_path": {"type": "string"}, "struct_name": {"type": "string"}, "address": {"type": "string"}, "module_name": {"type": "string"}, "syntypes_path": {"type": "string"}, "session_id": {"type": "integer"}}, "required": ["header_path", "struct_name", "address"]}},
         {"name": "windbg.write_file", "description": "Write file directly onto Windows filesystem.", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
         {"name": "windbg.get_session_metadata", "description": "Get metadata about active debugging target.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "integer"}}}},
-        {"name": "windbg.list_sessions", "description": "List all active WinDbg MCP sessions in host/guest.", "inputSchema": {"type": "object", "properties": {}}}
     ]
+    tools.extend(BRIDGE_LOCAL_TOOLS)
     return tools
+
+
+# Tools implemented by the bridge itself (never forwarded to the DLL).
+BRIDGE_LOCAL_TOOLS = [
+    {
+        "name": "windbg.list_sessions",
+        "description": (
+            "List all active WinDbg MCP sessions reachable from the bridge, plus the guest host the "
+            "bridge is currently pointed at. If this is empty and the user mentioned a VM IP, call "
+            "windbg.set_guest_host."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "windbg.set_guest_host",
+        "description": (
+            "Point the bridge at a different WinDbg host (e.g. the debugger VM's current IP on a host-only "
+            "network) without restarting. Clears cached connections, rediscovers sessions and returns them. "
+            "Use when windbg.list_sessions is empty or calls fail with 'unreachable' and the user has told "
+            "you where WinDbg is running. Only loopback/private/link-local hosts are accepted by default."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "IP address or hostname of the machine running WinDbg (e.g. '192.168.56.101' or '127.0.0.1')"},
+                "port": {"type": "integer", "description": "Base HTTP port of the dbgx-mcp extension (default 5678)"},
+                "persist": {"type": "boolean", "description": "Also save to the bridge env file so the setting survives restarts (default false)"},
+            },
+            "required": ["host"],
+        },
+    },
+]
+
+
+def _tool_text_result(req_id, payload) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]},
+    }
+
+
+def _tool_error(req_id, code, message) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+def effective_transport() -> str:
+    """Transport the bridge will actually use for GUEST_IP right now."""
+    if sys.platform == "win32" and GUEST_IP == "127.0.0.1" and TRANSPORT_MODE in ("auto", "pipe"):
+        return "pipe"
+    return "http"
+
+
+def describe_gateway() -> dict:
+    return {
+        "guest_host": GUEST_IP,
+        "base_port": BASE_PORT,
+        "transport": effective_transport(),
+        "auth": "bearer" if AUTH_TOKEN else "none",
+        "env_file": ENV_FILE,
+    }
 
 
 def handle_list_sessions(req_id):
     """Processes the windbg.list_sessions tool call."""
     sessions = get_sessions()
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": {
-            "content": [{"type": "text", "text": json.dumps(sessions, indent=2)}]
-        },
-    }
+    payload = describe_gateway()
+    payload["sessions"] = sessions
+    return _tool_text_result(req_id, payload)
+
+
+def _reset_host_bound_state():
+    """Drops every cache keyed by host/port after GUEST_IP or BASE_PORT changed."""
+    with _connections_lock:
+        for conn in _connections.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _connections.clear()
+    with _session_map_lock:
+        _session_map.clear()
+    with _cache_lock:
+        _command_cache.clear()
+    if sys.platform == "win32":
+        for path in list(_pipe_handles):
+            _close_pipe_handle(path)
+
+
+def persist_env_setting(key: str, value: str, path: str = None) -> str:
+    """Upserts KEY=VALUE in the env file (atomic rewrite). Returns the path written."""
+    path = path or ENV_FILE
+    key_upper = key.upper()
+    lines = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        pass
+    out, replaced = [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k = stripped.split("=", 1)[0].strip().upper()
+            if k == key_upper:
+                if not replaced:
+                    out.append(f"{key_upper}={value}")
+                    replaced = True
+                continue
+        out.append(line)
+    if not replaced:
+        out.append(f"{key_upper}={value}")
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
+def set_guest_host(host: str, port=None, persist: bool = False) -> dict:
+    """Re-points the bridge at another WinDbg host at runtime. Raises ValueError on bad input."""
+    global GUEST_IP, BASE_PORT, _current_port, _current_pipe_name
+
+    new_host = validate_guest_host(host)
+    new_port = BASE_PORT
+    if port is not None:
+        if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+            raise ValueError("port must be an integer between 1 and 65535")
+        new_port = port
+
+    with _config_lock:
+        changed = (new_host != GUEST_IP) or (new_port != BASE_PORT)
+        previous = (GUEST_IP, BASE_PORT)
+        GUEST_IP = new_host
+        BASE_PORT = new_port
+        if changed:
+            _reset_host_bound_state()
+            _current_port = BASE_PORT
+            _current_pipe_name = None
+        log(f"GUEST HOST: {previous[0]}:{previous[1]} -> {GUEST_IP}:{BASE_PORT} (changed={changed}, persist={persist})")
+
+    persisted_to = None
+    if persist:
+        persisted_to = persist_env_setting("WINDBG_MCP_HOST", GUEST_IP)
+        if port is not None:
+            persist_env_setting("WINDBG_MCP_PORT", str(BASE_PORT))
+
+    sessions = get_sessions()
+    if sessions:
+        _current_port = sessions[0].get("port", BASE_PORT)
+        _current_pipe_name = sessions[0].get("pipe_name")
+
+    result = describe_gateway()
+    result.update({
+        "changed": changed,
+        "persisted_to": persisted_to,
+        "sessions": sessions,
+    })
+    if not sessions:
+        result["hint"] = (
+            f"No dbgx-mcp sessions answered at {GUEST_IP} (ports {BASE_PORT}-{BASE_PORT + 10}). Check that the "
+            "extension is loaded in WinDbg with WINDBG_MCP_BIND set to a reachable interface and that the "
+            "firewall allows the port."
+        )
+    return result
+
+
+def handle_set_guest_host(req_id, tool_args, output_stream):
+    """Processes the windbg.set_guest_host tool call."""
+    try:
+        result = set_guest_host(
+            tool_args.get("host"),
+            port=tool_args.get("port"),
+            persist=bool(tool_args.get("persist", False)),
+        )
+    except ValueError as e:
+        return _tool_error(req_id, -32602, str(e))
+    except Exception as e:
+        log(f"SET_GUEST_HOST ERROR: {e}")
+        return _tool_error(req_id, -32000, f"Failed to switch guest host: {e}")
+    if result.get("changed"):
+        send_notification(output_stream, "notifications/tools/list_changed")
+    return _tool_text_result(req_id, result)
 
 # ====================================================================
 # MAIN STRATEGIC DISPATCH
@@ -781,15 +1045,7 @@ def handle_request(line, output_stream):
                                 ),
                             }
 
-                    resp_data["result"]["tools"].append(
-                        {
-                            "name": "windbg.list_sessions",
-                            "description": (
-                                "List all active WinDbg MCP sessions in the host/guest VM."
-                            ),
-                            "inputSchema": {"type": "object", "properties": {}},
-                        }
-                    )
+                    resp_data["result"]["tools"].extend(BRIDGE_LOCAL_TOOLS)
                 send_response(output_stream, resp_data)
             except Exception as e:
                 log(f"TOOLS/LIST BACKEND FAIL on :{_current_port}: {e}. Returning full catalog.")
@@ -819,6 +1075,10 @@ def handle_request(line, output_stream):
 
             if tool_name in ("windbg.list_sessions", "list_sessions"):
                 send_response(output_stream, handle_list_sessions(req_id))
+                return
+
+            if tool_name in ("windbg.set_guest_host", "set_guest_host"):
+                send_response(output_stream, handle_set_guest_host(req_id, tool_args, output_stream))
                 return
 
             target_port = tool_args.get("session_id", _current_port)
@@ -901,7 +1161,10 @@ def handle_request(line, output_stream):
                                 resp_json["error"]["suggestions"] = suggestions
                                 log(f"ENRICHED ERROR: '{command}' suggestions={suggestions}")
 
-                send_response(output_stream, resp_json)
+                if req_id is not None:
+                    send_response(output_stream, resp_json)
+                else:
+                    log(f"Notification '{method}' forwarded; suppressing backend reply")
             else:
                 log(f"Empty response from :{target_port}")
                 if req_id is not None:

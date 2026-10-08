@@ -141,6 +141,35 @@ The `windbg-bridge.py` script acts as a proxy between Stdio-based MCP clients (l
    ```
 3. Use the `windbg.list_sessions` tool to discover available debuggers and their ports.
 
+### Configuration
+
+Every bridge setting is resolved as **environment variable → env file → default**:
+
+| Setting | Env var | Default |
+|---|---|---|
+| WinDbg host (guest VM IP) | `WINDBG_MCP_HOST` (alias `WINDBG_MCP_BIND`) | `127.0.0.1` |
+| Base port | `WINDBG_MCP_PORT` | `5678` |
+| Transport | `WINDBG_MCP_TRANSPORT` (`auto`/`pipe`/`http`) | `auto` |
+| Bearer token | `WINDBG_MCP_TOKEN` | unset |
+| Allow non-private hosts in `set_guest_host` | `WINDBG_MCP_ALLOW_PUBLIC_HOST` | `0` |
+| Env file location | `WINDBG_MCP_ENV_FILE` | `~/.windbg-mcp.env` |
+
+The env file is plain `KEY=VALUE` lines. You normally never edit it by hand — see below.
+
+### Pointing the bridge at a VM whose IP changed (`windbg.set_guest_host`)
+
+When WinDbg runs in a VM on a host-only/NAT network its IP can change between boots. Instead of
+editing the MCP client config and restarting, just tell the agent:
+
+> "WinDbg is at 192.168.56.101 now"
+
+The agent calls `windbg.set_guest_host({"host": "192.168.56.101"})`. The bridge validates the host
+(loopback/private/link-local only, unless `WINDBG_MCP_ALLOW_PUBLIC_HOST=1`), drops cached
+connections, rediscovers sessions and returns them, and emits `notifications/tools/list_changed`.
+Add `"persist": true` to have it written to the env file so the next bridge start remembers it.
+`windbg.list_sessions` always reports the `guest_host`/`transport` the bridge is currently using.
+The token is deliberately *not* settable through the tool.
+
 ## Troubleshooting `.load` Failures
 
 1. Confirm the DLL path exists and is absolute.

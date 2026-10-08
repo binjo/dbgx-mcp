@@ -1,3 +1,4 @@
+import json
 import unittest
 import sys
 import os
@@ -234,6 +235,129 @@ class TestPersistentPipeClient(unittest.TestCase):
             t.join()
         self.assertEqual(max_in_flight, 1)
         self.assertEqual(self.opened, [100])
+
+
+class TestGuestHostSwitching(unittest.TestCase):
+    """windbg.set_guest_host / env-file configuration."""
+
+    def setUp(self):
+        import tempfile as _tf
+        self._saved = {k: getattr(bridge, k) for k in ("GUEST_IP", "BASE_PORT", "ALLOW_PUBLIC_HOST", "ENV_FILE", "_current_port")}
+        self._orig_get_sessions = bridge.get_sessions
+        self._tmpdir = _tf.mkdtemp()
+        bridge.ENV_FILE = os.path.join(self._tmpdir, "bridge.env")
+        bridge.GUEST_IP = "127.0.0.1"
+        bridge.BASE_PORT = 5678
+        bridge.ALLOW_PUBLIC_HOST = False
+        bridge.get_sessions = lambda: []
+
+    def tearDown(self):
+        import shutil
+        for k, v in self._saved.items():
+            setattr(bridge, k, v)
+        bridge.get_sessions = self._orig_get_sessions
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_validate_guest_host_accepts_lab_addresses(self):
+        for h in ["127.0.0.1", "localhost", "192.168.56.101", "10.0.0.5", "172.16.3.4", "169.254.1.1", "fe80::1", "::1"]:
+            self.assertEqual(bridge.validate_guest_host(f"  {h} "), h)
+
+    def test_validate_guest_host_rejects_public_and_malformed(self):
+        for h in ["8.8.8.8", "1.1.1.1", "http://10.0.0.1", "10.0.0.1/mcp", "", "   ", "10.0.0.1 ; rm"]:
+            with self.assertRaises(ValueError, msg=h):
+                bridge.validate_guest_host(h)
+
+    def test_validate_guest_host_public_override(self):
+        bridge.ALLOW_PUBLIC_HOST = True
+        self.assertEqual(bridge.validate_guest_host("8.8.8.8"), "8.8.8.8")
+
+    def test_set_guest_host_switches_and_resets_state(self):
+        bridge._connections["127.0.0.1:5678"] = type("C", (), {"close": lambda self: None})()
+        bridge._session_map[5678] = {"port": 5678}
+        bridge._command_cache[(5678, "r")] = (0, {})
+        res = bridge.set_guest_host("192.168.56.101")
+        self.assertTrue(res["changed"])
+        self.assertEqual(bridge.GUEST_IP, "192.168.56.101")
+        self.assertEqual(res["guest_host"], "192.168.56.101")
+        self.assertEqual(res["transport"], "http")
+        self.assertEqual(bridge._connections, {})
+        self.assertEqual(bridge._session_map, {})
+        self.assertEqual(bridge._command_cache, {})
+        self.assertIn("hint", res)  # no sessions found -> actionable hint
+        self.assertIsNone(res["persisted_to"])
+
+    def test_set_guest_host_same_host_is_noop(self):
+        bridge._session_map[5678] = {"port": 5678}
+        res = bridge.set_guest_host("127.0.0.1")
+        self.assertFalse(res["changed"])
+        self.assertEqual(bridge._session_map, {5678: {"port": 5678}})
+
+    def test_set_guest_host_port_validation(self):
+        for bad in [0, 70000, "5678", True]:
+            with self.assertRaises(ValueError):
+                bridge.set_guest_host("10.0.0.1", port=bad)
+        res = bridge.set_guest_host("10.0.0.1", port=6000)
+        self.assertEqual((bridge.GUEST_IP, bridge.BASE_PORT), ("10.0.0.1", 6000))
+        self.assertEqual(res["base_port"], 6000)
+
+    def test_set_guest_host_persist_writes_env_file(self):
+        with open(bridge.ENV_FILE, "w", encoding="utf-8") as f:
+            f.write("# comment\nWINDBG_MCP_HOST=10.9.9.9\nWINDBG_MCP_TRANSPORT=http\n")
+        res = bridge.set_guest_host("192.168.56.7", port=5700, persist=True)
+        self.assertEqual(res["persisted_to"], bridge.ENV_FILE)
+        cfg = bridge.load_env_file(bridge.ENV_FILE)
+        self.assertEqual(cfg["windbg_mcp_host"], "192.168.56.7")
+        self.assertEqual(cfg["windbg_mcp_port"], "5700")
+        self.assertEqual(cfg["windbg_mcp_transport"], "http")
+        with open(bridge.ENV_FILE, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("# comment", text)
+        self.assertEqual(text.count("WINDBG_MCP_HOST="), 1)
+
+    def test_load_env_file_missing_and_quoted(self):
+        self.assertEqual(bridge.load_env_file(os.path.join(self._tmpdir, "nope")), {})
+        with open(bridge.ENV_FILE, "w", encoding="utf-8") as f:
+            f.write('WINDBG_MCP_TOKEN="s3cret"\nbad line\nWINDBG_MCP_HOST = \'10.1.1.1\'\n')
+        cfg = bridge.load_env_file(bridge.ENV_FILE)
+        self.assertEqual(cfg, {"windbg_mcp_token": "s3cret", "windbg_mcp_host": "10.1.1.1"})
+
+    def test_setting_precedence_env_over_file(self):
+        orig_file = bridge._FILE_SETTINGS
+        bridge._FILE_SETTINGS = {"windbg_mcp_host": "10.0.0.2"}
+        try:
+            os.environ.pop("WINDBG_MCP_HOST", None)
+            self.assertEqual(bridge._setting(("windbg_mcp_host",), "127.0.0.1"), "10.0.0.2")
+            os.environ["WINDBG_MCP_HOST"] = "10.0.0.3"
+            self.assertEqual(bridge._setting(("windbg_mcp_host",), "127.0.0.1"), "10.0.0.3")
+            self.assertEqual(bridge._setting(("windbg_mcp_other",), "dflt"), "dflt")
+        finally:
+            os.environ.pop("WINDBG_MCP_HOST", None)
+            bridge._FILE_SETTINGS = orig_file
+
+    def test_handle_set_guest_host_tool_response_and_notification(self):
+        import io
+        out = io.StringIO()
+        resp = bridge.handle_set_guest_host(7, {"host": "192.168.56.2"}, out)
+        self.assertEqual(resp["id"], 7)
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        self.assertEqual(payload["guest_host"], "192.168.56.2")
+        self.assertIn("notifications/tools/list_changed", out.getvalue())
+
+        err = bridge.handle_set_guest_host(8, {"host": "8.8.8.8"}, io.StringIO())
+        self.assertEqual(err["error"]["code"], -32602)
+        self.assertIn("ALLOW_PUBLIC_HOST", err["error"]["message"])
+
+    def test_list_sessions_reports_gateway(self):
+        bridge.get_sessions = lambda: [{"port": 5678}]
+        resp = bridge.handle_list_sessions(1)
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        self.assertEqual(payload["guest_host"], "127.0.0.1")
+        self.assertEqual(payload["sessions"], [{"port": 5678}])
+
+    def test_bridge_local_tools_advertised(self):
+        names = {t["name"] for t in bridge.get_default_tools_list()}
+        self.assertIn("windbg.set_guest_host", names)
+        self.assertIn("windbg.list_sessions", names)
 
 
 if __name__ == "__main__":
