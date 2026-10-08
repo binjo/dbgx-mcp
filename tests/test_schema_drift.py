@@ -119,5 +119,69 @@ class TestSchemaDrift(unittest.TestCase):
       self.assertEqual(a_req, t_req)
 
 
+# --- Tool annotations: kToolAnnotations (guardrails.cpp) vs TOOL_TRAITS (bridge) ---
+
+GUARDRAILS_CPP = os.path.join(ROOT, "src", "mcp", "guardrails.cpp")
+
+# Server-side alias advertised nowhere but accepted by the router.
+ANNOTATION_ALIASES = {"windbg.time_travel": "windbg.ttd_position"}
+
+
+def _parse_bool_tuple(text: str) -> dict:
+  vals = [v.strip() == "true" for v in text.split(",")]
+  if len(vals) != 4:
+    raise ValueError(f"expected 4 booleans, got {text!r}")
+  keys = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+  return dict(zip(keys, vals))
+
+
+def load_server_annotations() -> dict:
+  with open(GUARDRAILS_CPP, "r", encoding="utf-8") as f:
+    src = f.read()
+  # Named presets: constexpr ToolAnnotations kReadOnly{true, false, true, false};
+  presets = {
+      name: _parse_bool_tuple(body)
+      for name, body in re.findall(r"constexpr ToolAnnotations (k\w+)\{([^}]*)\}", src)
+  }
+  start = src.index("kToolAnnotations")
+  table = src[start:src.index("}};", start)]
+  out = {}
+  for name, value in re.findall(r'\{"(windbg\.[a-z_]+)",\s*([^}]*\}|k\w+)\}', table):
+    if value.startswith("ToolAnnotations{"):
+      out[name] = _parse_bool_tuple(value[len("ToolAnnotations{"):-1])
+    else:
+      out[name] = presets[value]
+  return out
+
+
+class TestAnnotationDrift(unittest.TestCase):
+
+  @classmethod
+  def setUpClass(cls):
+    cls.server = load_server_annotations()
+    cls.bridge = dict(bridge.TOOL_TRAITS)
+    cls.advertised = set(load_server_tools())
+
+  def test_every_advertised_tool_is_annotated(self):
+    self.assertEqual(self.advertised - set(self.server), set())
+
+  def test_annotation_tables_match(self):
+    server_names = set(self.server) - set(ANNOTATION_ALIASES)
+    bridge_names = set(self.bridge) - BRIDGE_ONLY_TOOLS
+    self.assertEqual(
+        server_names,
+        bridge_names,
+        f"missing in bridge: {sorted(server_names - bridge_names)}; "
+        f"missing in server: {sorted(bridge_names - server_names)}",
+    )
+    for name in server_names:
+      with self.subTest(tool=name):
+        self.assertEqual(self.server[name], self.bridge[name])
+
+  def test_annotation_aliases_match_target(self):
+    for alias, target in ANNOTATION_ALIASES.items():
+      self.assertEqual(self.server[alias], self.server[target])
+
+
 if __name__ == "__main__":
   unittest.main()

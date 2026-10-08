@@ -121,7 +121,10 @@ MethodOutcome HandleInitialize(const json::FieldMap& root_fields) {
       "\","
       "\"capabilities\":{\"tools\":{\"listChanged\":false}},"
       "\"serverInfo\":{\"name\":\"dbgx-mcp\",\"version\":\"" DBGX_VERSION_STRING
-      "\"}"
+      "\"},"
+      "\"instructions\":\"" +
+      json::Escape(ServerInstructions()) +
+      "\""
       "}";
   return outcome;
 }
@@ -136,7 +139,9 @@ MethodOutcome HandleInitializedNotification() {
 MethodOutcome HandleToolsList() {
   MethodOutcome outcome;
   outcome.ok = true;
-  outcome.result_json =
+  // Annotations (readOnlyHint & co.) are added by InjectToolAnnotations from the
+  // table in guardrails.cpp so the schema literal below stays annotation-free.
+  outcome.result_json = InjectToolAnnotations(
       "{"
       "\"tools\":["
       "{"
@@ -483,7 +488,7 @@ MethodOutcome HandleToolsList() {
       "}"
       "}"
       "]"
-      "}";
+      "}");
   return outcome;
 }
 
@@ -527,6 +532,7 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
   bool is_json_output = false;
 
   // Read-only mode (WINDBG_MCP_READONLY=1): reject anything that mutates the target.
+  // Reported as an isError tool result (not a JSON-RPC error) so the model can read why.
   if (IsReadOnlyModeEnabled() && IsMutatingTool(tool_name)) {
     bool mutating = true;
     if (tool_name == "windbg.ttd_position" || tool_name == "windbg.time_travel") {
@@ -535,10 +541,13 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
       mutating = !position.empty();  // Querying the position is fine; seeking is not.
     }
     if (mutating) {
-      outcome.error_code = -32602;
-      outcome.error_message = "Tool '" + tool_name +
-                              "' is disabled because the server is running in read-only mode "
-                              "(WINDBG_MCP_READONLY is set).";
+      outcome.ok = true;
+      outcome.result_json = BuildRefusalResult(
+          "read_only_mode",
+          "Tool '" + tool_name +
+              "' is disabled because the server is running in read-only mode (WINDBG_MCP_READONLY is set).",
+          "Use read-only tools (get_context, read_memory, disassemble, dx, eval with inspection commands). Ask "
+          "the user to restart WinDbg without WINDBG_MCP_READONLY if target changes are required.");
       return outcome;
     }
   }
@@ -550,10 +559,11 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
       outcome.error_message = "Invalid params: command must be a non-empty string";
       return outcome;
     }
+    std::string blocked_token;
     std::string guard_error;
-    if (!ValidateDebuggerCommand(command, &guard_error)) {
-      outcome.error_code = -32602;
-      outcome.error_message = guard_error;
+    if (!ValidateDebuggerCommandDetail(command, &blocked_token, &guard_error)) {
+      outcome.ok = true;
+      outcome.result_json = BuildRefusalResult("command_blocked", guard_error, GuardrailAlternative(blocked_token));
       return outcome;
     }
     windbg::CommandExecutionOptions options;

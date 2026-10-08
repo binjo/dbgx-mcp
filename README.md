@@ -431,6 +431,15 @@ Safety behavior remains unchanged:
   (`eval`, `write_memory`, `write_file`, `continue`, `step`, `set/clear_breakpoint`,
   `apply_struct`, `apply_synthetic_type`, TTD seeks). Inspection tools and `interrupt` remain
   available.
+- **Refusals are tool results, not protocol errors.** Guardrail and read-only refusals come back
+  as `{"content":[{"type":"text","text":"{\"error\":\"command_blocked\"|\"read_only_mode\",
+  \"message\":...,\"next_steps\":[...]}"}],"isError":true}` so the model sees the reason and the
+  suggested alternative instead of an opaque `-32602`. Malformed params still raise `-32602`.
+- **Tool annotations & instructions.** `tools/list` carries MCP `annotations`
+  (`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`) from the table in
+  `src/mcp/guardrails.cpp`, and `initialize` returns an `instructions` string describing the
+  serial-execution and execution-state workflow. `tests/test_schema_drift.py` keeps the server
+  table in sync with the bridge's `TOOL_TRAITS`.
 - Supports HTTP `POST /mcp` for JSON-RPC.
 - `GET /mcp` returns 405 (no SSE stream yet).
 

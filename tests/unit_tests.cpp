@@ -862,8 +862,11 @@ void TestGuardrailsRejectDangerousEvalViaRouter(int* failures) {
       R"({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"windbg.eval","arguments":{"command":"r; .kill"}}})");
 
   Expect(result.status_code == 200, "guardrail rejection should still be a JSON-RPC response", failures);
-  Expect(Contains(result.body, "\"code\":-32602"), "guardrail rejection should use invalid params code", failures);
+  Expect(!Contains(result.body, "\"error\":{"), "guardrail rejection must not be a JSON-RPC error", failures);
+  Expect(Contains(result.body, "\"isError\":true"), "guardrail rejection should be an isError tool result", failures);
+  Expect(Contains(result.body, "command_blocked"), "guardrail rejection should carry a machine-readable kind", failures);
   Expect(Contains(result.body, "prohibited"), "guardrail rejection should explain why", failures);
+  Expect(Contains(result.body, "windbg.continue"), "guardrail rejection should suggest an alternative", failures);
   Expect(executor.call_count == 0, "dangerous command must never reach the executor", failures);
 }
 
@@ -886,7 +889,8 @@ void TestGuardrailsReadOnlyMode(int* failures) {
 
   dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
       R"({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"windbg.write_memory","arguments":{"address":"0x1000","data":"90"}}})");
-  Expect(Contains(result.body, "\"code\":-32602"), "read-only mode must reject write_memory", failures);
+  Expect(Contains(result.body, "\"isError\":true"), "read-only mode must reject write_memory as isError", failures);
+  Expect(Contains(result.body, "read_only_mode"), "read-only rejection should carry a machine-readable kind", failures);
   Expect(Contains(result.body, "read-only mode"), "read-only rejection should name the mode", failures);
   Expect(executor.call_count == 0, "read-only rejection must not reach executor", failures);
 
@@ -903,6 +907,82 @@ void TestGuardrailsReadOnlyMode(int* failures) {
   Expect(!Contains(result.body, "read-only mode"), "read tools are allowed in read-only mode", failures);
 
   SetEnvironmentVariableA("WINDBG_MCP_READONLY", NULL);
+}
+
+void TestGuardrailsDetailAndAlternatives(int* failures) {
+  std::string token;
+  std::string err;
+  Expect(!dbgx::mcp::ValidateDebuggerCommandDetail("r; .KILL", &token, &err), "detail variant blocks too", failures);
+  Expect(token == ".kill", "blocked token is reported lower-cased", failures);
+  Expect(!dbgx::mcp::GuardrailAlternative(token).empty(), "every deny-listed token has an alternative", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommandDetail("$$><c:\\x.txt", &token, &err), "sourcing blocked", failures);
+  Expect(token == "$<", "sourcing reports the $< token", failures);
+  Expect(Contains(dbgx::mcp::GuardrailAlternative("$<"), "windbg.eval"), "sourcing alternative suggests inline eval",
+         failures);
+  Expect(dbgx::mcp::GuardrailAlternative("not_blocked").empty(), "unknown token has no alternative", failures);
+}
+
+void TestToolAnnotations(int* failures) {
+  dbgx::mcp::ToolAnnotations a;
+  Expect(dbgx::mcp::GetToolAnnotations("windbg.read_memory", &a) && a.read_only && !a.destructive,
+         "read_memory is read-only", failures);
+  Expect(dbgx::mcp::GetToolAnnotations("windbg_write_memory", &a) && a.destructive && a.idempotent,
+         "write_memory is destructive+idempotent (alias normalised)", failures);
+  Expect(dbgx::mcp::GetToolAnnotations("windbg.step", &a) && !a.read_only && !a.idempotent,
+         "step is a non-idempotent control tool", failures);
+  Expect(!dbgx::mcp::GetToolAnnotations("windbg.nope", &a), "unknown tool has no annotations", failures);
+  Expect(dbgx::mcp::ToolAnnotationsJson(dbgx::mcp::ToolAnnotations{true, false, true, false}) ==
+             "{\"readOnlyHint\":true,\"destructiveHint\":false,\"idempotentHint\":true,\"openWorldHint\":false}",
+         "annotations serialise in MCP shape", failures);
+
+  // Injection: known tool annotated once, unknown left alone, nested "name" inside a string value untouched.
+  const std::string injected = dbgx::mcp::InjectToolAnnotations(
+      R"({"tools":[{"name":"windbg.dx","description":"x \"name\":\"y\""},{"name":"other.tool"}]})");
+  Expect(Contains(injected, R"("name":"windbg.dx","annotations":{"readOnlyHint":true)"),
+         "known tool gets annotations right after its name", failures);
+  Expect(Contains(injected, R"({"name":"other.tool"})"), "unknown tool is left untouched", failures);
+  Expect(injected.find("annotations") == injected.rfind("annotations"), "exactly one annotations block injected",
+         failures);
+
+  // Every advertised tool must be annotated and the document must still parse.
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+  const dbgx::mcp::JsonRpcHttpResult result =
+      router.HandleJsonRpcPost(R"({"jsonrpc":"2.0","id":"abc","method":"tools/list","params":{}})");
+  std::size_t names = 0;
+  std::size_t annotations = 0;
+  for (std::size_t pos = result.body.find("\"name\":\"windbg."); pos != std::string::npos;
+       pos = result.body.find("\"name\":\"windbg.", pos + 1)) {
+    ++names;
+  }
+  for (std::size_t pos = result.body.find("\"annotations\":{"); pos != std::string::npos;
+       pos = result.body.find("\"annotations\":{", pos + 1)) {
+    ++annotations;
+  }
+  Expect(names > 20 && names == annotations, "every advertised tool carries annotations", failures);
+  dbgx::json::FieldMap root;
+  std::string parse_error;
+  Expect(dbgx::json::ParseObjectFields(result.body, &root, &parse_error), "annotated tools/list is valid JSON",
+         failures);
+}
+
+void TestInitializeInstructionsAndRefusalShape(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+  const dbgx::mcp::JsonRpcHttpResult result = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}})");
+  Expect(Contains(result.body, "\"instructions\":\""), "initialize should carry instructions", failures);
+  Expect(Contains(result.body, "get_execution_state"), "instructions should mention execution-state workflow",
+         failures);
+
+  const std::string refusal = dbgx::mcp::BuildRefusalResult("command_blocked", "why \"quoted\"", "do this instead");
+  dbgx::json::FieldMap root;
+  std::string parse_error;
+  Expect(dbgx::json::ParseObjectFields(refusal, &root, &parse_error), "refusal result is valid JSON", failures);
+  Expect(Contains(refusal, "\"isError\":true"), "refusal is flagged isError", failures);
+  Expect(Contains(refusal, "next_steps"), "refusal carries next_steps when an alternative exists", failures);
+  const std::string bare = dbgx::mcp::BuildRefusalResult("read_only_mode", "msg", "");
+  Expect(!Contains(bare, "next_steps"), "no next_steps when there is no alternative", failures);
 }
 
 }  // namespace
@@ -955,6 +1035,9 @@ int main() {
   TestGuardrailsValidateDebuggerCommand(&failures);
   TestGuardrailsRejectDangerousEvalViaRouter(&failures);
   TestGuardrailsReadOnlyMode(&failures);
+  TestGuardrailsDetailAndAlternatives(&failures);
+  TestToolAnnotations(&failures);
+  TestInitializeInstructionsAndRefusalShape(&failures);
 
   if (failures == 0) {
     std::cout << "All unit tests passed.\n";
