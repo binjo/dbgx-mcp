@@ -369,12 +369,11 @@ Safety behavior remains unchanged:
 
 - HTTP binds to `127.0.0.1` by default (`WINDBG_MCP_BIND` overrides).
 - Validates `Origin` when present, allowing only `http://localhost...` and `http://127.0.0.1...`.
-- **Bearer token on HTTP.** When `WINDBG_MCP_BIND` is not loopback, the DLL generates a random
-  token at load, prints it in the WinDbg console / `%TEMP%\dbgx-mcp-extension.log`, stores it in
-  the session registry file, and requires `Authorization: Bearer <token>` on `/mcp` and `/sessions`
-  (HTTP 401 otherwise). Set `WINDBG_MCP_TOKEN=<secret>` on both sides to use a fixed token, or
-  `WINDBG_MCP_NO_AUTH=1` before loading to disable (not recommended). The bridge reads
-  `WINDBG_MCP_TOKEN` and the per-session `token` field automatically.
+- **Optional bearer token on HTTP.** Set `WINDBG_MCP_TOKEN=<secret>` in both WinDbg's and the
+  bridge's environment to require `Authorization: Bearer <secret>` on `/mcp` and `/sessions`
+  (HTTP 401 otherwise). Off by default — on loopback or a host-only VM network the Origin check
+  and pipe ACL are usually sufficient. The bridge also honours a per-session `token` field from
+  the local session registry.
 - **Named pipe ACL.** `\\.\pipe\dbgx-mcp-<port>` is created with a DACL limited to the current
   user, SYSTEM and Administrators; when WinDbg runs elevated a High-integrity mandatory label is
   added so a medium-IL process cannot drive an elevated debugger.

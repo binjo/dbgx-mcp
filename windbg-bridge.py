@@ -31,8 +31,8 @@ TRANSPORT_MODE = next(
 )
 # Well-known base port for the WinDbg MCP server
 BASE_PORT = 5678
-# Optional bearer token for the HTTP transport. Required when the DLL is bound to a
-# non-loopback address (it prints the auto-generated token in the WinDbg console).
+# Optional bearer token for the HTTP transport (opt-in). Must match WINDBG_MCP_TOKEN set in
+# WinDbg's environment; leave unset when the DLL was loaded without a token.
 AUTH_TOKEN = next(
     (v for k, v in os.environ.items() if k.lower() == "windbg_mcp_token"),
     "",

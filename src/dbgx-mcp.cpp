@@ -11,7 +11,6 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
-#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -61,21 +60,6 @@ ExtensionState& State() {
 
 bool IsLoopbackHost(std::string_view host) {
   return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
-}
-
-std::string GenerateAuthToken() {
-  // std::random_device is backed by a CSPRNG on MSVC (rand_s / BCrypt).
-  std::random_device rd;
-  static constexpr char kHex[] = "0123456789abcdef";
-  std::string token;
-  token.reserve(48);
-  for (int i = 0; i < 6; ++i) {
-    std::uint32_t word = rd();
-    for (int nibble = 0; nibble < 8; ++nibble) {
-      token.push_back(kHex[(word >> (nibble * 4)) & 0xF]);
-    }
-  }
-  return token;
 }
 
 // Constant-time-ish comparison so a timing side channel cannot be used to guess the token.
@@ -392,7 +376,7 @@ dbgx::mcp::HttpResponse HandleHttpRequest(const dbgx::mcp::HttpRequest& request)
       denied.status_code = 401;
       denied.body =
           "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32001,\"message\":\"Unauthorized: missing or invalid "
-          "bearer token. Set WINDBG_MCP_TOKEN on the client to the token shown in the WinDbg console.\"}}";
+          "bearer token. Set WINDBG_MCP_TOKEN on the client to match the value configured for WinDbg.\"}}";
       return denied;
     }
   }
@@ -558,22 +542,15 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
     bind_host = bind_addr_buf;
   }
 
-  // HTTP authentication policy:
-  //   * WINDBG_MCP_TOKEN=<secret>  -> always require this bearer token.
-  //   * non-loopback bind, no token -> generate a random token (unless WINDBG_MCP_NO_AUTH=1).
-  //   * loopback bind, no token     -> no auth (Origin check + pipe ACL still apply).
+  // HTTP authentication is opt-in: set WINDBG_MCP_TOKEN=<secret> (on both WinDbg and the
+  // bridge) to require `Authorization: Bearer <secret>` on /mcp and /sessions. Without it the
+  // Origin check and the named-pipe ACL are the only access controls, which is adequate for
+  // loopback and host-only VM networks.
   state.auth_token.clear();
-  bool token_generated = false;
   {
     char token_buf[256] = {0};
-    char no_auth_buf[8] = {0};
-    const bool no_auth = GetEnvironmentVariableA("WINDBG_MCP_NO_AUTH", no_auth_buf, sizeof(no_auth_buf)) > 0 &&
-                         std::string(no_auth_buf) != "0";
     if (GetEnvironmentVariableA("WINDBG_MCP_TOKEN", token_buf, sizeof(token_buf)) > 0) {
       state.auth_token = token_buf;
-    } else if (enable_http && !IsLoopbackHost(bind_host) && !no_auth) {
-      state.auth_token = GenerateAuthToken();
-      token_generated = true;
     }
   }
 
@@ -592,16 +569,10 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
       LogMessage("HTTP MCP server listening on http://" + bind_host + ":" + std::to_string(state.bound_port) +
                  "/mcp (Keep-Alive enabled)");
       if (!state.auth_token.empty()) {
-        if (token_generated) {
-          LogMessage("HTTP bearer token (auto-generated for non-loopback bind): " + state.auth_token);
-          LogMessage("  * Set WINDBG_MCP_TOKEN=" + state.auth_token +
-                     " in the MCP client's environment (windbg-bridge.py) to authenticate.");
-          LogMessage("  * Set WINDBG_MCP_NO_AUTH=1 before loading the extension to disable this check.");
-        } else {
-          LogMessage("HTTP bearer token authentication enabled (WINDBG_MCP_TOKEN).");
-        }
+        LogMessage("HTTP bearer token authentication enabled (WINDBG_MCP_TOKEN).");
       } else if (!IsLoopbackHost(bind_host)) {
-        LogMessage("WARNING: HTTP server is reachable from the network WITHOUT authentication (WINDBG_MCP_NO_AUTH).");
+        LogMessage("HTTP server is reachable from the network without authentication; set WINDBG_MCP_TOKEN to "
+                   "require a bearer token if the network is not trusted.");
       }
     } else {
       LogMessage("HTTP server start failed: " + http_error);
