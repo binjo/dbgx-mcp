@@ -166,9 +166,27 @@ editing the MCP client config and restarting, just tell the agent:
 The agent calls `windbg.set_guest_host({"host": "192.168.56.101"})`. The bridge validates the host
 (loopback/private/link-local only, unless `WINDBG_MCP_ALLOW_PUBLIC_HOST=1`), drops cached
 connections, rediscovers sessions and returns them, and emits `notifications/tools/list_changed`.
-Add `"persist": true` to have it written to the env file so the next bridge start remembers it.
+Add `"persist": true` to have it written to the env file so the next bridge start remembers it
+(the result carries a `warnings` entry if `WINDBG_MCP_HOST` in the client config would shadow it).
 `windbg.list_sessions` always reports the `guest_host`/`transport` the bridge is currently using.
 The token is deliberately *not* settable through the tool.
+
+If nobody knows the VM's IP, `windbg.discover_guests` (or `set_guest_host({"host": "auto"})`)
+sweeps this machine's private `/24` subnets — VirtualBox host-only, VMware vmnet, Hyper-V default
+switch — with cheap TCP probes on the base port, asks responders for `/sessions`, and returns the
+candidates. The sweep is capped at 1024 hosts and only ever touches private/link-local ranges.
+
+### What the bridge does for the agent
+
+| Behaviour | Why |
+|---|---|
+| `initialize` returns `instructions` describing the workflow (list sessions → set host → prefer structured tools) | Clients inject it into the model's system prompt. |
+| Every tool carries MCP `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`) | Clients auto-approve reads and confirm writes. One table ([`TOOL_TRAITS`](windbg-bridge.py)) also drives caching and retry rules. |
+| Tool-level failures are `isError` results with `error`, `message`, `next_steps` (e.g. `command_blocked`, `backend_unreachable`, `backend_timeout`, `unknown_session`) | The model reads and recovers instead of seeing an opaque protocol error. JSON-RPC errors are reserved for malformed requests. |
+| `notifications/progress` every 10 s while a long command (`.reload /f`, `!analyze -v`) is in flight, when the client sent a `progressToken` | Keeps spec-compliant clients from timing out before WinDbg answers. |
+| Never re-sends a request that may have executed: retries only on connect failure, or on a stale keep-alive for read-only/idempotent calls; timeouts are reported, not retried | Prevents a second `p`/`g`/`write_memory` after a slow first one. |
+| Read-only `eval` results (`r`, `k`, `lm`, `version`…) are cached briefly per *session* (`port:pid`) and flushed by any mutating call (`step`, `continue`, `r rax=…`, `.reload`, …) | Fast polling without ever serving pre-step state. |
+| Unreachable host at `initialize` answers synthetically at once | A dead VM IP no longer stalls the client's handshake for 60 s. |
 
 ## Troubleshooting `.load` Failures
 

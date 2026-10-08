@@ -162,7 +162,8 @@ _request_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 # CACHE AND GUARDRAIL CONFIGURATIONS
 # ====================================================================
 
-# Simple memory cache: { (port, command_str): (timestamp, result_dict) }
+# Simple memory cache: { (session_key, command_str): (timestamp, result_dict) }
+# session_key is "port:pid" so a WinDbg restart on the same port never serves stale results.
 _command_cache = {}
 
 # Restrict commands that can brick or kill the debugger session
@@ -175,27 +176,124 @@ DANGEROUS_COMMANDS = {
     ".server", ".endsrv", ".remote"
 }
 
+# What the agent should do instead when a guardrail fires (keyed by the blocked token).
+GUARDRAIL_ALTERNATIVES = {
+    "q": "Ending the debugger session is reserved for the user; leave the target as it is.",
+    "qq": "Ending the debugger session is reserved for the user; leave the target as it is.",
+    "qd": "Ending the debugger session is reserved for the user; leave the target as it is.",
+    ".kill": "Target lifecycle is reserved for the user; use windbg.continue / windbg.interrupt to control execution.",
+    ".detach": "Target lifecycle is reserved for the user; use windbg.continue / windbg.interrupt to control execution.",
+    ".abandon": "Target lifecycle is reserved for the user; use windbg.continue / windbg.interrupt to control execution.",
+    ".restart": "Target lifecycle is reserved for the user; ask them to restart the target if needed.",
+    ".reboot": "Target lifecycle is reserved for the user; ask them to reboot the target if needed.",
+    ".crash": "Target lifecycle is reserved for the user.",
+    ".shell": "Shell escapes are blocked; use windbg.write_file for file output or ask the user to run host commands.",
+    "!shell": "Shell escapes are blocked; use windbg.write_file for file output or ask the user to run host commands.",
+    ".server": "Remote debugging setup is reserved for the user.",
+    ".endsrv": "Remote debugging setup is reserved for the user.",
+    ".remote": "Remote debugging setup is reserved for the user.",
+    "$<": "Inline the commands in windbg.eval (separate with ';') instead of sourcing a script file.",
+}
+
+# ---- Command classification (first-token based; never substring matching) ----
+
+# Debugger commands that only read target state. Everything else is treated as potentially
+# mutating and invalidates the per-session cache. Being conservative here only costs cache hits.
+_READ_ONLY_TOKENS = {
+    # memory / data display
+    "d", "da", "db", "dc", "dd", "dD", "df", "dp", "dq", "du", "dw", "dW", "dyb", "dyd", "ds", "dS",
+    "dda", "ddp", "dds", "dpa", "dpp", "dps", "dqa", "dqp", "dqs", "dt", "dv", "dx", "dl", "dg", "dG",
+    # disassembly / symbols
+    "u", "ub", "uf", "up", "ur", "ln", "ls", "lsa", "lsc", "lsf", "x", "ld",
+    # module / stack / thread listing
+    "lm", "k", "kb", "kc", "kd", "kp", "kP", "kv", "kn", "kL", "kM", "kf", "bl",
+    # evaluation / info
+    "?", "??", "version", "vertarget", "vercommand", "s", ".lastevent", ".exr", ".formats", ".time",
+    ".ttime", ".echo", ".printf", ".chain", ".help", ".symopt", ".tlist", ".dumpdebug", ".frame",
+    # extension reads
+    "!peb", "!teb", "!object", "!address", "!handle", "!dlls", "!vm", "!heap", "!analyze", "!process",
+    "!thread", "!pte", "!vad", "!dh", "!lmi", "!chkimg", "!sym", "!error", "!gle", "!exchain",
+    "!runaway", "!locks", "!cs", "!dso", "!uniqstack", "!findstack", "!gflag", "!envvar", "!std_map",
+    "!for_each_process", "!for_each_thread", "!for_each_module", "!for_each_frame", "!list", "!dp",
+    "!pool", "!poolused", "!drvobj", "!devobj", "!irp", "!stacks", "!running", "!ready", "!idt", "!gdt",
+    "!pcr", "!prcb", "!tz", "!wmitrace", "!ttdext.calls",
+}
+# Read-only only when used without arguments (with arguments they change debugger context/paths).
+_READ_ONLY_WHEN_BARE = {"r", ".sympath", ".srcpath", ".exepath", ".effmach", ".symopt", ".frame",
+                        ".process", ".thread", ".context", ".cxr", ".ecxr"}
+# Tokens whose variants carry a suffix (lmv, lmf, kvn...). Checked with startswith after exact lookup.
+_READ_ONLY_PREFIX_FAMILIES = ("lm", "k", "dp", "dq", "dd", "dw", "db", "da", "du", "dy")
+_READ_ONLY_TOKENS = {t.lower() for t in _READ_ONLY_TOKENS}
+
+# Cacheable read-only commands and their TTL (seconds). First token only; any arguments other
+# than for 'x'/'lm' families drop the command out of the cache.
+_CACHEABLE_TOKENS = {
+    "version": 300.0, "vertarget": 300.0, ".effmach": 300.0,
+    "lm": 120.0, "x": 120.0,
+    "!peb": 30.0, "!teb": 30.0, "!object": 30.0,
+    "r": 5.0, "k": 5.0, "kb": 5.0, "kp": 5.0, "kv": 5.0, "kn": 5.0, "kc": 5.0,
+}
+
+
+def _first_token(subcommand: str) -> str:
+    """Leading command token of a single (already ';'-split) command, lower-cased.
+
+    Handles WinDbg's glued forms: 'r@rax', 'dd@rsp', '~1s', '|0s', 'k=rbp'.
+    """
+    s = subcommand.strip()
+    if not s:
+        return ""
+    m = re.match(r"^([.!$]?[A-Za-z_][A-Za-z0-9_.]*|\?\??|~|\||\$[<>]+)", s)
+    tok = m.group(1) if m else s.split()[0]
+    return tok.lower()
+
+
+def _is_read_only_subcommand(sub: str) -> bool:
+    sub = sub.strip()
+    tok = _first_token(sub)
+    if not tok:
+        return True
+    rest = sub[len(tok):].strip()
+    if tok == "r":
+        return "=" not in rest  # 'r rax=5' writes; 'r', 'r rax', 'r @rax' read
+    if tok in ("~", "|"):
+        # Bare '~'/'|' list threads/processes, '~*k' walks stacks; '~1s' / '|1s' switch context.
+        return not rest or re.match(r"^[*.#0-9a-fA-F]*\s*k", rest) is not None
+    if tok in _READ_ONLY_WHEN_BARE:
+        return not rest
+    if tok in _READ_ONLY_TOKENS:
+        return True
+    return any(tok.startswith(p) and tok[len(p):].isalpha() for p in _READ_ONLY_PREFIX_FAMILIES)
+
+
+def command_mutates(command: str) -> bool:
+    """True if any sub-command of a windbg.eval command may change target or debugger state."""
+    subs = split_commands_safe(command)
+    if not subs:
+        return False
+    return not all(_is_read_only_subcommand(s) for s in subs)
+
+
 def get_cache_ttl(command: str) -> float:
-    """Returns appropriate TTL in seconds based on command semantics."""
-    cmd = command.lower().strip()
-
-    # Strictly static / metadata
-    if any(x in cmd for x in ["version", ".effmach", "vertarget"]):
-        return 300.0  # 5 minutes
-
-    # Moderately static
-    if "lm" in cmd or cmd.startswith("x "):
-        return 120.0  # 2 minutes
-
-    # High-level structures
-    if any(x in cmd for x in ["!peb", "!teb", "!object"]):
-        return 30.0   # 30 seconds
-
-    # Fast-changing execution context (Registers and stacks)
-    if any(x == cmd or cmd.startswith(x + " ") for x in ["r", "k", "kb", "kp", "kv"]):
-        return 5.0    # 5 seconds to cushion fast loop queries without stale reads
-
-    return 0.0  # Bypass cache (write operations, execution control, etc.)
+    """TTL in seconds for caching a windbg.eval command (0 = never cache)."""
+    subs = split_commands_safe(command)
+    if len(subs) != 1:
+        return 0.0
+    sub = subs[0]
+    tok = _first_token(sub)
+    rest = sub[len(tok):].strip()
+    if tok.startswith("lm") and tok[2:].isalpha():
+        tok = "lm"
+    ttl = _CACHEABLE_TOKENS.get(tok, 0.0)
+    if ttl <= 0.0:
+        return 0.0
+    if "=" in rest:
+        return 0.0  # register write
+    if tok in ("version", "vertarget", ".effmach", "!peb", "!teb") and rest:
+        return 0.0
+    if tok == "x" and not rest:
+        return 0.0
+    return ttl
 
 
 def split_commands_safe(command: str) -> list[str]:
@@ -221,29 +319,58 @@ def split_commands_safe(command: str) -> list[str]:
     return [p for p in parts if p]
 
 
-def validate_command(command: str) -> tuple[bool, str]:
-    """Checks if a command is safe to execute. Returns (is_safe, error_message)."""
+def validate_command_detail(command: str) -> dict | None:
+    """Returns None if the command is allowed, else {blocked, reason, alternative}."""
     # Guardrail: Reject sourcing/nesting commands from disk files to prevent arbitrary code/file execution
     if any(pattern in command for pattern in ["$<", "$>", "$$<", "$$>"]):
-        return False, (
-            "Sourcing or nesting command files (using '$<' or '$$<') is prohibited "
-            "to prevent unauthorized disk file execution."
-        )
+        return {
+            "blocked": "$<",
+            "reason": (
+                "Sourcing or nesting command files (using '$<' or '$$<') is prohibited "
+                "to prevent unauthorized disk file execution."
+            ),
+            "alternative": GUARDRAIL_ALTERNATIVES["$<"],
+        }
 
     # Split by semicolon to check each individual subcommand
-    subcommands = split_commands_safe(command)
-    for sub in subcommands:
-        parts = sub.strip().split()
-        if not parts:
-            continue
-        base_cmd = parts[0].lower()
+    for sub in split_commands_safe(command):
+        base_cmd = _first_token(sub)
         if base_cmd in DANGEROUS_COMMANDS:
-            return False, (
-                f"The command '{base_cmd}' is prohibited by the gateway "
-                "guardrails to prevent accidental termination or corruption of the "
-                "debugging session."
-            )
-    return True, ""
+            return {
+                "blocked": base_cmd,
+                "reason": (
+                    f"The command '{base_cmd}' is prohibited by the gateway "
+                    "guardrails to prevent accidental termination or corruption of the "
+                    "debugging session."
+                ),
+                "alternative": GUARDRAIL_ALTERNATIVES.get(base_cmd, ""),
+            }
+    return None
+
+
+def validate_command(command: str) -> tuple[bool, str]:
+    """Checks if a command is safe to execute. Returns (is_safe, error_message)."""
+    detail = validate_command_detail(command)
+    if detail is None:
+        return True, ""
+    return False, detail["reason"]
+
+
+# Timeouts for windbg.eval by first token (seconds). Order matters: first match wins.
+_EVAL_TIMEOUT_RULES = (
+    # (predicate(token, rest), timeout)
+    (lambda t, r: t == ".reload" and re.search(r"(^|\s)[/-]f\b", r) is not None, 1200.0),
+    (lambda t, r: t in (".reload", ".sympath", ".symfix"), 300.0),
+    (lambda t, r: t == "!process" and re.match(r"^0\s+(0|7|1f)\b", r) is not None, 480.0),
+    (lambda t, r: t in ("!for_each_process", "!for_each_thread", "!for_each_module"), 900.0),
+    (lambda t, r: t == "!analyze" and "-v" in r.split(), 300.0),
+    (lambda t, r: t in ("!thread", "!process") and r.split()[:1] == ["-1"], 300.0),
+    (lambda t, r: t.startswith("lm") or t in ("!dlls", "!handle", "!vm", "!address"), 180.0),
+    (lambda t, r: t in ("version", "vertarget", ".effmach", "?", "??", "r", ".help", ".echo"), 10.0),
+    (lambda t, r: t in ("!analyze", "!thread", "!process"), 120.0),
+    (lambda t, r: t in ("s",) or t.startswith(("dd", "dq", "dp", "da", "du", "db", "dw", "dy", "dt", "dx", "u")), 90.0),
+    (lambda t, r: t in ("g", "gu", "gh", "gn", "p", "pa", "pc", "pt", "t", "ta", "tc", "tt", "wt", "bp", "bu", "bm", "ba", "bc", "bd", "be"), 60.0),
+)
 
 
 def get_timeout_for_request(req_data) -> float:
@@ -260,49 +387,18 @@ def get_timeout_for_request(req_data) -> float:
 
     if tool_name == "windbg.eval":
         command = tool_args.get("command", "")
-        cmd_lower = command.lower().strip()
-
-        # Extended symbol loading commands
-        if any(ext_cmd in cmd_lower for ext_cmd in [".reload /f", ".reload -f"]):
-            return 1200.0  # 20 minutes
-
-        # Standard symbol operations
-        if any(sym_cmd in cmd_lower for sym_cmd in [".reload", ".sympath", ".symfix"]):
-            return 300.0   # 5 minutes
-
-        # Process list commands
-        if any(proc_cmd in cmd_lower for proc_cmd in ["!process 0 0", "!process 0 7", "!process 0 1f"]):
-            return 480.0   # 8 minutes
-
-        # Streaming commands
-        if any(stream_cmd in cmd_lower for stream_cmd in ["!for_each_process", "!for_each_thread", "!for_each_module"]):
-            return 900.0   # 15 minutes
-
-        # Large analysis commands
-        if any(large_cmd in cmd_lower for large_cmd in ["!analyze -v", "!thread -1", "!process -1"]):
-            return 300.0   # 5 minutes
-
-        # Bulk commands
-        if any(bulk_cmd in cmd_lower for bulk_cmd in ["lm", "!dlls", "!handle", "!vm", "!address"]):
-            return 180.0   # 3 minutes
-
-        # Quick commands
-        if any(quick_cmd in cmd_lower for quick_cmd in ["version", "help", "?", "r", ".effmach", "vertarget"]):
-            return 10.0    # 10 seconds
-
-        # Analysis commands
-        if any(analysis_cmd in cmd_lower for analysis_cmd in ["!analyze", "!thread", "!process"]):
-            return 120.0   # 2 minutes
-
-        # Memory commands
-        if any(memory_cmd in cmd_lower for memory_cmd in ["dd", "dq", "dp", "da", "du"]):
-            return 90.0    # 1.5 minutes
-
-        # Execution commands
-        if any(exec_cmd in cmd_lower for exec_cmd in ["g", "p", "t", "bp", "bc"]):
-            return 60.0    # 1 minute
-
-        return 60.0
+        timeout = 0.0
+        # A chained command gets the longest timeout of its parts.
+        for sub in split_commands_safe(command) or [""]:
+            tok = _first_token(sub)
+            rest = sub.strip()[len(tok):].strip().lower()
+            sub_timeout = 60.0
+            for predicate, value in _EVAL_TIMEOUT_RULES:
+                if predicate(tok, rest):
+                    sub_timeout = value
+                    break
+            timeout = max(timeout, sub_timeout)
+        return timeout or 60.0
 
     elif tool_name == "windbg.carve_pe":
         return 300.0  # 5 minutes for PE extraction
@@ -332,6 +428,93 @@ def get_timeout_for_request(req_data) -> float:
     return 60.0
 
 
+# ====================================================================
+# TOOL TRAITS (single source for MCP annotations, cache invalidation and retry safety)
+# ====================================================================
+#
+# readOnly:   never changes target or debugger state (safe to auto-approve, safe to retry)
+# destructive: changes target memory/files irreversibly
+# idempotent: re-sending the same call has no additional effect
+# "dynamic" tools (eval, ttd_position) are classified per call by tool_mutates().
+_RO = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+_CTRL = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
+_DESTRUCTIVE_IDEMPOTENT = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}
+
+TOOL_TRAITS = {
+    "windbg.eval": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+    "windbg.dx": _RO,
+    "windbg.get_context": _RO,
+    "windbg.get_modules": _RO,
+    "windbg.get_breakpoints": _RO,
+    "windbg.disassemble": _RO,
+    "windbg.read_memory": _RO,
+    "windbg.write_memory": _DESTRUCTIVE_IDEMPOTENT,
+    "windbg.search": _RO,
+    "windbg.read_string": _RO,
+    "windbg.carve_pe": _RO,
+    "windbg.get_threads": _RO,
+    "windbg.get_execution_state": _RO,
+    "windbg.interrupt": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "windbg.step": _CTRL,
+    "windbg.continue": _CTRL,
+    # 'bp' at an already-breakpointed address creates a duplicate, so a retry is not harmless.
+    "windbg.set_breakpoint": _CTRL,
+    "windbg.clear_breakpoint": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "windbg.resolve": _RO,
+    "windbg.ttd_position": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "windbg.search_catalog": _RO,
+    "windbg.get_command_docs": _RO,
+    "windbg.get_catalog_entry": _RO,
+    "windbg.apply_struct": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "windbg.apply_synthetic_type": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "windbg.write_file": _DESTRUCTIVE_IDEMPOTENT,
+    "windbg.get_session_metadata": _RO,
+    "windbg.list_sessions": _RO,
+    "windbg.set_guest_host": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "windbg.discover_guests": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+}
+
+
+def tool_mutates(tool_name: str, tool_args: dict) -> bool:
+    """True if this specific call may change target/debugger state (drives cache invalidation)."""
+    if tool_name == "windbg.eval":
+        return command_mutates(tool_args.get("command", "") or "")
+    if tool_name == "windbg.ttd_position":
+        return bool(tool_args.get("position"))
+    traits = TOOL_TRAITS.get(tool_name)
+    if traits is None:
+        return True  # unknown tool: assume the worst
+    return not traits["readOnlyHint"]
+
+
+def tool_is_retry_safe(tool_name: str, tool_args: dict) -> bool:
+    """True if the request may be transparently re-sent after a transport failure.
+
+    A request is retry-safe only when re-executing it cannot change the target a second time:
+    read-only calls, and idempotent non-control calls (set/clear breakpoint, write_memory with
+    the same bytes). step/continue/eval-with-side-effects are never retried.
+    """
+    if tool_name == "windbg.eval":
+        return not command_mutates(tool_args.get("command", "") or "")
+    if tool_name == "windbg.ttd_position":
+        return True  # seeking to an absolute position twice lands in the same place
+    traits = TOOL_TRAITS.get(tool_name)
+    if traits is None:
+        return False
+    return traits["readOnlyHint"] or traits["idempotentHint"]
+
+
+def annotate_tool(tool: dict) -> dict:
+    """Adds MCP tool annotations (spec 2025-03-26) in place when we know the tool."""
+    name = tool.get("name", "")
+    if name.startswith("windbg_"):
+        name = "windbg." + name[7:]
+    traits = TOOL_TRAITS.get(name)
+    if traits is not None and "annotations" not in tool:
+        tool["annotations"] = dict(traits)
+    return tool
+
+
 def enrich_error_response(command: str, error_message: str) -> list[str]:
     """Generates actionable workflow recovery hints for agents based on typical failures."""
     suggestions = []
@@ -356,24 +539,47 @@ def enrich_error_response(command: str, error_message: str) -> list[str]:
 # GATEWAY LOGISTICS
 # ====================================================================
 
+LOG_MAX_BYTES = 5 * 1024 * 1024
+_log_lock = threading.Lock()
+
+
 def log(msg):
-    """Logs a diagnostic message to the temporary log file."""
+    """Logs a diagnostic message to the temporary log file (rotated at LOG_MAX_BYTES)."""
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        with _log_lock:
+            try:
+                if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+                    os.replace(LOG_FILE, LOG_FILE + ".1")
+            except OSError:
+                pass
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
     except IOError:
         pass
+
+
+def _stdout_broken():
+    """The client went away: nothing we send can be read anymore, so stop the process."""
+    log("stdout closed by client; shutting down bridge")
+    release_global_mutex()
+    os._exit(0)
 
 
 def send_response(output_stream, data):
     """Serializes and sends a JSON-RPC response to stdout thread-safely."""
     try:
         line = json.dumps(data)
+    except (TypeError, ValueError) as e:
+        log(f"SEND ERROR (serialize): {e}")
+        return
+    try:
         with _stdout_lock:
             output_stream.write(line + "\n")
             output_stream.flush()
         log(f"SENT: {line[:200]}...")
-    except (TypeError, ValueError, IOError) as e:
+    except (BrokenPipeError, ValueError):  # ValueError: I/O operation on closed file
+        _stdout_broken()
+    except IOError as e:
         log(f"SEND ERROR: {e}")
 
 
@@ -388,8 +594,58 @@ def send_notification(output_stream, method, params=None):
             output_stream.write(line + "\n")
             output_stream.flush()
         log(f"NOTIFICATION SENT: {method}")
+    except (BrokenPipeError, ValueError):
+        _stdout_broken()
     except Exception as e:
         log(f"NOTIFICATION ERROR: {e}")
+
+
+PROGRESS_INTERVAL_SECONDS = 10.0
+
+
+class ProgressHeartbeat:
+    """Emits notifications/progress while a forwarded request is in flight.
+
+    MCP clients that honour progressToken reset their per-call timeout on every progress
+    notification, which is what lets a 20-minute '.reload /f' survive a 60 s client deadline.
+    No token in the request -> no-op.
+    """
+
+    def __init__(self, output_stream, req_data, label: str, total_seconds: float):
+        meta = (req_data.get("params") or {}).get("_meta") or {}
+        self.token = meta.get("progressToken")
+        self.output_stream = output_stream
+        self.label = label
+        self.total = max(total_seconds, 1.0)
+        self.started = time.time()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        if self.token is not None:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        return False
+
+    def _run(self):
+        while not self._stop.wait(PROGRESS_INTERVAL_SECONDS):
+            elapsed = time.time() - self.started
+            send_notification(
+                self.output_stream,
+                "notifications/progress",
+                {
+                    "progressToken": self.token,
+                    "progress": round(min(elapsed, self.total), 1),
+                    "total": round(self.total, 1),
+                    "message": f"{self.label} still running ({int(elapsed)}s elapsed, timeout {int(self.total)}s)",
+                },
+            )
 
 
 _last_known_sessions = None
@@ -404,10 +660,12 @@ def session_watcher_loop(output_stream):
             check_count += 1
 
             current_sessions = get_sessions()
-            curr_ports = sorted([s.get("port", 9999) for s in current_sessions])
+            curr_ports = sorted([f"{s.get('port', 9999)}:{s.get('pid', 0)}" for s in current_sessions])
 
             if _last_known_sessions is not None and curr_ports != _last_known_sessions:
                 log(f"Session list changed: {_last_known_sessions} -> {curr_ports}. Sending notifications/tools/list_changed.")
+                with _cache_lock:
+                    _command_cache.clear()
                 if current_sessions:
                     _current_port = current_sessions[0].get("port", BASE_PORT)
                     _current_pipe_name = current_sessions[0].get("pipe_name")
@@ -576,8 +834,32 @@ def forward_pipe(pipe_name, body_bytes, timeout=60.0):
     raise IOError(f"Pipe dispatch to '{full_pipe_path}' failed")
 
 
-def forward_post(host, port, path, body_bytes, timeout=60.0, extra_headers=None):
-    """Forwards a POST request using a persistent keep-alive connection with automatic reconnect."""
+class BackendTimeout(IOError):
+    """The server accepted the request but did not answer within the deadline."""
+
+
+def _drop_connection(key, conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+    with _connections_lock:
+        if _connections.get(key) is conn:
+            del _connections[key]
+
+
+def forward_post(host, port, path, body_bytes, timeout=60.0, extra_headers=None, retry_safe=False):
+    """Forwards a POST over a persistent keep-alive connection.
+
+    Retry policy (the request may have side effects on a live debugger, so we must never
+    execute it twice by accident):
+      * failure while *sending* (connect refused, reset before the body was written) -> the
+        server never saw it -> always retry once on a fresh connection;
+      * stale keep-alive (server closed the idle socket, RemoteDisconnected before any status
+        line) -> retry once only when retry_safe (read-only / idempotent call);
+      * timeout waiting for the response -> never retry; raise BackendTimeout so the caller can
+        tell the agent the command may still be running.
+    """
     key = f"{host}:{port}"
     lock = get_connection_lock(key)
     headers = {
@@ -589,38 +871,56 @@ def forward_post(host, port, path, body_bytes, timeout=60.0, extra_headers=None)
 
     with lock:
         conn = get_connection(host, port, timeout=timeout)
+        reused = conn.sock is not None
+        phase = "send"
+        try:
+            conn.request("POST", path, body=body_bytes, headers=headers)
+            phase = "receive"
+            resp = conn.getresponse()
+            data = resp.read()
+            return data, resp.status
+        except socket.timeout as e:
+            _drop_connection(key, conn)
+            if phase == "send":
+                raise IOError(f"connect to {host}:{port} timed out") from e
+            raise BackendTimeout(f"no response from {host}:{port} within {timeout:.0f}s") from e
+        except (http.client.HTTPException, IOError) as e:
+            _drop_connection(key, conn)
+            stale_keepalive = reused and isinstance(e, (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError))
+            if phase == "send" or (stale_keepalive and retry_safe):
+                log(f"Connection error to {host}:{port} during {phase}: {e}. Retrying once on a new connection.")
+            else:
+                raise
+        # Single retry on a fresh connection; any failure here propagates.
+        conn = get_connection(host, port, timeout=timeout)
         try:
             conn.request("POST", path, body=body_bytes, headers=headers)
             resp = conn.getresponse()
             data = resp.read()
             return data, resp.status
-        except (http.client.HTTPException, IOError) as e:
-            log(
-                f"Connection error to {host}:{port}: {e}. Retrying with a new connection."
-            )
-            try:
-                conn.close()
-            except Exception:
-                pass
-            with _connections_lock:
-                if key in _connections:
-                    del _connections[key]
-            # Retry once
-            conn = get_connection(host, port, timeout=timeout)
-            conn.request("POST", path, body=body_bytes, headers=headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            return data, resp.status
+        except socket.timeout as e:
+            _drop_connection(key, conn)
+            raise BackendTimeout(f"no response from {host}:{port} within {timeout:.0f}s") from e
+        except (http.client.HTTPException, IOError):
+            _drop_connection(key, conn)
+            raise
 
 
-def forward_mcp_message(session, body_bytes, timeout=60.0):
+def current_endpoint() -> tuple[str, int]:
+    """Consistent (host, base_port) snapshot; never read the globals separately on a hot path."""
+    with _config_lock:
+        return GUEST_IP, BASE_PORT
+
+
+def forward_mcp_message(session, body_bytes, timeout=60.0, retry_safe=False):
     """Dispatches a JSON-RPC message to the session via Named Pipe or HTTP based on availability and settings."""
+    host, base_port = current_endpoint()
     pipe_name = session.get("pipe_name") if isinstance(session, dict) else None
-    port = session.get("port", BASE_PORT) if isinstance(session, dict) else session
+    port = session.get("port", base_port) if isinstance(session, dict) else session
 
     use_pipe = (
         sys.platform == "win32"
-        and GUEST_IP == "127.0.0.1"
+        and host == "127.0.0.1"
         and TRANSPORT_MODE in ("auto", "pipe")
         and pipe_name is not None
     )
@@ -633,7 +933,7 @@ def forward_mcp_message(session, body_bytes, timeout=60.0):
             if TRANSPORT_MODE == "pipe":
                 raise
 
-    return forward_post(GUEST_IP, port, "/mcp", body_bytes, timeout=timeout, extra_headers=auth_headers(session))
+    return forward_post(host, port, "/mcp", body_bytes, timeout=timeout, extra_headers=auth_headers(session), retry_safe=retry_safe)
 
 
 def is_process_alive(pid: int) -> bool:
@@ -661,12 +961,14 @@ def is_process_alive(pid: int) -> bool:
             return False
 
 
-def scan_port(port):
-    """Scans a single port for active WinDbg MCP guest sessions."""
-    url = f"http://{GUEST_IP}:{port}/sessions"
+def scan_port(port, host=None, timeout=0.3):
+    """Scans a single host:port for active WinDbg MCP guest sessions."""
+    if host is None:
+        host, _ = current_endpoint()
+    url = f"http://{host}:{port}/sessions"
     try:
         req = urllib.request.Request(url, method="GET", headers=auth_headers())
-        with urllib.request.urlopen(req, timeout=0.3) as f:
+        with urllib.request.urlopen(req, timeout=timeout) as f:
             if f.getcode() == 200:
                 data = json.loads(f.read().decode("utf-8"))
                 if isinstance(data, list):
@@ -679,12 +981,28 @@ def scan_port(port):
     return []
 
 
+def session_key(session: dict) -> str:
+    """Stable identity of a session: port plus the WinDbg process id (changes when WinDbg restarts)."""
+    return f"{session.get('port', 0)}:{session.get('pid', 0)}"
+
+
+def _publish_sessions(sessions: list) -> list:
+    for s in sessions:
+        if isinstance(s, dict):
+            s.setdefault("session_key", session_key(s))
+    with _session_map_lock:
+        for s in sessions:
+            if "port" in s:
+                _session_map[s["port"]] = s
+    return sorted(sessions, key=lambda x: x.get("port", 9999))
+
+
 def get_sessions():
     """Discover all active WinDbg MCP sessions (instant local registry read or remote HTTP scan)."""
-    global _session_map
+    host, base_port = current_endpoint()
 
     # Fast local filesystem registry discovery (< 0.1 ms)
-    if GUEST_IP == "127.0.0.1":
+    if host == "127.0.0.1":
         registry_dir = os.path.join(tempfile.gettempdir(), "dbgx-mcp-registry")
         if os.path.exists(registry_dir):
             sessions = []
@@ -707,32 +1025,104 @@ def get_sessions():
                         except Exception:
                             pass
                 if sessions:
-                    with _session_map_lock:
-                        for s in sessions:
-                            if "port" in s:
-                                _session_map[s["port"]] = s
-                    return sorted(sessions, key=lambda x: x.get("port", 9999))
+                    return _publish_sessions(sessions)
             except Exception as e:
                 log(f"Local registry scan error: {e}")
 
     # Fallback to parallel HTTP scanning for remote VMs
-    ports_to_try = [BASE_PORT] + [p for p in range(BASE_PORT + 1, BASE_PORT + 11)]
+    ports_to_try = list(range(base_port, base_port + 11))
     unique_sessions = {}
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(ports_to_try)
-    ) as executor:
-        results = executor.map(scan_port, ports_to_try)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ports_to_try)) as executor:
+        results = executor.map(lambda p: scan_port(p, host=host), ports_to_try)
         for res in results:
             for s in res:
                 if isinstance(s, dict) and "port" in s:
                     unique_sessions[s["port"]] = s
 
-    result_list = list(unique_sessions.values())
-    with _session_map_lock:
-        for s in result_list:
-            if "port" in s:
-                _session_map[s["port"]] = s
-    return sorted(result_list, key=lambda x: x.get("port", 9999))
+    return _publish_sessions(list(unique_sessions.values()))
+
+
+# ---- Guest auto-discovery (host-only / NAT lab networks) ----
+
+DISCOVERY_MAX_HOSTS = 1024        # hard budget: at most four /24s per sweep
+DISCOVERY_CONNECT_TIMEOUT = 0.25  # seconds per TCP probe
+
+
+def local_lab_networks() -> list:
+    """IPv4 /24 networks of this machine's private/link-local interfaces (VM host-only adapters live here)."""
+    nets = {}
+    addrs = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addrs.add(info[4][0])
+    except OSError:
+        pass
+    # Interfaces without a hostname mapping: learn the egress address toward a few well-known lab ranges.
+    for probe in ("192.168.56.1", "192.168.0.1", "10.0.0.1", "172.16.0.1"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.05)
+            s.connect((probe, 9))
+            addrs.add(s.getsockname()[0])
+            s.close()
+        except OSError:
+            pass
+    for a in addrs:
+        try:
+            ip = ipaddress.ip_address(a)
+        except ValueError:
+            continue
+        if ip.is_loopback or not (ip.is_private or ip.is_link_local):
+            continue
+        net = ipaddress.ip_network(f"{a}/24", strict=False)
+        nets[str(net)] = net
+    return list(nets.values())
+
+
+def _tcp_open(host: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def discover_guests(port=None, networks=None) -> dict:
+    """Sweeps the local lab /24s for dbgx-mcp servers listening on `port` and returns candidates.
+
+    Only TCP-connects (cheap, ~0.25 s worst case per host, fully parallel) and then asks the
+    responders for /sessions so the agent can pick the right machine without guessing IPs.
+    """
+    _, base_port = current_endpoint()
+    port = port or base_port
+    nets = networks if networks is not None else local_lab_networks()
+    hosts = []
+    for net in nets:
+        for h in net.hosts():
+            hosts.append(str(h))
+            if len(hosts) >= DISCOVERY_MAX_HOSTS:
+                break
+        if len(hosts) >= DISCOVERY_MAX_HOSTS:
+            break
+
+    started = time.time()
+    candidates = []
+    if hosts:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=128) as executor:
+            open_flags = list(executor.map(lambda h: _tcp_open(h, port, DISCOVERY_CONNECT_TIMEOUT), hosts))
+        for h, is_open in zip(hosts, open_flags):
+            if not is_open:
+                continue
+            sessions = scan_port(port, host=h, timeout=1.0)
+            candidates.append({"host": h, "port": port, "sessions": sessions, "is_dbgx_mcp": bool(sessions)})
+    candidates.sort(key=lambda c: (not c["is_dbgx_mcp"], c["host"]))
+    return {
+        "scanned_networks": [str(n) for n in nets],
+        "hosts_probed": len(hosts),
+        "port": port,
+        "elapsed_seconds": round(time.time() - started, 2),
+        "candidates": candidates,
+    }
 
 
 def get_default_tools_list():
@@ -792,43 +1182,95 @@ BRIDGE_LOCAL_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "IP address or hostname of the machine running WinDbg (e.g. '192.168.56.101' or '127.0.0.1')"},
+                "host": {"type": "string", "description": "IP address or hostname of the machine running WinDbg (e.g. '192.168.56.101' or '127.0.0.1'), or 'auto' to sweep the local host-only/NAT subnets for a dbgx-mcp server and use the first one found"},
                 "port": {"type": "integer", "description": "Base HTTP port of the dbgx-mcp extension (default 5678)"},
                 "persist": {"type": "boolean", "description": "Also save to the bridge env file so the setting survives restarts (default false)"},
             },
             "required": ["host"],
         },
     },
+    {
+        "name": "windbg.discover_guests",
+        "description": (
+            "Sweep this machine's private /24 subnets (VirtualBox host-only, VMware vmnet, Hyper-V default "
+            "switch) for machines with a dbgx-mcp server listening and return them with their sessions. "
+            "Takes a few seconds. Use when the user has not told you the debugger VM's IP; then call "
+            "windbg.set_guest_host with the chosen host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "port": {"type": "integer", "description": "Port to probe (default: the bridge's base port, 5678)"},
+            },
+        },
+    },
 ]
+for _t in BRIDGE_LOCAL_TOOLS:
+    annotate_tool(_t)
+
+# Injected into the MCP initialize result; clients surface it to the model as server guidance.
+SERVER_INSTRUCTIONS = (
+    "WinDbg bridge. Workflow: (1) call windbg.list_sessions; if `sessions` is empty, ask the user for the "
+    "debugger VM's IP or call windbg.discover_guests, then windbg.set_guest_host. (2) Prefer structured "
+    "tools (get_context, get_modules, get_breakpoints, disassemble, read_memory, resolve, dx) over raw "
+    "windbg.eval; use eval for anything else. (3) step / continue / write_memory / set_breakpoint / "
+    "ttd_position(position=...) change target state; check windbg.get_execution_state before issuing "
+    "commands if a continue may still be running. (4) Tool failures come back as isError results with "
+    "`error` and `next_steps` fields: read them and recover instead of retrying blindly. (5) Session "
+    "lifecycle commands (q, .kill, .detach, .restart, .shell) are blocked; ask the user instead. Pass "
+    "session_id (a port from list_sessions) to target a specific WinDbg instance."
+)
 
 
-def _tool_text_result(req_id, payload) -> dict:
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]},
-    }
+def _tool_text_result(req_id, payload, is_error: bool = False) -> dict:
+    result = {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]}
+    if is_error:
+        result["isError"] = True
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
-def _tool_error(req_id, code, message) -> dict:
+def _tool_failure(req_id, error: str, message: str, next_steps=None, **extra) -> dict:
+    """Tool-level failure as an MCP isError result (the model can read it), not a JSON-RPC error."""
+    payload = {"error": error, "message": message}
+    if next_steps:
+        payload["next_steps"] = list(next_steps)
+    payload.update(extra)
+    return _tool_text_result(req_id, payload, is_error=True)
+
+
+def _rpc_error(req_id, code, message) -> dict:
+    """Protocol-level error (malformed request, internal fault)."""
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
 def effective_transport() -> str:
     """Transport the bridge will actually use for GUEST_IP right now."""
-    if sys.platform == "win32" and GUEST_IP == "127.0.0.1" and TRANSPORT_MODE in ("auto", "pipe"):
+    host, _ = current_endpoint()
+    if sys.platform == "win32" and host == "127.0.0.1" and TRANSPORT_MODE in ("auto", "pipe"):
         return "pipe"
     return "http"
 
 
 def describe_gateway() -> dict:
+    host, base_port = current_endpoint()
     return {
-        "guest_host": GUEST_IP,
-        "base_port": BASE_PORT,
+        "guest_host": host,
+        "base_port": base_port,
         "transport": effective_transport(),
         "auth": "bearer" if AUTH_TOKEN else "none",
         "env_file": ENV_FILE,
     }
+
+
+def _no_sessions_next_steps(host: str, base_port: int) -> list:
+    steps = []
+    if host == "127.0.0.1":
+        steps.append("Ask the user to load dbgx-mcp in WinDbg (.load dbgx-mcp) on this machine, or")
+        steps.append("if WinDbg runs in a VM: call windbg.discover_guests, or windbg.set_guest_host(host=<vm ip>) if the user gave you the IP")
+    else:
+        steps.append(f"Verify WinDbg on {host} has dbgx-mcp loaded with WINDBG_MCP_BIND=0.0.0.0 (or the VM's address) and port {base_port} open in its firewall")
+        steps.append("Call windbg.discover_guests if the VM's IP may have changed (DHCP on host-only adapters)")
+    return steps
 
 
 def handle_list_sessions(req_id):
@@ -836,7 +1278,30 @@ def handle_list_sessions(req_id):
     sessions = get_sessions()
     payload = describe_gateway()
     payload["sessions"] = sessions
+    if not sessions:
+        payload["next_steps"] = _no_sessions_next_steps(payload["guest_host"], payload["base_port"])
     return _tool_text_result(req_id, payload)
+
+
+def handle_discover_guests(req_id, tool_args):
+    """Processes the windbg.discover_guests tool call."""
+    port = tool_args.get("port")
+    if port is not None and (isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535)):
+        return _tool_failure(req_id, "invalid_argument", "port must be an integer between 1 and 65535")
+    try:
+        result = discover_guests(port=port)
+    except Exception as e:
+        log(f"DISCOVER ERROR: {e}")
+        return _tool_failure(req_id, "discovery_failed", str(e))
+    hits = [c for c in result["candidates"] if c["is_dbgx_mcp"]]
+    if hits:
+        result["next_steps"] = [f"Call windbg.set_guest_host(host='{hits[0]['host']}')" + (f", port={hits[0]['port']}" if hits[0]["port"] != BASE_PORT else "")]
+    else:
+        result["next_steps"] = [
+            "No dbgx-mcp server answered on the scanned subnets. Ask the user for the VM's IP, confirm WINDBG_MCP_BIND "
+            "is set to a reachable interface in WinDbg's environment, and that the Windows firewall allows the port.",
+        ]
+    return _tool_text_result(req_id, result)
 
 
 def _reset_host_bound_state():
@@ -889,17 +1354,31 @@ def persist_env_setting(key: str, value: str, path: str = None) -> str:
 
 
 def set_guest_host(host: str, port=None, persist: bool = False) -> dict:
-    """Re-points the bridge at another WinDbg host at runtime. Raises ValueError on bad input."""
+    """Re-points the bridge at another WinDbg host at runtime. Raises ValueError on bad input.
+
+    host="auto" sweeps the local lab subnets and picks the first machine running dbgx-mcp.
+    """
     global GUEST_IP, BASE_PORT, _current_port, _current_pipe_name
 
-    new_host = validate_guest_host(host)
-    new_port = BASE_PORT
     if port is not None:
         if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
             raise ValueError("port must be an integer between 1 and 65535")
-        new_port = port
 
+    discovery = None
+    if isinstance(host, str) and host.strip().lower() == "auto":
+        discovery = discover_guests(port=port)
+        hits = [c for c in discovery["candidates"] if c["is_dbgx_mcp"]]
+        if not hits:
+            raise ValueError(
+                f"auto-discovery found no dbgx-mcp server on {discovery['scanned_networks'] or 'any local subnet'} "
+                f"(port {discovery['port']}, {discovery['hosts_probed']} hosts probed). Ask the user for the VM's IP."
+            )
+        host = hits[0]["host"]
+        port = hits[0]["port"]
+
+    new_host = validate_guest_host(host)
     with _config_lock:
+        new_port = BASE_PORT if port is None else port
         changed = (new_host != GUEST_IP) or (new_port != BASE_PORT)
         previous = (GUEST_IP, BASE_PORT)
         GUEST_IP = new_host
@@ -911,14 +1390,21 @@ def set_guest_host(host: str, port=None, persist: bool = False) -> dict:
         log(f"GUEST HOST: {previous[0]}:{previous[1]} -> {GUEST_IP}:{BASE_PORT} (changed={changed}, persist={persist})")
 
     persisted_to = None
+    warnings = []
     if persist:
-        persisted_to = persist_env_setting("WINDBG_MCP_HOST", GUEST_IP)
+        persisted_to = persist_env_setting("WINDBG_MCP_HOST", new_host)
         if port is not None:
-            persist_env_setting("WINDBG_MCP_PORT", str(BASE_PORT))
+            persist_env_setting("WINDBG_MCP_PORT", str(new_port))
+        shadowing = [k for k in os.environ if k.lower() in ("windbg_mcp_host", "windbg_mcp_bind")]
+        if shadowing:
+            warnings.append(
+                f"Environment variable {shadowing[0]} is set by the MCP client config and overrides the env file on the "
+                "next bridge start; remove it from the client config for the persisted host to take effect."
+            )
 
     sessions = get_sessions()
     if sessions:
-        _current_port = sessions[0].get("port", BASE_PORT)
+        _current_port = sessions[0].get("port", new_port)
         _current_pipe_name = sessions[0].get("pipe_name")
 
     result = describe_gateway()
@@ -927,12 +1413,17 @@ def set_guest_host(host: str, port=None, persist: bool = False) -> dict:
         "persisted_to": persisted_to,
         "sessions": sessions,
     })
+    if discovery is not None:
+        result["discovery"] = {k: discovery[k] for k in ("scanned_networks", "hosts_probed", "elapsed_seconds")}
+    if warnings:
+        result["warnings"] = warnings
     if not sessions:
         result["hint"] = (
-            f"No dbgx-mcp sessions answered at {GUEST_IP} (ports {BASE_PORT}-{BASE_PORT + 10}). Check that the "
+            f"No dbgx-mcp sessions answered at {new_host} (ports {new_port}-{new_port + 10}). Check that the "
             "extension is loaded in WinDbg with WINDBG_MCP_BIND set to a reachable interface and that the "
             "firewall allows the port."
         )
+        result["next_steps"] = _no_sessions_next_steps(new_host, new_port)
     return result
 
 
@@ -945,10 +1436,13 @@ def handle_set_guest_host(req_id, tool_args, output_stream):
             persist=bool(tool_args.get("persist", False)),
         )
     except ValueError as e:
-        return _tool_error(req_id, -32602, str(e))
+        return _tool_failure(
+            req_id, "invalid_host", str(e),
+            next_steps=["Ask the user for the debugger VM's IP, or call windbg.discover_guests to sweep the lab subnets."],
+        )
     except Exception as e:
         log(f"SET_GUEST_HOST ERROR: {e}")
-        return _tool_error(req_id, -32000, f"Failed to switch guest host: {e}")
+        return _tool_failure(req_id, "switch_failed", f"Failed to switch guest host: {e}")
     if result.get("changed"):
         send_notification(output_stream, "notifications/tools/list_changed")
     return _tool_text_result(req_id, result)
@@ -957,238 +1451,298 @@ def handle_set_guest_host(req_id, tool_args, output_stream):
 # MAIN STRATEGIC DISPATCH
 # ====================================================================
 
-def handle_request(line, output_stream):
-    """Processes an individual JSON-RPC request from start to finish."""
+def _normalize_tool_name(name: str) -> str:
+    return "windbg." + name[7:] if name.startswith("windbg_") else name
+
+
+def _cache_session_key(target_session: dict, target_port) -> str:
+    return session_key(target_session) if target_session.get("pid") else f"{target_port}:0"
+
+
+def _invalidate_session_cache(skey: str):
+    with _cache_lock:
+        for key in [k for k in _command_cache if k[0] == skey]:
+            del _command_cache[key]
+
+
+def _resolve_target_session(target_port) -> dict | None:
+    """Session dict for a port; refreshes discovery once if the port is unknown. None if still unknown."""
+    with _session_map_lock:
+        session = _session_map.get(target_port)
+    if session is None:
+        get_sessions()
+        with _session_map_lock:
+            session = _session_map.get(target_port)
+    return session
+
+
+def _synthetic_initialize(req_id, requested_version) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "protocolVersion": requested_version,
+            "capabilities": {"tools": {"listChanged": True}},
+            "serverInfo": {"name": "windbg-bridge-gateway", "version": "1.3.0"},
+            "instructions": SERVER_INSTRUCTIONS,
+        },
+    }
+
+
+def _handle_initialize(req_id, req_data, line, output_stream):
     global _current_port, _current_pipe_name
+    params = req_data.get("params", {})
+    requested_version = params.get("protocolVersion", "2024-11-05")
+    log(f"initialize: requested version {requested_version}, transport {TRANSPORT_MODE}")
+    sessions = get_sessions()
+    if not sessions:
+        # Nothing to forward to: answer immediately instead of waiting out a TCP timeout (A6).
+        log("initialize: no active sessions; returning synthetic handshake")
+        send_response(output_stream, _synthetic_initialize(req_id, requested_version))
+        return
+
+    active_session = sessions[0]
+    _current_port = active_session.get("port", BASE_PORT)
+    _current_pipe_name = active_session.get("pipe_name")
+    try:
+        resp_bytes, _ = forward_mcp_message(active_session, line.encode("utf-8"), timeout=15.0, retry_safe=True)
+        resp_data = json.loads(resp_bytes.decode("utf-8"))
+        result = resp_data.get("result")
+        if isinstance(result, dict):
+            result["protocolVersion"] = requested_version
+            result.setdefault("capabilities", {})["tools"] = {"listChanged": True}
+            result.setdefault("instructions", SERVER_INSTRUCTIONS)
+            log(f"Backend init successful on :{_current_port}")
+        send_response(output_stream, resp_data)
+    except Exception as e:
+        log(f"INIT BACKEND FAIL on :{_current_port}: {e}. Returning synthetic success.")
+        send_response(output_stream, _synthetic_initialize(req_id, requested_version))
+
+
+def _handle_tools_list(req_id, line, output_stream):
+    sessions = get_sessions()
+    tools = None
+    if sessions:
+        try:
+            resp_bytes, _ = forward_mcp_message(sessions[0], line.encode("utf-8"), timeout=15.0, retry_safe=True)
+            resp_data = json.loads(resp_bytes.decode("utf-8"))
+            tools = resp_data.get("result", {}).get("tools")
+        except Exception as e:
+            log(f"TOOLS/LIST BACKEND FAIL on :{sessions[0].get('port')}: {e}. Returning full catalog.")
+    if not isinstance(tools, list):
+        tools = get_default_tools_list()
+    else:
+        for tool in tools:
+            if tool.get("name", "").startswith(("windbg.", "windbg_")):
+                props = tool.setdefault("inputSchema", {}).setdefault("properties", {})
+                props["session_id"] = {
+                    "type": "integer",
+                    "description": "Port of target WinDbg session. Find via windbg.list_sessions.",
+                }
+        tools.extend(BRIDGE_LOCAL_TOOLS)
+    for tool in tools:
+        annotate_tool(tool)
+    send_response(output_stream, {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}})
+
+
+def _unreachable_failure(req_id, target_port, error: str):
+    host, base_port = current_endpoint()
+    sessions_now = get_sessions()
+    next_steps = []
+    if sessions_now:
+        ports = [s.get("port") for s in sessions_now]
+        next_steps.append(f"Session on port {target_port} is gone; live sessions are {ports}. Pass one as session_id, or omit session_id to use the default.")
+    else:
+        next_steps.extend(_no_sessions_next_steps(host, base_port))
+    return _tool_failure(
+        req_id, "backend_unreachable", f"WinDbg session on {host}:{target_port} did not answer: {error}",
+        next_steps=next_steps, guest_host=host, port=target_port, sessions_now=sessions_now,
+    )
+
+
+def _handle_tools_call(req_id, req_data, line, output_stream):
+    params = req_data.get("params", {})
+    raw_tool_name = params.get("name", "")
+    tool_name = _normalize_tool_name(raw_tool_name)
+    if tool_name != raw_tool_name:
+        req_data["params"]["name"] = tool_name
+        line = json.dumps(req_data)
+    tool_args = params.get("arguments") or {}
+    if not isinstance(tool_args, dict):
+        send_response(output_stream, _rpc_error(req_id, -32602, "params.arguments must be an object"))
+        return
+
+    # Bridge-local tools (never forwarded)
+    if tool_name in ("windbg.list_sessions", "list_sessions"):
+        send_response(output_stream, handle_list_sessions(req_id))
+        return
+    if tool_name in ("windbg.set_guest_host", "set_guest_host"):
+        send_response(output_stream, handle_set_guest_host(req_id, tool_args, output_stream))
+        return
+    if tool_name in ("windbg.discover_guests", "discover_guests"):
+        send_response(output_stream, handle_discover_guests(req_id, tool_args))
+        return
+
+    # Session routing
+    explicit_session = "session_id" in tool_args
+    target_port = tool_args.pop("session_id", _current_port)
+    if explicit_session:
+        req_data["params"]["arguments"] = tool_args
+        line = json.dumps(req_data)
+        if isinstance(target_port, bool) or not isinstance(target_port, int):
+            send_response(output_stream, _tool_failure(
+                req_id, "invalid_session_id", "session_id must be the integer port of a session from windbg.list_sessions",
+                sessions_now=get_sessions(),
+            ))
+            return
+    target_session = _resolve_target_session(target_port)
+    if target_session is None:
+        if explicit_session:
+            send_response(output_stream, _tool_failure(
+                req_id, "unknown_session", f"No WinDbg session is listening on port {target_port}.",
+                next_steps=["Call windbg.list_sessions and pass one of the returned ports as session_id."],
+                sessions_now=get_sessions(),
+            ))
+            return
+        target_session = {"port": target_port, "pipe_name": f"dbgx-mcp-{target_port}"}
+    skey = _cache_session_key(target_session, target_port)
+
+    # Guardrail + cache (eval only)
+    command = ""
+    if tool_name == "windbg.eval":
+        command = tool_args.get("command", "") or ""
+        detail = validate_command_detail(command)
+        if detail is not None:
+            log(f"GUARDRAIL BLOCKED: '{command}'")
+            send_response(output_stream, _tool_failure(
+                req_id, "command_blocked", detail["reason"],
+                next_steps=[detail["alternative"]] if detail["alternative"] else None,
+                blocked=detail["blocked"], command=command,
+            ))
+            return
+        ttl = get_cache_ttl(command)
+        if ttl > 0.0:
+            with _cache_lock:
+                cached_item = _command_cache.get((skey, command.strip()))
+            if cached_item and time.time() - cached_item[0] < ttl:
+                log(f"CACHE HIT: '{command}' on {skey}")
+                resp_to_send = dict(cached_item[1])
+                resp_to_send["id"] = req_id
+                send_response(output_stream, resp_to_send)
+                return
+
+    mutates = tool_mutates(tool_name, tool_args)
+    retry_safe = tool_is_retry_safe(tool_name, tool_args)
+    req_timeout = get_timeout_for_request(req_data)
+    label = f"{tool_name} {command}".strip() if command else tool_name
+    log(f"FORWARD: {label!r} -> {skey} timeout={req_timeout}s mutates={mutates} retry_safe={retry_safe}")
+    try:
+        with ProgressHeartbeat(output_stream, req_data, label, req_timeout):
+            resp_bytes, _ = forward_mcp_message(target_session, line.encode("utf-8"), timeout=req_timeout, retry_safe=retry_safe)
+    except BackendTimeout as e:
+        if mutates:
+            _invalidate_session_cache(skey)
+        send_response(output_stream, _tool_failure(
+            req_id, "backend_timeout", str(e),
+            next_steps=[
+                "The command was delivered and may still be running in WinDbg; it was NOT retried.",
+                "Call windbg.get_execution_state; if the target is running, use windbg.interrupt before issuing more commands.",
+            ],
+            port=target_port, timeout_seconds=req_timeout, command=command or None,
+        ))
+        return
+    except Exception as e:
+        log(f"FORWARD ERROR to target {target_port}: {e}")
+        send_response(output_stream, _unreachable_failure(req_id, target_port, str(e)))
+        return
+
+    if mutates:
+        _invalidate_session_cache(skey)
+
+    if not resp_bytes:
+        log(f"Empty response from :{target_port}")
+        if req_id is not None:
+            send_response(output_stream, {"jsonrpc": "2.0", "id": req_id, "result": {}})
+        return
+
+    try:
+        resp_json = json.loads(resp_bytes.decode("utf-8"))
+    except ValueError as e:
+        send_response(output_stream, _tool_failure(req_id, "bad_backend_response", f"Server on port {target_port} returned non-JSON: {e}"))
+        return
+
+    if tool_name == "windbg.eval":
+        result = resp_json.get("result")
+        if isinstance(result, dict) and not result.get("isError"):
+            ttl = get_cache_ttl(command)
+            if ttl > 0.0 and not mutates:
+                with _cache_lock:
+                    _command_cache[(skey, command.strip())] = (time.time(), resp_json)
+                log(f"CACHED: '{command}' on {skey} (TTL: {ttl}s)")
+        elif "error" in resp_json:
+            err_msg = resp_json["error"].get("message", "")
+            suggestions = enrich_error_response(command, err_msg)
+            if suggestions:
+                resp_json["error"]["suggestions"] = suggestions
+                log(f"ENRICHED ERROR: '{command}' suggestions={suggestions}")
+
+    if req_id is not None:
+        send_response(output_stream, resp_json)
+
+
+def _handle_passthrough(req_id, method, line, output_stream):
+    """Any other method (notifications/initialized, resources/*, prompts/*...) goes to the default session."""
+    target_port = _current_port
+    with _session_map_lock:
+        target_session = _session_map.get(target_port, {"port": target_port, "pipe_name": f"dbgx-mcp-{target_port}"})
+    try:
+        resp_bytes, _ = forward_mcp_message(target_session, line.encode("utf-8"), timeout=60.0, retry_safe=True)
+    except Exception as e:
+        log(f"FORWARD ERROR ({method}) to target {target_port}: {e}")
+        if req_id is not None:
+            send_response(output_stream, _rpc_error(req_id, -32000, f"Backend :{target_port} unreachable: {e}"))
+        return
+    if req_id is None:
+        log(f"Notification '{method}' forwarded; suppressing backend reply")
+        return
+    if not resp_bytes:
+        send_response(output_stream, {"jsonrpc": "2.0", "id": req_id, "result": {}})
+        return
+    try:
+        send_response(output_stream, json.loads(resp_bytes.decode("utf-8")))
+    except ValueError as e:
+        send_response(output_stream, _rpc_error(req_id, -32603, f"Backend returned non-JSON: {e}"))
+
+
+def handle_request(line, output_stream):
+    """Processes an individual JSON-RPC request from start to finish. Every request with an id gets a reply."""
+    req_id = None
     try:
         req_data = json.loads(line)
+        if not isinstance(req_data, dict):
+            raise ValueError("JSON-RPC message must be an object")
+    except ValueError as e:
+        send_response(output_stream, _rpc_error(None, -32700, f"Parse error: {e}"))
+        return
+    try:
         req_id = req_data.get("id")
         method = req_data.get("method")
-        params = req_data.get("params", {})
         log(f"REQ: {method} (id: {req_id})")
 
-        # 1. Handle local gateway heartbeats
         if method == "ping":
             send_response(output_stream, {"jsonrpc": "2.0", "id": req_id, "result": {}})
-            return
-
-        # 2. Handle Handshake/Initialization
-        if method == "initialize":
-            requested_version = params.get("protocolVersion", "2024-11-05")
-            log(
-                f"Searching for active WinDbg sessions (Requested version: {requested_version}, Transport: {TRANSPORT_MODE})..."
-            )
-            sessions = get_sessions()
-            active_session = None
-            if sessions:
-                active_session = sessions[0]
-                _current_port = active_session.get("port", BASE_PORT)
-                _current_pipe_name = active_session.get("pipe_name")
-                log(f"Found active session on port :{_current_port} (pipe: {_current_pipe_name}). Using as default.")
-            else:
-                log(f"No active sessions found. Falling back to base port :{BASE_PORT}")
-                active_session = {"port": BASE_PORT, "pipe_name": f"dbgx-mcp-{BASE_PORT}"}
-
-            try:
-                resp_bytes, status = forward_mcp_message(
-                    active_session, line.encode("utf-8"), timeout=60.0
-                )
-                resp_data = json.loads(resp_bytes.decode("utf-8"))
-                if "result" in resp_data:
-                    resp_data["result"]["protocolVersion"] = requested_version
-
-                    if "capabilities" in resp_data["result"]:
-                        caps = resp_data["result"]["capabilities"]
-                        caps["tools"] = {"listChanged": True}
-                        log(f"Backend init successful on :{_current_port}")
-
-                send_response(output_stream, resp_data)
-            except Exception as e:
-                log(
-                    f"INIT BACKEND FAIL on :{_current_port}: {e}. Returning synthetic success."
-                )
-                synthetic = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "protocolVersion": requested_version,
-                        "capabilities": {"tools": {"listChanged": True}},
-                        "serverInfo": {
-                            "name": "windbg-bridge-gateway",
-                            "version": "1.2.0",
-                        },
-                    },
-                }
-                send_response(output_stream, synthetic)
-            return
-
-        # 3. Handle Tool Discovery
-        if method == "tools/list":
-            sessions = get_sessions()
-            active_session = sessions[0] if sessions else {"port": _current_port, "pipe_name": _current_pipe_name}
-            try:
-                resp_bytes, status = forward_mcp_message(
-                    active_session, line.encode("utf-8"), timeout=60.0
-                )
-                resp_data = json.loads(resp_bytes.decode("utf-8"))
-                if "result" in resp_data and "tools" in resp_data["result"]:
-                    for tool in resp_data["result"]["tools"]:
-                        if tool["name"].startswith("windbg.") or tool["name"].startswith("windbg_"):
-                            props = tool.setdefault("inputSchema", {}).setdefault(
-                                "properties", {}
-                            )
-                            props["session_id"] = {
-                                "type": "integer",
-                                "description": (
-                                    "Port of target WinDbg session. "
-                                    "Find via windbg.list_sessions."
-                                ),
-                            }
-
-                    resp_data["result"]["tools"].extend(BRIDGE_LOCAL_TOOLS)
-                send_response(output_stream, resp_data)
-            except Exception as e:
-                log(f"TOOLS/LIST BACKEND FAIL on :{_current_port}: {e}. Returning full catalog.")
-                send_response(
-                    output_stream,
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "tools": get_default_tools_list()
-                        },
-                    },
-                )
-            return
-
-        # 4. Handle Execution
-        if method == "tools/call":
-            raw_tool_name = params.get("name", "")
-            tool_name = raw_tool_name
-            # Normalize tool_name if client uses underscore notation
-            if tool_name.startswith("windbg_"):
-                tool_name = "windbg." + tool_name[7:]
-                req_data["params"]["name"] = tool_name
-                line = json.dumps(req_data)
-
-            tool_args = params.get("arguments", {})
-
-            if tool_name in ("windbg.list_sessions", "list_sessions"):
-                send_response(output_stream, handle_list_sessions(req_id))
-                return
-
-            if tool_name in ("windbg.set_guest_host", "set_guest_host"):
-                send_response(output_stream, handle_set_guest_host(req_id, tool_args, output_stream))
-                return
-
-            target_port = tool_args.get("session_id", _current_port)
-            if "session_id" in tool_args:
-                del tool_args["session_id"]
-                req_data["params"]["arguments"] = tool_args
-                line = json.dumps(req_data)
-
-            # Resolve target session metadata
-            with _session_map_lock:
-                target_session = _session_map.get(target_port, {"port": target_port, "pipe_name": f"dbgx-mcp-{target_port}"})
-
-            # --- GUARDRAIL INTERCEPTOR ---
-            if tool_name == "windbg.eval":
-                command = tool_args.get("command", "")
-                is_safe, guard_err = validate_command(command)
-                if not is_safe:
-                    log(f"GUARDRAIL BLOCKED: '{command}'")
-                    send_response(output_stream, {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32602,
-                            "message": guard_err
-                        }
-                    })
-                    return
-
-                # --- SMART TTL CACHE INTERCEPTOR ---
-                ttl = get_cache_ttl(command)
-                if ttl > 0.0:
-                    cache_key = (target_port, command.strip())
-                    with _cache_lock:
-                        cached_item = _command_cache.get(cache_key)
-                        if cached_item:
-                            cache_time, cached_res = cached_item
-                            if time.time() - cache_time < ttl:
-                                log(f"CACHE HIT: '{command}' on :{target_port}")
-                                resp_to_send = dict(cached_res)
-                                resp_to_send["id"] = req_id
-                                send_response(output_stream, resp_to_send)
-                                return
+        elif method == "initialize":
+            _handle_initialize(req_id, req_data, line, output_stream)
+        elif method == "tools/list":
+            _handle_tools_list(req_id, line, output_stream)
+        elif method == "tools/call":
+            _handle_tools_call(req_id, req_data, line, output_stream)
         else:
-            target_port = _current_port
-            with _session_map_lock:
-                target_session = _session_map.get(target_port, {"port": target_port, "pipe_name": f"dbgx-mcp-{target_port}"})
-
-        # Forwarding to Backend via Pipe / HTTP
-        try:
-            req_timeout = get_timeout_for_request(req_data)
-            log(f"FORWARD: using adaptive timeout {req_timeout}s for tool/command on target {target_port}")
-            resp_bytes, status = forward_mcp_message(
-                target_session, line.encode("utf-8"), timeout=req_timeout
-            )
-            if resp_bytes:
-                resp_json = json.loads(resp_bytes.decode("utf-8"))
-
-                # Intercept results to cache or enrich errors
-                if method == "tools/call":
-                    raw_tool_name = params.get("name", "")
-                    tool_name = "windbg." + raw_tool_name[7:] if raw_tool_name.startswith("windbg_") else raw_tool_name
-
-                    if tool_name == "windbg.eval":
-                        command = tool_args.get("command", "")
-
-                        # Populate cache on success
-                        if "result" in resp_json:
-                            ttl = get_cache_ttl(command)
-                            if ttl > 0.0:
-                                cache_key = (target_port, command.strip())
-                                with _cache_lock:
-                                    _command_cache[cache_key] = (time.time(), resp_json)
-                                    log(f"CACHED: '{command}' on :{target_port} (TTL: {ttl}s)")
-
-                        # Enrich syntax/runtime errors with actionable recommendations
-                        elif "error" in resp_json:
-                            err_msg = resp_json["error"].get("message", "")
-                            suggestions = enrich_error_response(command, err_msg)
-                            if suggestions:
-                                resp_json["error"]["suggestions"] = suggestions
-                                log(f"ENRICHED ERROR: '{command}' suggestions={suggestions}")
-
-                if req_id is not None:
-                    send_response(output_stream, resp_json)
-                else:
-                    log(f"Notification '{method}' forwarded; suppressing backend reply")
-            else:
-                log(f"Empty response from :{target_port}")
-                if req_id is not None:
-                    send_response(
-                        output_stream,
-                        {"jsonrpc": "2.0", "id": req_id, "result": {}},
-                    )
-        except Exception as e:
-            log(f"FORWARD ERROR to target {target_port}: {e}")
-            if req_id is not None:
-                send_response(
-                    output_stream,
-                    {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32000,
-                            "message": f"Backend :{target_port} unreachable: {e}",
-                        },
-                    },
-                )
-
+            _handle_passthrough(req_id, method, line, output_stream)
     except Exception as e:
-        log(f"GLOBAL BRIDGE REQUEST ERROR: {e}")
+        log(f"GLOBAL BRIDGE REQUEST ERROR: {e!r}")
+        if req_id is not None:
+            send_response(output_stream, _rpc_error(req_id, -32603, f"Bridge internal error: {e}"))
 
 
 _global_mutex_handle = None
@@ -1305,6 +1859,13 @@ def main():
         except Exception as e:
             log(f"Stdin read loop error: {e}")
             break
+
+    # The client is gone: nothing in flight can be delivered, so do not wait for long-running
+    # forwards (a 20-minute .reload would otherwise keep a zombie bridge alive).
+    _request_executor.shutdown(wait=False, cancel_futures=True)
+    release_global_mutex()
+    log("Bridge Gateway stopped")
+    os._exit(0)
 
 
 if __name__ == "__main__":
