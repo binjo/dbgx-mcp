@@ -740,6 +740,25 @@ class TestDispatch(unittest.TestCase):
         self._call(1, "windbg.eval", {"command": "k"})
         self.assertNotIn("notifications/progress", self.out.getvalue())
 
+    def test_notification_roots_list_changed_produces_no_response(self):
+        bridge.handle_request('{"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}', self.out)
+        self.assertEqual(self.out.getvalue(), "")
+        self.assertEqual(self.forwarded, [])
+
+    def test_notification_initialized_produces_no_response(self):
+        bridge.handle_request('{"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}', self.out)
+        self.assertEqual(self.out.getvalue(), "")
+        self.assertEqual(self.forwarded, [])
+
+    def test_send_response_suppresses_null_id(self):
+        # Normal response with null id should be suppressed
+        bridge.send_response(self.out, {"jsonrpc": "2.0", "id": None, "error": {"code": -32601, "message": "Method not found"}})
+        self.assertEqual(self.out.getvalue(), "")
+
+        # But parse error (-32700) or invalid request (-32600) with null id is permitted
+        bridge.send_response(self.out, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+        self.assertIn("-32700", self.out.getvalue())
+
 
 class TestDiscovery(unittest.TestCase):
     def test_discover_guests_with_stubbed_network(self):

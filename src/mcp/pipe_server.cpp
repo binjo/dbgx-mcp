@@ -280,6 +280,10 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
                   "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Handler not available\"}}";
             }
 
+            if (response_line.empty()) {
+              continue;
+            }
+
             response_line.push_back('\n');
 
             DWORD total_written = 0;

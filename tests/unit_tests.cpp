@@ -350,6 +350,30 @@ void TestInitializedNotification(int* failures) {
   Expect(result.body.empty(), "initialized notification payload should be empty", failures);
 }
 
+void TestNotificationRootsListChanged(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result =
+      router.HandleJsonRpcPost(R"({"jsonrpc":"2.0","method":"notifications/roots/list_changed","params":{}})");
+
+  Expect(result.status_code == 202, "roots/list_changed notification should return HTTP 202", failures);
+  Expect(!result.has_body, "roots/list_changed notification should return empty body", failures);
+  Expect(result.body.empty(), "roots/list_changed notification payload should be empty", failures);
+}
+
+void TestNotificationUnknownMethod(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  const dbgx::mcp::JsonRpcHttpResult result =
+      router.HandleJsonRpcPost(R"({"jsonrpc":"2.0","method":"unknown/notification","params":{}})");
+
+  Expect(result.status_code == 202, "unknown notification should return HTTP 202", failures);
+  Expect(!result.has_body, "unknown notification should return empty body", failures);
+  Expect(result.body.empty(), "unknown notification payload should be empty", failures);
+}
+
 void TestParseError(int* failures) {
   FakeExecutor executor;
   dbgx::mcp::JsonRpcRouter router(&executor);
@@ -998,6 +1022,8 @@ int main() {
   TestToolsCallWithOptions(&failures);
   TestUnknownMethod(&failures);
   TestInitializedNotification(&failures);
+  TestNotificationRootsListChanged(&failures);
+  TestNotificationUnknownMethod(&failures);
   TestParseError(&failures);
   TestHttpServerStartBindsWithoutConflict(&failures);
   TestHttpServerFallbackAfterPortConflict(&failures);

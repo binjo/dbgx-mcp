@@ -568,6 +568,14 @@ def _stdout_broken():
 def send_response(output_stream, data):
     """Serializes and sends a JSON-RPC response to stdout thread-safely."""
     try:
+        # Notifications MUST NOT receive responses per JSON-RPC 2.0.
+        # Only parse errors (-32700) or invalid request errors (-32600) may have id=None.
+        if isinstance(data, dict) and data.get("id") is None:
+            err = data.get("error")
+            if not (isinstance(err, dict) and err.get("code") in (-32700, -32600)):
+                log(f"DROPPED INVALID RESPONSE TO NOTIFICATION (id=None): {data}")
+                return
+
         line = json.dumps(data)
     except (TypeError, ValueError) as e:
         log(f"SEND ERROR (serialize): {e}")
@@ -1396,9 +1404,9 @@ def set_guest_host(host: str, port=None, persist: bool = False) -> dict:
         if port is not None:
             persist_env_setting("WINDBG_MCP_PORT", str(new_port))
         shadowing = [k for k in os.environ if k.lower() in ("windbg_mcp_host", "windbg_mcp_bind")]
-        if shadowing:
+        for k in shadowing:
             warnings.append(
-                f"Environment variable {shadowing[0]} is set by the MCP client config and overrides the env file on the "
+                f"Environment variable {k} is set by the MCP client config and overrides the env file on the "
                 "next bridge start; remove it from the client config for the persisted host to take effect."
             )
 
@@ -1728,6 +1736,14 @@ def handle_request(line, output_stream):
         req_id = req_data.get("id")
         method = req_data.get("method")
         log(f"REQ: {method} (id: {req_id})")
+
+        # Notifications (requests without an 'id' member per JSON-RPC 2.0) MUST NOT receive
+        # a response, and MUST NOT be sent into _pipe_round_trip (which holds the persistent
+        # pipe lock while waiting in ReadFile for a newline response that PipeServer never sends
+        # for notifications).
+        if "id" not in req_data or req_id is None:
+            log(f"NOTIFICATION RECEIVED: {method}")
+            return
 
         if method == "ping":
             send_response(output_stream, {"jsonrpc": "2.0", "id": req_id, "result": {}})

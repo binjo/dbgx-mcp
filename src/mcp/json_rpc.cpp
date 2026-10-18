@@ -1085,7 +1085,7 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
 
 MethodOutcome DispatchMethod(std::string_view method, const json::FieldMap& root_fields,
                              windbg::IWinDbgCommandExecutor* executor) {
-  if (method == "notifications/initialized" || method == "initialized") {
+  if (method.rfind("notifications/", 0) == 0 || method == "initialized") {
     return HandleInitializedNotification();
   }
   if (method == "initialize") {
@@ -1162,8 +1162,9 @@ JsonRpcHttpResult JsonRpcRouter::HandleJsonRpcPost(std::string_view request_body
   }
 
   if (!has_id) {
-    http_result.status_code = outcome.http_status_on_error;
-    http_result.body = BuildJsonRpcError("null", outcome.error_code, outcome.error_message);
+    http_result.status_code = 202;
+    http_result.has_body = false;
+    http_result.body.clear();
     return http_result;
   }
 
