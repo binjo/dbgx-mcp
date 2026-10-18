@@ -69,12 +69,16 @@ std::string StatusText(int status_code) {
       return "Accepted";
     case 400:
       return "Bad Request";
+    case 401:
+      return "Unauthorized";
     case 403:
       return "Forbidden";
     case 404:
       return "Not Found";
     case 405:
       return "Method Not Allowed";
+    case 413:
+      return "Payload Too Large";
     case 500:
       return "Internal Server Error";
     default:
@@ -301,6 +305,11 @@ std::string BuildHttpResponseText(const HttpResponse& response, bool keep_alive)
 
 }  // namespace
 
+struct ClientWorkerEntry {
+  std::thread thread;
+  std::shared_ptr<std::atomic<bool>> finished;
+};
+
 struct HttpServer::Impl {
   std::mutex mutex;
   std::atomic<bool> running{false};
@@ -313,8 +322,29 @@ struct HttpServer::Impl {
 
   std::mutex clients_mutex;
   std::vector<SOCKET> active_clients;
-  std::vector<std::thread> client_threads;
+  std::vector<ClientWorkerEntry> client_threads;
 };
+
+bool IsOriginHostEnd(std::string_view origin, std::size_t prefix_len) {
+  if (origin.size() == prefix_len) {
+    return true;
+  }
+  const char next = origin[prefix_len];
+  if (next == '/') {
+    return origin.size() == prefix_len + 1;
+  }
+  if (next != ':') {
+    return false;
+  }
+  std::size_t pos = prefix_len + 1;
+  if (pos >= origin.size()) {
+    return false;
+  }
+  while (pos < origin.size() && std::isdigit(static_cast<unsigned char>(origin[pos])) != 0) {
+    ++pos;
+  }
+  return pos == origin.size() || (pos + 1 == origin.size() && origin[pos] == '/');
+}
 
 bool IsOriginAllowed(std::string_view origin_header) {
   if (origin_header.empty()) {
@@ -322,11 +352,14 @@ bool IsOriginAllowed(std::string_view origin_header) {
   }
 
   const std::string lowered = ToLower(Trim(origin_header));
-  if (lowered.rfind("http://localhost", 0) == 0) {
-    return true;
-  }
-  if (lowered.rfind("http://127.0.0.1", 0) == 0) {
-    return true;
+  static constexpr std::string_view kAllowedPrefixes[] = {
+      "http://localhost",  "https://localhost",  "http://127.0.0.1",  "https://127.0.0.1",
+      "http://[::1]",      "https://[::1]",
+  };
+  for (std::string_view prefix : kAllowedPrefixes) {
+    if (lowered.rfind(prefix, 0) == 0 && IsOriginHostEnd(lowered, prefix.size())) {
+      return true;
+    }
   }
   return false;
 }
@@ -428,6 +461,10 @@ bool HttpServer::Start(const std::string& host, std::uint16_t port, HttpRequestH
       return fail_start("Failed to create listening socket (" + FormatSocketError(socket_error) + ")", socket_error);
     }
 
+    int exclusive = 1;
+    (void)setsockopt(listen_socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
+                     sizeof(exclusive));
+
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(last_attempted_port);
@@ -437,7 +474,7 @@ bool HttpServer::Start(const std::string& host, std::uint16_t port, HttpRequestH
       const int bind_error = WSAGetLastError();
       closesocket(listen_socket);
 
-      if (IsPortConflictError(bind_error)) {
+      if (IsPortConflictError(bind_error) || bind_error == WSAEACCES) {
         ++conflict_count;
         last_error_code = bind_error;
         continue;
@@ -491,21 +528,34 @@ bool HttpServer::Start(const std::string& host, std::uint16_t port, HttpRequestH
 
   impl_->worker = std::thread([this]() {
     while (!impl_->stop_requested.load()) {
+      SOCKET ls = impl_->listen_socket;
+      if (ls == INVALID_SOCKET) {
+        break;
+      }
       fd_set read_set;
       FD_ZERO(&read_set);
-      FD_SET(impl_->listen_socket, &read_set);
+      FD_SET(ls, &read_set);
 
       timeval timeout{};
       timeout.tv_sec = 0;
       timeout.tv_usec = 100000;
 
       const int select_result = select(0, &read_set, nullptr, nullptr, &timeout);
-      if (select_result <= 0) {
+      if (select_result < 0) {
+        if (impl_->stop_requested.load()) {
+          break;
+        }
+        continue;
+      }
+      if (select_result == 0) {
         continue;
       }
 
-      SOCKET client_socket = accept(impl_->listen_socket, nullptr, nullptr);
+      SOCKET client_socket = accept(ls, nullptr, nullptr);
       if (client_socket == INVALID_SOCKET) {
+        if (impl_->stop_requested.load()) {
+          break;
+        }
         continue;
       }
 
@@ -519,12 +569,25 @@ bool HttpServer::Start(const std::string& host, std::uint16_t port, HttpRequestH
       setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&socket_timeout_ms),
                  sizeof(socket_timeout_ms));
 
+      auto finished_flag = std::make_shared<std::atomic<bool>>(false);
+
       {
         std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
+        // Reap finished client threads to avoid leaking thread handles over long sessions
+        for (auto it = impl_->client_threads.begin(); it != impl_->client_threads.end();) {
+          if (it->finished && it->finished->load()) {
+            if (it->thread.joinable()) {
+              it->thread.join();
+            }
+            it = impl_->client_threads.erase(it);
+          } else {
+            ++it;
+          }
+        }
         impl_->active_clients.push_back(client_socket);
       }
 
-      std::thread client_thread([this, client_socket]() {
+      std::thread client_thread([this, client_socket, finished_flag]() {
         (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         std::string buffer;
         buffer.reserve(8192);
@@ -534,7 +597,18 @@ bool HttpServer::Start(const std::string& host, std::uint16_t port, HttpRequestH
           std::string parse_error;
           HttpResponse response;
           if (ReceiveRequest(client_socket, buffer, &request, &parse_error)) {
-            response = impl_->handler(request);
+            try {
+              response = impl_->handler(request);
+            } catch (const std::exception& e) {
+              response.status_code = 500;
+              response.body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal "
+                              "server exception\"}}";
+              (void)e;
+            } catch (...) {
+              response.status_code = 500;
+              response.body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal "
+                              "server exception\"}}";
+            }
           } else {
             // Socket closed or malformed request
             break;
@@ -559,9 +633,6 @@ bool HttpServer::Start(const std::string& host, std::uint16_t port, HttpRequestH
           }
         }
 
-        shutdown(client_socket, SD_BOTH);
-        closesocket(client_socket);
-
         {
           std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
           auto it = std::find(impl_->active_clients.begin(), impl_->active_clients.end(), client_socket);
@@ -570,12 +641,16 @@ bool HttpServer::Start(const std::string& host, std::uint16_t port, HttpRequestH
           }
         }
 
+        shutdown(client_socket, SD_BOTH);
+        closesocket(client_socket);
+
         CoUninitialize();
+        finished_flag->store(true);
       });
 
       {
         std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
-        impl_->client_threads.push_back(std::move(client_thread));
+        impl_->client_threads.push_back(ClientWorkerEntry{std::move(client_thread), std::move(finished_flag)});
       }
     }
 
@@ -603,13 +678,13 @@ void HttpServer::Stop() {
     impl_->listen_socket = INVALID_SOCKET;
   }
 
-  // Close all active client connections to unblock worker loops
+  // Shutdown all active client connections to unblock recv/send loops.
+  // Do NOT call closesocket() here — the owning client thread closes its socket to avoid handle-reuse races.
   {
     std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
     for (SOCKET client : impl_->active_clients) {
       if (client != INVALID_SOCKET) {
         shutdown(client, SD_BOTH);
-        closesocket(client);
       }
     }
   }
@@ -619,15 +694,16 @@ void HttpServer::Stop() {
   }
 
   // Join all client threads cleanly before unloading
+  std::vector<ClientWorkerEntry> threads_to_join;
   {
     std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
-    for (auto& th : impl_->client_threads) {
-      if (th.joinable()) {
-        th.join();
-      }
-    }
-    impl_->client_threads.clear();
+    threads_to_join = std::move(impl_->client_threads);
     impl_->active_clients.clear();
+  }
+  for (auto& entry : threads_to_join) {
+    if (entry.thread.joinable()) {
+      entry.thread.join();
+    }
   }
 
   impl_->running.store(false);

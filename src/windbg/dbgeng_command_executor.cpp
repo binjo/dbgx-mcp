@@ -24,6 +24,8 @@ namespace {
 
 class OutputCaptureCallbacks : public IDebugOutputCallbacks {
 public:
+  static constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
+
   OutputCaptureCallbacks(const CommandExecutionOptions& options = {})
       : ref_count_(1), options_(options), line_count_(0), truncated_(false) {}
 
@@ -51,6 +53,7 @@ public:
   }
 
   STDMETHOD(Output)(ULONG mask, PCSTR text) override {
+    (void)mask;
     if (text == nullptr) {
       return S_OK;
     }
@@ -59,36 +62,17 @@ public:
       return S_OK;
     }
 
-    std::string input(text);
-    std::size_t start = 0;
-    while (start < input.size()) {
-      std::size_t end = input.find('\n', start);
-      std::string line = (end == std::string::npos) ? input.substr(start) : input.substr(start, end - start + 1);
+    pending_line_.append(text);
+    if (pending_line_.size() > kMaxOutputBytes) {
+      FlushCompleteLine(pending_line_);
+      pending_line_.clear();
+    }
 
-      // Filter options
-      bool include_line = true;
-      if (!options_.pattern.empty()) {
-        if (line.find(options_.pattern) == std::string::npos) {
-          include_line = false;
-        }
-      }
-
-      if (include_line) {
-        output_ += line;
-        if (end != std::string::npos || (line.size() > 0 && line.back() == '\n')) {
-          line_count_++;
-          if (options_.max_lines > 0 && line_count_ >= options_.max_lines) {
-            output_ +=
-                "\n... [Output truncated after reaching max_lines limit: " + std::to_string(options_.max_lines) + "]\n";
-            truncated_ = true;
-            break;
-          }
-        }
-      }
-
-      if (end == std::string::npos)
-        break;
-      start = end + 1;
+    std::size_t newline_pos = 0;
+    while (!truncated_ && (newline_pos = pending_line_.find('\n')) != std::string::npos) {
+      std::string line = pending_line_.substr(0, newline_pos + 1);
+      pending_line_.erase(0, newline_pos + 1);
+      FlushCompleteLine(line);
     }
 
     return S_OK;
@@ -96,17 +80,50 @@ public:
 
   std::string TakeOutput() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!truncated_ && !pending_line_.empty()) {
+      FlushCompleteLine(pending_line_);
+      pending_line_.clear();
+    }
     return output_;
   }
 
 private:
+  void FlushCompleteLine(const std::string& line) {
+    if (truncated_) {
+      return;
+    }
+    if (!options_.pattern.empty() && line.find(options_.pattern) == std::string::npos) {
+      return;
+    }
+    if (output_.size() + line.size() > kMaxOutputBytes) {
+      const std::size_t remaining = output_.size() < kMaxOutputBytes ? (kMaxOutputBytes - output_.size()) : 0;
+      output_.append(line, 0, remaining);
+      output_ += "\n... [Output truncated after reaching 1MB byte limit]\n";
+      truncated_ = true;
+      return;
+    }
+    output_ += line;
+    line_count_++;
+    if (options_.max_lines > 0 && line_count_ >= options_.max_lines) {
+      output_ += "\n... [Output truncated after reaching max_lines limit: " + std::to_string(options_.max_lines) + "]\n";
+      truncated_ = true;
+    }
+  }
+
   volatile LONG ref_count_;
   std::mutex mutex_;
   std::string output_;
+  std::string pending_line_;
   CommandExecutionOptions options_;
   int line_count_;
   bool truncated_;
 };
+
+std::string FormatHexDisplacement(std::uint64_t disp) {
+  char buf[32] = {0};
+  snprintf(buf, sizeof(buf), "+0x%llx", static_cast<unsigned long long>(disp));
+  return std::string(buf);
+}
 
 std::string HResultToString(HRESULT hr) {
   char* raw = nullptr;
@@ -186,8 +203,7 @@ CommandExecutionResult DbgEngCommandExecutor::Execute(const std::string& command
 }
 
 CommandExecutionResult DbgEngCommandExecutor::DispatchToWorker(TaskFunction func, bool check_ready) {
-  std::promise<CommandExecutionResult> promise;
-  std::future<CommandExecutionResult> future = promise.get_future();
+  std::future<CommandExecutionResult> future;
 
   auto wrapped_task = [this, func = std::move(func), check_ready]() -> CommandExecutionResult {
     if (check_ready) {
@@ -217,7 +233,9 @@ CommandExecutionResult DbgEngCommandExecutor::DispatchToWorker(TaskFunction func
     if (shutdown_) {
       return {false, "", "Executor is shutting down"};
     }
-    task_queue_.push(ExecutionTask{std::move(wrapped_task), std::move(promise), true});
+    std::promise<CommandExecutionResult> task_promise;
+    future = task_promise.get_future();
+    task_queue_.push(ExecutionTask{std::move(wrapped_task), std::move(task_promise), true});
   }
   cv_.notify_one();
   return future.get();
@@ -228,7 +246,10 @@ void DbgEngCommandExecutor::WorkerThreadProc() {
 
   if (SUCCEEDED(DebugCreate(__uuidof(IDebugClient), reinterpret_cast<void**>(worker_client_.GetAddressOf())))) {
     (void)worker_client_.As(&worker_control_);
-    (void)worker_client_.As(&interrupt_control_);
+    {
+      std::lock_guard<std::mutex> int_lock(interrupt_mutex_);
+      (void)worker_client_.As(&interrupt_control_);
+    }
     (void)worker_client_.As(&worker_data_);
     (void)worker_client_.As(&worker_symbols_);
     (void)worker_client_.As(&worker_registers_);
@@ -247,17 +268,27 @@ void DbgEngCommandExecutor::WorkerThreadProc() {
       task_queue_.pop();
     }
 
-    CommandExecutionResult result = task.func();
+    CommandExecutionResult result;
+    try {
+      result = task.func();
+    } catch (const std::exception& e) {
+      result = {false, "", std::string("Unhandled worker exception: ") + e.what()};
+    } catch (...) {
+      result = {false, "", "Unhandled unknown worker exception"};
+    }
     if (task.has_promise) {
-      task.promise.set_value(result);
+      task.promise.set_value(std::move(result));
     }
   }
 
+  {
+    std::lock_guard<std::mutex> int_lock(interrupt_mutex_);
+    interrupt_control_.Reset();
+  }
   worker_systems_.Reset();
   worker_registers_.Reset();
   worker_symbols_.Reset();
   worker_data_.Reset();
-  interrupt_control_.Reset();
   worker_control_.Reset();
   worker_client_.Reset();
 
@@ -328,15 +359,14 @@ CommandExecutionResult DbgEngCommandExecutor::ExecuteSynchronously(const std::st
 }
 
 DebuggerExecutionState DbgEngCommandExecutor::GetExecutionState() {
-  if (worker_control_ != nullptr) {
-    ULONG raw_status = 0;
-    if (SUCCEEDED(worker_control_->GetExecutionStatus(&raw_status))) {
-      return ParseRawStatus(raw_status);
-    }
+  Microsoft::WRL::ComPtr<IDebugControl> control;
+  {
+    std::lock_guard<std::mutex> int_lock(interrupt_mutex_);
+    control = interrupt_control_;
   }
-  if (interrupt_control_ != nullptr) {
+  if (control != nullptr) {
     ULONG raw_status = 0;
-    if (SUCCEEDED(interrupt_control_->GetExecutionStatus(&raw_status))) {
+    if (SUCCEEDED(control->GetExecutionStatus(&raw_status))) {
       return ParseRawStatus(raw_status);
     }
   }
@@ -348,7 +378,11 @@ bool DbgEngCommandExecutor::InterruptTarget() {
   // blocked and the whole point is to break the engine out of a running state.
   // Only GetExecutionStatus / SetInterrupt are used here, both of which are safe to
   // call from any thread on any client.
-  Microsoft::WRL::ComPtr<IDebugControl> control = interrupt_control_ != nullptr ? interrupt_control_ : worker_control_;
+  Microsoft::WRL::ComPtr<IDebugControl> control;
+  {
+    std::lock_guard<std::mutex> int_lock(interrupt_mutex_);
+    control = interrupt_control_;
+  }
   if (control == nullptr) {
     return false;
   }
@@ -526,7 +560,7 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously(bo
       if (SUCCEEDED(symbols->GetNameByOffset(ip, sym_name, sizeof(sym_name), nullptr, &disp))) {
         std::string sym = sym_name;
         if (disp > 0)
-          sym += "+0x" + std::to_string(disp);
+          sym += FormatHexDisplacement(disp);
         writer.Key("symbol");
         writer.StringValue(sym);
       }
@@ -534,7 +568,7 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously(bo
     char disasm[256] = {0};
     ULONG disasm_size = 0;
     ULONG64 next_ip = 0;
-    if (SUCCEEDED(control->Disassemble(ip, 0, disasm, sizeof(disasm), &disasm_size, &next_ip))) {
+    if (control != nullptr && SUCCEEDED(control->Disassemble(ip, 0, disasm, sizeof(disasm), &disasm_size, &next_ip))) {
       std::string line = disasm;
       while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
         line.pop_back();
@@ -576,7 +610,7 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously(bo
         if (!include_all_registers && !IsPrimaryRegister(name)) {
           continue;
         }
-        DEBUG_VALUE val;
+        DEBUG_VALUE val{};
         if (SUCCEEDED(registers->GetValue(i, &val))) {
           if (val.Type == DEBUG_VALUE_INT64) {
             writer.Key(name);
@@ -584,6 +618,30 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously(bo
           } else if (val.Type == DEBUG_VALUE_INT32) {
             writer.Key(name);
             writer.HexValue(val.I32);
+          } else if (val.Type == DEBUG_VALUE_INT16) {
+            writer.Key(name);
+            writer.HexValue(val.I16);
+          } else if (val.Type == DEBUG_VALUE_INT8) {
+            writer.Key(name);
+            writer.HexValue(val.I8);
+          } else if (val.Type == DEBUG_VALUE_FLOAT32) {
+            writer.Key(name);
+            writer.StringValue(std::to_string(val.F32));
+          } else if (val.Type == DEBUG_VALUE_FLOAT64) {
+            writer.Key(name);
+            writer.StringValue(std::to_string(val.F64));
+          } else if (val.Type == DEBUG_VALUE_VECTOR64 || val.Type == DEBUG_VALUE_VECTOR128) {
+            const size_t vec_bytes = (val.Type == DEBUG_VALUE_VECTOR128) ? 16 : 8;
+            static const char* kHex = "0123456789abcdef";
+            std::string vec_str = "0x";
+            vec_str.reserve(2 + vec_bytes * 2);
+            for (size_t b = 0; b < vec_bytes; ++b) {
+              unsigned char byte = val.RawBytes[vec_bytes - 1 - b];
+              vec_str.push_back(kHex[byte >> 4]);
+              vec_str.push_back(kHex[byte & 0x0f]);
+            }
+            writer.Key(name);
+            writer.StringValue(vec_str);
           }
         }
       }
@@ -611,7 +669,7 @@ CommandExecutionResult DbgEngCommandExecutor::GetContextSnapshotSynchronously(bo
             writer.Key("symbol");
             std::string sym = name;
             if (disp > 0)
-              sym += "+0x" + std::to_string(disp);
+              sym += FormatHexDisplacement(disp);
             writer.StringValue(sym);
           }
         }
@@ -679,8 +737,13 @@ CommandExecutionResult DbgEngCommandExecutor::CarvePESynchronously(std::uint64_t
   }
 
   // Limit raw read to 10MB to avoid excessive heap allocations
-  if (length > 10 * 1024 * 1024)
-    length = 10 * 1024 * 1024;
+  constexpr std::uint32_t kMaxCarveSize = 10 * 1024 * 1024;
+  if (length == 0) {
+    return {false, "", "Length must be greater than 0"};
+  }
+  if (length > kMaxCarveSize) {
+    length = kMaxCarveSize;
+  }
   std::vector<unsigned char> mem_data(length);
   ULONG bytes_read = 0;
   HRESULT hr = data->ReadVirtual(address, mem_data.data(), length, &bytes_read);
@@ -695,7 +758,7 @@ CommandExecutionResult DbgEngCommandExecutor::CarvePESynchronously(std::uint64_t
 
   std::uint32_t pe_offset = 0;
   std::memcpy(&pe_offset, &mem_data[0x3c], 4);
-  if (pe_offset + 248 > mem_data.size()) {
+  if (static_cast<std::uint64_t>(pe_offset) + 248ULL > mem_data.size()) {
     return {false, "", "PE offset goes out of bounds"};
   }
 
@@ -706,12 +769,16 @@ CommandExecutionResult DbgEngCommandExecutor::CarvePESynchronously(std::uint64_t
 
   std::uint16_t num_sections = 0;
   std::memcpy(&num_sections, &mem_data[pe_offset + 6], 2);
+  if (num_sections == 0 || num_sections > 96) {
+    return {false, "", "Invalid PE section count"};
+  }
 
   std::uint16_t optional_header_size = 0;
   std::memcpy(&optional_header_size, &mem_data[pe_offset + 20], 2);
 
-  std::uint32_t section_tbl_offset = pe_offset + 24 + optional_header_size;
-  if (section_tbl_offset + (num_sections * 40) > mem_data.size()) {
+  std::uint64_t section_tbl_offset =
+      static_cast<std::uint64_t>(pe_offset) + 24ULL + static_cast<std::uint64_t>(optional_header_size);
+  if (section_tbl_offset + (static_cast<std::uint64_t>(num_sections) * 40ULL) > mem_data.size()) {
     return {false, "", "Section table goes out of bounds"};
   }
 
@@ -724,12 +791,13 @@ CommandExecutionResult DbgEngCommandExecutor::CarvePESynchronously(std::uint64_t
   };
 
   std::vector<SectionInfo> sections;
-  std::uint32_t max_end_paddr = 0;
+  sections.reserve(num_sections);
+  std::uint64_t max_end_paddr = 0;
   std::uint32_t min_paddr = 0xffffffff;
 
   for (std::uint16_t i = 0; i < num_sections; ++i) {
-    std::uint32_t offset = section_tbl_offset + i * 40;
-    SectionInfo sect;
+    std::size_t offset = static_cast<std::size_t>(section_tbl_offset + static_cast<std::uint64_t>(i) * 40ULL);
+    SectionInfo sect{};
     std::memcpy(sect.name, &mem_data[offset], 8);
     std::memcpy(&sect.vsize, &mem_data[offset + 8], 4);
     std::memcpy(&sect.vaddr, &mem_data[offset + 12], 4);
@@ -737,41 +805,48 @@ CommandExecutionResult DbgEngCommandExecutor::CarvePESynchronously(std::uint64_t
     std::memcpy(&sect.paddr, &mem_data[offset + 20], 4);
 
     sections.push_back(sect);
-    if (sect.paddr + sect.psize > max_end_paddr) {
-      max_end_paddr = sect.paddr + sect.psize;
+    std::uint64_t end_paddr = static_cast<std::uint64_t>(sect.paddr) + static_cast<std::uint64_t>(sect.psize);
+    if (end_paddr > max_end_paddr) {
+      max_end_paddr = end_paddr;
     }
     if (sect.paddr < min_paddr && sect.paddr > 0) {
       min_paddr = sect.paddr;
     }
   }
 
-  if (sections.empty() || max_end_paddr == 0) {
+  constexpr std::uint64_t kMaxDiskImageBytes = 32ULL * 1024ULL * 1024ULL;
+  if (sections.empty() || max_end_paddr == 0 || max_end_paddr > kMaxDiskImageBytes) {
     return {false, "", "No sections found or invalid raw size"};
   }
 
-  std::uint32_t headers_size = (min_paddr == 0xffffffff) ? 0x200 : min_paddr;
+  std::size_t headers_size = (min_paddr == 0xffffffff) ? 0x200 : static_cast<std::size_t>(min_paddr);
   if (headers_size > mem_data.size()) {
-    headers_size = (std::uint32_t)mem_data.size();
+    headers_size = mem_data.size();
+  }
+  if (headers_size > static_cast<std::size_t>(max_end_paddr)) {
+    headers_size = static_cast<std::size_t>(max_end_paddr);
   }
 
-  std::vector<unsigned char> disk_data(max_end_paddr, 0);
+  std::vector<unsigned char> disk_data(static_cast<std::size_t>(max_end_paddr), 0);
 
   // 1. Copy headers
   std::memcpy(disk_data.data(), mem_data.data(), headers_size);
 
   // 2. Map sections from memory aligned view to file aligned view
   for (const auto& sect : sections) {
-    if (sect.vaddr >= mem_data.size()) {
+    if (sect.vaddr >= mem_data.size() || sect.paddr >= disk_data.size()) {
       continue;
     }
-    std::uint32_t copy_size = sect.psize;
-    if (sect.vaddr + copy_size > mem_data.size()) {
-      copy_size = (std::uint32_t)mem_data.size() - sect.vaddr;
+    std::uint64_t copy_size = sect.psize;
+    if (static_cast<std::uint64_t>(sect.vaddr) + copy_size > mem_data.size()) {
+      copy_size = mem_data.size() - static_cast<std::uint64_t>(sect.vaddr);
     }
-    if (sect.paddr + copy_size > disk_data.size()) {
-      copy_size = (std::uint32_t)disk_data.size() - sect.paddr;
+    if (static_cast<std::uint64_t>(sect.paddr) + copy_size > disk_data.size()) {
+      copy_size = disk_data.size() - static_cast<std::uint64_t>(sect.paddr);
     }
-    std::memcpy(disk_data.data() + sect.paddr, mem_data.data() + sect.vaddr, copy_size);
+    if (copy_size > 0) {
+      std::memcpy(disk_data.data() + sect.paddr, mem_data.data() + sect.vaddr, static_cast<std::size_t>(copy_size));
+    }
   }
 
   std::string hex;
@@ -802,24 +877,41 @@ CommandExecutionResult DbgEngCommandExecutor::WriteMemorySynchronously(std::uint
     }
   }
 
-  std::vector<unsigned char> buffer;
-  buffer.reserve(hex_data.size() / 2);
+  std::string clean_hex;
+  clean_hex.reserve(hex_data.size());
   for (size_t i = 0; i < hex_data.size(); ++i) {
-    if (isxdigit(hex_data[i])) {
-      if (i + 1 < hex_data.size() && isxdigit(hex_data[i + 1])) {
-        char hex[3] = {hex_data[i], hex_data[i + 1], 0};
-        buffer.push_back(static_cast<unsigned char>(strtoul(hex, nullptr, 16)));
-        i++;
-      }
+    unsigned char ch = static_cast<unsigned char>(hex_data[i]);
+    if (std::isspace(ch) || ch == '-' || ch == ':') {
+      continue;
     }
+    if ((ch == 'x' || ch == 'X') && !clean_hex.empty() && clean_hex.back() == '0') {
+      clean_hex.pop_back();
+      continue;
+    }
+    if (!std::isxdigit(ch)) {
+      return {false, "", "Invalid hex character in hex_data"};
+    }
+    clean_hex.push_back(static_cast<char>(ch));
   }
 
-  if (buffer.empty()) {
-    return {false, "", "Empty or invalid hex data"};
+  if (clean_hex.empty() || (clean_hex.size() % 2 != 0)) {
+    return {false, "", "Empty or odd-length hex data"};
+  }
+
+  constexpr std::size_t kMaxWriteBytes = 1024 * 1024;
+  if (clean_hex.size() / 2 > kMaxWriteBytes) {
+    return {false, "", "Write payload exceeds maximum allowed size (1MB)"};
+  }
+
+  std::vector<unsigned char> buffer;
+  buffer.reserve(clean_hex.size() / 2);
+  for (size_t i = 0; i < clean_hex.size(); i += 2) {
+    char hex[3] = {clean_hex[i], clean_hex[i + 1], 0};
+    buffer.push_back(static_cast<unsigned char>(std::strtoul(hex, nullptr, 16)));
   }
 
   ULONG bytes_written = 0;
-  HRESULT hr = data->WriteVirtual(address, buffer.data(), (ULONG)buffer.size(), &bytes_written);
+  HRESULT hr = data->WriteVirtual(address, buffer.data(), static_cast<ULONG>(buffer.size()), &bytes_written);
   if (FAILED(hr)) {
     return {false, "", "WriteVirtual failed: " + HResultToString(hr)};
   }
@@ -854,19 +946,36 @@ CommandExecutionResult DbgEngCommandExecutor::SearchMemorySynchronously(std::uin
     }
   }
 
-  std::vector<unsigned char> pattern_bytes;
-  for (size_t i = 0; i < pattern.size(); ++i) {
-    if (isxdigit(pattern[i])) {
-      if (i + 1 < pattern.size() && isxdigit(pattern[i + 1])) {
-        char hex[3] = {pattern[i], pattern[i + 1], 0};
-        pattern_bytes.push_back(static_cast<unsigned char>(strtoul(hex, nullptr, 16)));
-        i++;
-      }
-    }
+  if (end_address <= start_address) {
+    return {false, "", "end_address must be greater than start_address"};
   }
 
-  if (pattern_bytes.empty()) {
-    return {false, "", "Empty or invalid pattern"};
+  std::string clean_hex;
+  clean_hex.reserve(pattern.size());
+  for (size_t i = 0; i < pattern.size(); ++i) {
+    unsigned char ch = static_cast<unsigned char>(pattern[i]);
+    if (std::isspace(ch) || ch == '-' || ch == ':') {
+      continue;
+    }
+    if ((ch == 'x' || ch == 'X') && !clean_hex.empty() && clean_hex.back() == '0') {
+      clean_hex.pop_back();
+      continue;
+    }
+    if (!std::isxdigit(ch)) {
+      return {false, "", "Invalid hex character in pattern"};
+    }
+    clean_hex.push_back(static_cast<char>(ch));
+  }
+
+  if (clean_hex.empty() || (clean_hex.size() % 2 != 0)) {
+    return {false, "", "Empty or odd-length hex pattern"};
+  }
+
+  std::vector<unsigned char> pattern_bytes;
+  pattern_bytes.reserve(clean_hex.size() / 2);
+  for (size_t i = 0; i < clean_hex.size(); i += 2) {
+    char hex[3] = {clean_hex[i], clean_hex[i + 1], 0};
+    pattern_bytes.push_back(static_cast<unsigned char>(std::strtoul(hex, nullptr, 16)));
   }
 
   mcp::JsonWriter writer;
@@ -874,11 +983,17 @@ CommandExecutionResult DbgEngCommandExecutor::SearchMemorySynchronously(std::uin
 
   ULONG64 found_addr = 0;
   ULONG64 current = start_address;
+  constexpr std::size_t kMaxSearchResults = 4096;
+  std::size_t match_count = 0;
 
-  while (current < end_address) {
-    if (SUCCEEDED(data->SearchVirtual(current, end_address - current, pattern_bytes.data(), (ULONG)pattern_bytes.size(),
-                                      1, &found_addr))) {
+  while (current < end_address && match_count < kMaxSearchResults) {
+    if (SUCCEEDED(data->SearchVirtual(current, end_address - current, pattern_bytes.data(),
+                                      static_cast<ULONG>(pattern_bytes.size()), 1, &found_addr))) {
       writer.HexValue(found_addr);
+      ++match_count;
+      if (found_addr == UINT64_MAX) {
+        break;
+      }
       current = found_addr + 1;
     } else {
       break;
@@ -1031,7 +1146,7 @@ CommandExecutionResult DbgEngCommandExecutor::GetBreakpointsSynchronously() {
         if (SUCCEEDED(symbols->GetNameByOffset(offset, sym_name, sizeof(sym_name), nullptr, &disp))) {
           std::string sym = sym_name;
           if (disp > 0)
-            sym += "+0x" + std::to_string(disp);
+            sym += FormatHexDisplacement(disp);
           writer.Key("symbol");
           writer.StringValue(sym);
         }
@@ -1094,7 +1209,7 @@ CommandExecutionResult DbgEngCommandExecutor::DisassembleSynchronously(std::uint
       if (SUCCEEDED(worker_symbols_->GetNameByOffset(current_offset, sym_name, sizeof(sym_name), nullptr, &disp))) {
         std::string sym = sym_name;
         if (disp > 0)
-          sym += "+0x" + std::to_string(disp);
+          sym += FormatHexDisplacement(disp);
         writer.Key("symbol");
         writer.StringValue(sym);
       }
@@ -1130,6 +1245,8 @@ CommandExecutionResult DbgEngCommandExecutor::ReadStringSynchronously(std::uint6
     }
   }
 
+  if (max_length == 0)
+    max_length = 256;
   if (max_length > 4096)
     max_length = 4096;
 
@@ -1142,11 +1259,15 @@ CommandExecutionResult DbgEngCommandExecutor::ReadStringSynchronously(std::uint6
     std::vector<wchar_t> buf(max_length + 1, 0);
     ULONG bytes_read = 0;
     HRESULT hr = data->ReadVirtual(address, buf.data(), max_length * sizeof(wchar_t), &bytes_read);
+    if (FAILED(hr) && bytes_read == 0) {
+      return {false, "", "ReadVirtual failed: " + HResultToString(hr)};
+    }
     size_t chars_read = bytes_read / sizeof(wchar_t);
     size_t len = 0;
     while (len < chars_read && buf[len] != L'\0') {
       len++;
     }
+    bool found_null = (len < chars_read && buf[len] == L'\0');
     std::vector<char> utf8(len * 4 + 1, 0);
     int u8_len = WideCharToMultiByte(CP_UTF8, 0, buf.data(), static_cast<int>(len), utf8.data(),
                                      static_cast<int>(utf8.size()), nullptr, nullptr);
@@ -1157,15 +1278,19 @@ CommandExecutionResult DbgEngCommandExecutor::ReadStringSynchronously(std::uint6
     writer.Key("length");
     writer.IntValue(static_cast<int>(len));
     writer.Key("truncated");
-    writer.BoolValue(len >= max_length);
+    writer.BoolValue(!found_null);
   } else {
     std::vector<char> buf(max_length + 1, 0);
     ULONG bytes_read = 0;
     HRESULT hr = data->ReadVirtual(address, buf.data(), max_length, &bytes_read);
+    if (FAILED(hr) && bytes_read == 0) {
+      return {false, "", "ReadVirtual failed: " + HResultToString(hr)};
+    }
     size_t len = 0;
     while (len < bytes_read && buf[len] != '\0') {
       len++;
     }
+    bool found_null = (len < bytes_read && buf[len] == '\0');
     std::string str_val;
     str_val.reserve(len);
     for (size_t i = 0; i < len; ++i) {
@@ -1184,7 +1309,7 @@ CommandExecutionResult DbgEngCommandExecutor::ReadStringSynchronously(std::uint6
     writer.Key("length");
     writer.IntValue(static_cast<int>(len));
     writer.Key("truncated");
-    writer.BoolValue(len >= max_length);
+    writer.BoolValue(!found_null);
   }
   writer.EndObject();
 
@@ -1192,6 +1317,11 @@ CommandExecutionResult DbgEngCommandExecutor::ReadStringSynchronously(std::uint6
 }
 
 CommandExecutionResult DbgEngCommandExecutor::Step(bool step_over, bool reverse, std::uint32_t count) {
+  if (count == 0) {
+    count = 1;
+  } else if (count > 1000) {
+    count = 1000;
+  }
   return DispatchToWorker(
       [this, step_over, reverse, count]() {
         std::string cmd;
@@ -1205,7 +1335,7 @@ CommandExecutionResult DbgEngCommandExecutor::Step(bool step_over, bool reverse,
         }
         auto res = ExecuteSynchronously(cmd, {});
         if (worker_control_ != nullptr) {
-          ULONG timeout_ms = (std::max)(5000U, count * 1000U);
+          ULONG timeout_ms = (std::min)(60000U, (std::max)(5000U, count * 1000U));
           (void)worker_control_->WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms);
         }
         return res;
@@ -1398,7 +1528,11 @@ std::optional<std::uint64_t> DbgEngCommandExecutor::ResolveAddress(const std::st
     }
     task_queue_.push(ExecutionTask{
         [this, &promise, expression]() -> CommandExecutionResult {
-          promise.set_value(ResolveAddressSynchronously(expression));
+          try {
+            promise.set_value(ResolveAddressSynchronously(expression));
+          } catch (...) {
+            promise.set_value(std::nullopt);
+          }
           return {true, "", ""};
         },
         std::promise<CommandExecutionResult>(), false});
@@ -1539,68 +1673,71 @@ SessionMetadata DbgEngCommandExecutor::GetSessionMetadata() {
     task_queue_.push(ExecutionTask{
         [this, &promise]() -> CommandExecutionResult {
           SessionMetadata metadata;
-          metadata.process_id = GetCurrentProcessId();
+          try {
+            metadata.process_id = GetCurrentProcessId();
 
-          Microsoft::WRL::ComPtr<IDebugSystemObjects> systems = worker_systems_;
-          Microsoft::WRL::ComPtr<IDebugControl> control = worker_control_;
+            Microsoft::WRL::ComPtr<IDebugSystemObjects> systems = worker_systems_;
+            Microsoft::WRL::ComPtr<IDebugControl> control = worker_control_;
 
-          if (systems != nullptr) {
-            ULONG pid = 0;
-            if (SUCCEEDED(systems->GetCurrentProcessSystemId(&pid))) {
-              metadata.process_id = static_cast<std::uint32_t>(pid);
+            if (systems != nullptr) {
+              ULONG pid = 0;
+              if (SUCCEEDED(systems->GetCurrentProcessSystemId(&pid))) {
+                metadata.process_id = static_cast<std::uint32_t>(pid);
+              }
+
+              char exe_name[MAX_PATH];
+              if (SUCCEEDED(systems->GetCurrentProcessExecutableName(exe_name, sizeof(exe_name), nullptr))) {
+                metadata.executable_name = exe_name;
+              }
             }
 
-            char exe_name[MAX_PATH];
-            if (SUCCEEDED(systems->GetCurrentProcessExecutableName(exe_name, sizeof(exe_name), nullptr))) {
-              metadata.executable_name = exe_name;
-            }
-          }
-
-          if (control != nullptr) {
-            ULONG type = 0;
-            ULONG qual = 0;
-            if (SUCCEEDED(control->GetDebuggeeType(&type, &qual))) {
-              metadata.target_info = "Type=" + std::to_string(type) + ", Qual=" + std::to_string(qual);
-              if (type == DEBUG_CLASS_USER_WINDOWS) {
-                metadata.debuggee_class = "user";
-                if (qual == 2) {
-                  metadata.is_ttd = true;
-                  metadata.target_type = "ttd_trace";
+            if (control != nullptr) {
+              ULONG type = 0;
+              ULONG qual = 0;
+              if (SUCCEEDED(control->GetDebuggeeType(&type, &qual))) {
+                metadata.target_info = "Type=" + std::to_string(type) + ", Qual=" + std::to_string(qual);
+                if (type == DEBUG_CLASS_USER_WINDOWS) {
+                  metadata.debuggee_class = "user";
+                  if (qual == 2) {
+                    metadata.is_ttd = true;
+                    metadata.target_type = "ttd_trace";
+                  } else {
+                    metadata.target_type = "live_user";
+                  }
+                } else if (type == DEBUG_CLASS_KERNEL) {
+                  metadata.debuggee_class = "kernel";
+                  metadata.target_type = "live_kernel";
                 } else {
-                  metadata.target_type = "live_user";
+                  metadata.debuggee_class = "other (" + std::to_string(type) + ")";
+                  metadata.target_type = "other";
                 }
-              } else if (type == DEBUG_CLASS_KERNEL) {
-                metadata.debuggee_class = "kernel";
-                metadata.target_type = "live_kernel";
-              } else {
-                metadata.debuggee_class = "other (" + std::to_string(type) + ")";
-                metadata.target_type = "other";
               }
-            }
 
-            ULONG proc_type = 0;
-            if (SUCCEEDED(control->GetEffectiveProcessorType(&proc_type))) {
-              switch (proc_type) {
-                case IMAGE_FILE_MACHINE_I386:
-                  metadata.architecture = "x86";
-                  break;
-                case IMAGE_FILE_MACHINE_AMD64:
-                  metadata.architecture = "x64";
-                  break;
-                case IMAGE_FILE_MACHINE_ARM64:
-                  metadata.architecture = "arm64";
-                  break;
-                case IMAGE_FILE_MACHINE_ARM:
-                  metadata.architecture = "arm";
-                  break;
-                default:
-                  metadata.architecture = "unknown (0x" + std::to_string(proc_type) + ")";
-                  break;
+              ULONG proc_type = 0;
+              if (SUCCEEDED(control->GetEffectiveProcessorType(&proc_type))) {
+                switch (proc_type) {
+                  case IMAGE_FILE_MACHINE_I386:
+                    metadata.architecture = "x86";
+                    break;
+                  case IMAGE_FILE_MACHINE_AMD64:
+                    metadata.architecture = "x64";
+                    break;
+                  case IMAGE_FILE_MACHINE_ARM64:
+                    metadata.architecture = "arm64";
+                    break;
+                  case IMAGE_FILE_MACHINE_ARM:
+                    metadata.architecture = "arm";
+                    break;
+                  default:
+                    metadata.architecture = "unknown (0x" + std::to_string(proc_type) + ")";
+                    break;
+                }
               }
             }
+          } catch (...) {
           }
 
-          promise.set_value(metadata);
+          promise.set_value(std::move(metadata));
           return {true, "", ""};
         },
         std::promise<CommandExecutionResult>(), false});
@@ -1610,3 +1747,4 @@ SessionMetadata DbgEngCommandExecutor::GetSessionMetadata() {
 }
 
 }  // namespace dbgx::windbg
+

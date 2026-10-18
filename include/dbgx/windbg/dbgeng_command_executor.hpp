@@ -58,6 +58,7 @@ private:
   std::queue<ExecutionTask> task_queue_;
   bool shutdown_ = false;
 
+  std::mutex interrupt_mutex_;
   Microsoft::WRL::ComPtr<IDebugControl> interrupt_control_;
 
   // Worker-thread local cached COM interfaces

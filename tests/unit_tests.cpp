@@ -1009,6 +1009,90 @@ void TestInitializeInstructionsAndRefusalShape(int* failures) {
   Expect(!Contains(bare, "next_steps"), "no next_steps when there is no alternative", failures);
 }
 
+void TestPingMethod(int* failures) {
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+  const dbgx::mcp::JsonRpcHttpResult result =
+      router.HandleJsonRpcPost(R"({"jsonrpc":"2.0","id":77,"method":"ping","params":{}})");
+  Expect(result.status_code == 200, "ping should return HTTP 200", failures);
+  Expect(Contains(result.body, R"("result":{})"), "ping should return empty object result", failures);
+}
+
+void TestOriginValidation(int* failures) {
+  Expect(dbgx::mcp::IsOriginAllowed(""), "empty Origin should be allowed (non-browser client)", failures);
+  Expect(dbgx::mcp::IsOriginAllowed("http://localhost"), "http://localhost should be allowed", failures);
+  Expect(dbgx::mcp::IsOriginAllowed("http://localhost:8080"), "http://localhost:8080 should be allowed",
+         failures);
+  Expect(dbgx::mcp::IsOriginAllowed("https://localhost:3000"), "https://localhost:3000 should be allowed",
+         failures);
+  Expect(dbgx::mcp::IsOriginAllowed("http://127.0.0.1"), "http://127.0.0.1 should be allowed", failures);
+  Expect(dbgx::mcp::IsOriginAllowed("http://127.0.0.1:5678"), "http://127.0.0.1:5678 should be allowed",
+         failures);
+  Expect(dbgx::mcp::IsOriginAllowed("http://[::1]:5678"), "http://[::1]:5678 should be allowed", failures);
+
+  Expect(!dbgx::mcp::IsOriginAllowed("http://localhost.evil.com"),
+         "http://localhost.evil.com must be rejected", failures);
+  Expect(!dbgx::mcp::IsOriginAllowed("https://localhost.evil.com:8080"),
+         "https://localhost.evil.com:8080 must be rejected", failures);
+  Expect(!dbgx::mcp::IsOriginAllowed("http://127.0.0.1.evil.com"),
+         "http://127.0.0.1.evil.com must be rejected", failures);
+  Expect(!dbgx::mcp::IsOriginAllowed("http://[::1].evil.com"),
+         "http://[::1].evil.com must be rejected", failures);
+  Expect(!dbgx::mcp::IsOriginAllowed("http://127.0.0.1@evil.com"),
+         "http://127.0.0.1@evil.com must be rejected", failures);
+  Expect(!dbgx::mcp::IsOriginAllowed("null"), "null Origin must be rejected", failures);
+}
+
+void TestGuardrailsBypassAndInjection(int* failures) {
+  std::string err;
+  Expect(!dbgx::mcp::ValidateDebuggerCommand(".if (1) { q }", &err), ".if block with q must be blocked", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand(".foreach (x {r}) { .kill }", &err),
+         ".foreach block with .kill must be blocked", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand("~*e q", &err), "~*e q must be blocked", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand("~0e .shell cmd", &err), "~0e .shell must be blocked", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand("|0e .detach", &err), "|0e .detach must be blocked", failures);
+  Expect(!dbgx::mcp::ValidateDebuggerCommand("r\n.kill", &err), "newline-separated .kill must be blocked", failures);
+
+  FakeExecutor executor;
+  dbgx::mcp::JsonRpcRouter router(&executor);
+
+  // windbg.dx with ExecuteCommand must be blocked
+  auto res = router.HandleJsonRpcPost(
+      R"json({"jsonrpc":"2.0","id":201,"method":"tools/call","params":{"name":"windbg.dx","arguments":{"expression":"Debugger.Utility.Control.ExecuteCommand(\"q\")"}}})json");
+  Expect(Contains(res.body, "\"isError\":true") && Contains(res.body, "command_blocked"),
+         "windbg.dx with ExecuteCommand must be blocked", failures);
+  Expect(executor.evaluated_expressions.empty(), "blocked dx expression must not evaluate", failures);
+
+  // windbg.set_breakpoint with command chaining must be blocked
+  res = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":202,"method":"tools/call","params":{"name":"windbg.set_breakpoint","arguments":{"expression":"main; .shell cmd"}}})");
+  Expect(Contains(res.body, "\"isError\":true") && Contains(res.body, "command_blocked"),
+         "set_breakpoint with semicolon injection must be blocked", failures);
+  Expect(executor.call_count == 0, "blocked set_breakpoint must not execute", failures);
+
+  // windbg.clear_breakpoint with non-numeric/wildcard injection must be blocked
+  res = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":203,"method":"tools/call","params":{"name":"windbg.clear_breakpoint","arguments":{"id":"0; q"}}})");
+  Expect(Contains(res.body, "\"isError\":true") && Contains(res.body, "command_blocked"),
+         "clear_breakpoint with semicolon injection must be blocked", failures);
+  Expect(executor.call_count == 0, "blocked clear_breakpoint must not execute", failures);
+
+  // windbg.ttd_position with injection must be blocked
+  res = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":204,"method":"tools/call","params":{"name":"windbg.ttd_position","arguments":{"position":"1B:0; .kill"}}})");
+  Expect(Contains(res.body, "\"isError\":true") && Contains(res.body, "command_blocked"),
+         "ttd_position with semicolon injection must be blocked", failures);
+  Expect(executor.call_count == 0, "blocked ttd_position must not execute", failures);
+
+  // Read-only refusal message should not recommend windbg.eval
+  SetEnvironmentVariableA("WINDBG_MCP_READONLY", "1");
+  res = router.HandleJsonRpcPost(
+      R"({"jsonrpc":"2.0","id":205,"method":"tools/call","params":{"name":"windbg.step","arguments":{}}})");
+  Expect(Contains(res.body, "read_only_mode"), "step should be rejected in read-only mode", failures);
+  Expect(!Contains(res.body, "eval"), "read-only refusal should not suggest eval", failures);
+  SetEnvironmentVariableA("WINDBG_MCP_READONLY", NULL);
+}
+
 }  // namespace
 
 int main() {
@@ -1064,6 +1148,9 @@ int main() {
   TestGuardrailsDetailAndAlternatives(&failures);
   TestToolAnnotations(&failures);
   TestInitializeInstructionsAndRefusalShape(&failures);
+  TestPingMethod(&failures);
+  TestOriginValidation(&failures);
+  TestGuardrailsBypassAndInjection(&failures);
 
   if (failures == 0) {
     std::cout << "All unit tests passed.\n";

@@ -54,8 +54,8 @@ std::string_view Trim(std::string_view text) {
   return text;
 }
 
-// Splits on ';' while respecting single and double quotes (mirrors the bridge's
-// split_commands_safe()).
+// Splits on ';', '{', and '}' while respecting single and double quotes (mirrors the bridge's
+// split_commands_safe() and also unwraps control-flow blocks like .if / .foreach / .block).
 std::vector<std::string_view> SplitCommandsSafe(std::string_view command) {
   std::vector<std::string_view> parts;
   char in_quote = 0;
@@ -68,7 +68,7 @@ std::vector<std::string_view> SplitCommandsSafe(std::string_view command) {
       }
     } else if (c == '"' || c == '\'') {
       in_quote = c;
-    } else if (c == ';') {
+    } else if (c == ';' || c == '{' || c == '}' || c == '\r' || c == '\n') {
       std::string_view part = Trim(command.substr(start, i - start));
       if (!part.empty()) {
         parts.push_back(part);
@@ -86,10 +86,33 @@ std::vector<std::string_view> SplitCommandsSafe(std::string_view command) {
 std::string_view FirstToken(std::string_view text) {
   text = Trim(text);
   std::size_t end = 0;
-  while (end < text.size() && !std::isspace(static_cast<unsigned char>(text[end]))) {
+  while (end < text.size() && !std::isspace(static_cast<unsigned char>(text[end])) && text[end] != '(') {
     ++end;
   }
   return text.substr(0, end);
+}
+
+// Strips thread/process prefix (e.g., "~*e q", "~0s", "|1s") and returns the inner command if 'e' is used.
+std::string_view StripThreadExecutePrefix(std::string_view sub) {
+  sub = Trim(sub);
+  if (sub.empty() || (sub.front() != '~' && sub.front() != '|')) {
+    return sub;
+  }
+  std::size_t i = 1;
+  while (i < sub.size() && (std::isalnum(static_cast<unsigned char>(sub[i])) || sub[i] == '*' || sub[i] == '.' ||
+                           sub[i] == '#' || sub[i] == '[' || sub[i] == ']')) {
+    ++i;
+  }
+  while (i < sub.size() && std::isspace(static_cast<unsigned char>(sub[i]))) {
+    ++i;
+  }
+  if (i < sub.size() && (sub[i] == 'e' || sub[i] == 'E')) {
+    std::size_t after_e = i + 1;
+    if (after_e == sub.size() || std::isspace(static_cast<unsigned char>(sub[after_e]))) {
+      return Trim(sub.substr(after_e));
+    }
+  }
+  return sub;
 }
 
 }  // namespace
@@ -110,7 +133,8 @@ bool ValidateDebuggerCommandDetail(std::string_view command, std::string* blocke
     return false;
   }
 
-  for (std::string_view sub : SplitCommandsSafe(command)) {
+  for (std::string_view raw_sub : SplitCommandsSafe(command)) {
+    std::string_view sub = StripThreadExecutePrefix(raw_sub);
     const std::string base = ToLower(FirstToken(sub));
     if (base.empty()) {
       continue;
@@ -136,6 +160,105 @@ bool ValidateDebuggerCommand(std::string_view command, std::string* error_messag
   return ValidateDebuggerCommandDetail(command, nullptr, error_message);
 }
 
+bool ValidateCommandArgument(std::string_view arg, std::string* error_message) {
+  if (arg.find(';') != std::string_view::npos || arg.find('\r') != std::string_view::npos ||
+      arg.find('\n') != std::string_view::npos || arg.find('\"') != std::string_view::npos ||
+      arg.find('\'') != std::string_view::npos || arg.find("$<") != std::string_view::npos ||
+      arg.find("$>") != std::string_view::npos) {
+    if (error_message != nullptr) {
+      *error_message = "Invalid argument: command separators (';', newlines, quotes, or '$<') are not allowed.";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool ValidateBreakpointId(std::string_view id, std::string* error_message) {
+  std::string_view trimmed = Trim(id);
+  if (trimmed.empty() || trimmed == "*") {
+    return true;
+  }
+  for (char c : trimmed) {
+    if (!std::isdigit(static_cast<unsigned char>(c)) && !std::isspace(static_cast<unsigned char>(c)) && c != '-' &&
+        c != ',') {
+      if (error_message != nullptr) {
+        *error_message = "Invalid breakpoint ID: must be '*' or numeric breakpoint ID(s).";
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ValidateTTDPosition(std::string_view position, std::string* error_message) {
+  std::string_view trimmed = Trim(position);
+  if (trimmed.empty()) {
+    return true;
+  }
+  std::string lower = ToLower(trimmed);
+  if (lower == "min" || lower == "max") {
+    return true;
+  }
+  for (char c : trimmed) {
+    if (!std::isxdigit(static_cast<unsigned char>(c)) && c != ':' && c != '%') {
+      if (error_message != nullptr) {
+        *error_message = "Invalid TTD position: must be 'HEX:HEX' (e.g. '1B:0'), percentage, 'min', or 'max'.";
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ValidateDxExpression(std::string_view expression, std::string* error_message) {
+  if (expression.find('\r') != std::string_view::npos || expression.find('\n') != std::string_view::npos) {
+    if (error_message != nullptr) {
+      *error_message = "Invalid expression: newlines are not allowed in dx expressions.";
+    }
+    return false;
+  }
+  const std::string lower = ToLower(expression);
+  if (lower.find("executecommand") != std::string::npos || lower.find("control.execute") != std::string::npos) {
+    if (error_message != nullptr) {
+      *error_message =
+          "Calling ExecuteCommand inside windbg.dx is prohibited by guardrails; use windbg.eval instead.";
+    }
+    return false;
+  }
+  return true;
+}
+
+std::string EscapeJsString(std::string_view input) {
+  std::string out;
+  out.reserve(input.size() + 8);
+  for (char c : input) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\"':
+        out += "\\\"";
+        break;
+      case '\'':
+        out += "\\'";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out.push_back(c);
+        break;
+    }
+  }
+  return out;
+}
+
 std::string NormalizeToolName(std::string_view tool_name) {
   std::string name(tool_name);
   if (name.rfind("windbg_", 0) == 0) {
@@ -152,8 +275,11 @@ bool IsMutatingTool(std::string_view tool_name) {
 bool IsReadOnlyModeEnabled() {
   char buf[16] = {};
   const DWORD len = GetEnvironmentVariableA("WINDBG_MCP_READONLY", buf, sizeof(buf));
-  if (len == 0 || len >= sizeof(buf)) {
+  if (len == 0) {
     return false;
+  }
+  if (len >= sizeof(buf)) {
+    return true;  // Non-empty long value: fail closed (treat as enabled)
   }
   const std::string value = ToLower(Trim(std::string_view(buf, len)));
   return !(value.empty() || value == "0" || value == "false" || value == "no" || value == "off");

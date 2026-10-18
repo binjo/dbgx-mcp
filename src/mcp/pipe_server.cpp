@@ -76,6 +76,13 @@ PSECURITY_DESCRIPTOR BuildCurrentUserPipeSecurityDescriptor() {
   return descriptor;
 }
 
+constexpr std::size_t kMaxPipeBufferBytes = 2 * 1024 * 1024;
+
+struct PipeClientWorkerEntry {
+  std::thread thread;
+  std::shared_ptr<std::atomic<bool>> finished;
+};
+
 }  // namespace
 
 struct PipeServer::Impl {
@@ -89,9 +96,8 @@ struct PipeServer::Impl {
   std::thread listener_thread;
 
   std::mutex clients_mutex;
-  std::condition_variable clients_cv;
   std::vector<HANDLE> active_pipes;
-  std::vector<std::thread> client_threads;
+  std::vector<PipeClientWorkerEntry> client_threads;
 };
 
 PipeServer::PipeServer() : impl_(std::make_unique<Impl>()) {}
@@ -135,10 +141,13 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
   }
 
   HANDLE ready_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+  auto first_pipe_ok = std::make_shared<std::atomic<bool>>(false);
+  auto first_pipe_err = std::make_shared<std::atomic<DWORD>>(0);
   impl_->running.store(true);
 
-  impl_->listener_thread = std::thread([this, ready_event]() {
+  impl_->listener_thread = std::thread([this, ready_event, first_pipe_ok, first_pipe_err]() {
     bool signaled_ready = false;
+    bool first_instance = true;
 
     PSECURITY_DESCRIPTOR pipe_descriptor = BuildCurrentUserPipeSecurityDescriptor();
     SECURITY_ATTRIBUTES pipe_security{};
@@ -148,17 +157,34 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
     LPSECURITY_ATTRIBUTES pipe_security_ptr = pipe_descriptor != nullptr ? &pipe_security : NULL;
 
     while (!impl_->stop_requested.load()) {
-      HANDLE pipe_handle = CreateNamedPipeA(impl_->full_pipe_path.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                                            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
-                                            65536, 65536, 5000, pipe_security_ptr);
+      DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+      if (first_instance) {
+        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+      }
+      DWORD pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+
+      HANDLE pipe_handle = CreateNamedPipeA(impl_->full_pipe_path.c_str(), open_mode, pipe_mode,
+                                            PIPE_UNLIMITED_INSTANCES, 65536, 65536, 5000, pipe_security_ptr);
 
       if (pipe_handle == INVALID_HANDLE_VALUE) {
+        DWORD create_err = GetLastError();
+        if (first_instance) {
+          first_pipe_err->store(create_err);
+          if (!signaled_ready && ready_event != NULL) {
+            SetEvent(ready_event);
+            signaled_ready = true;
+          }
+          break;
+        }
         if (impl_->stop_requested.load()) {
           break;
         }
         Sleep(50);
         continue;
       }
+
+      first_instance = false;
+      first_pipe_ok->store(true);
 
       if (!signaled_ready && ready_event != NULL) {
         SetEvent(ready_event);
@@ -204,12 +230,24 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
         continue;
       }
 
+      auto finished_flag = std::make_shared<std::atomic<bool>>(false);
+
       {
         std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
+        for (auto it = impl_->client_threads.begin(); it != impl_->client_threads.end();) {
+          if (it->finished && it->finished->load()) {
+            if (it->thread.joinable()) {
+              it->thread.join();
+            }
+            it = impl_->client_threads.erase(it);
+          } else {
+            ++it;
+          }
+        }
         impl_->active_pipes.push_back(pipe_handle);
       }
 
-      std::thread client_worker([this, pipe_handle]() {
+      std::thread client_worker([this, pipe_handle, finished_flag]() {
         (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
         std::string buffer;
@@ -252,6 +290,9 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
           }
 
           buffer.append(read_chunk, static_cast<std::size_t>(bytes_read));
+          if (buffer.size() > kMaxPipeBufferBytes && buffer.find('\n') == std::string::npos) {
+            break;  // Reject unbounded line without newline
+          }
 
           // Process all complete newline-delimited requests in buffer
           while (true) {
@@ -274,7 +315,13 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
 
             std::string response_line;
             if (impl_->handler) {
-              response_line = impl_->handler(request_line);
+              try {
+                response_line = impl_->handler(request_line);
+              } catch (...) {
+                response_line =
+                    "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal server "
+                    "exception\"}}";
+              }
             } else {
               response_line =
                   "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Handler not available\"}}";
@@ -325,10 +372,6 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
           }
         }
 
-        FlushFileBuffers(pipe_handle);
-        DisconnectNamedPipe(pipe_handle);
-        CloseHandle(pipe_handle);
-
         {
           std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
           auto it = std::find(impl_->active_pipes.begin(), impl_->active_pipes.end(), pipe_handle);
@@ -336,14 +379,18 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
             impl_->active_pipes.erase(it);
           }
         }
-        impl_->clients_cv.notify_all();
+
+        FlushFileBuffers(pipe_handle);
+        DisconnectNamedPipe(pipe_handle);
+        CloseHandle(pipe_handle);
 
         CoUninitialize();
+        finished_flag->store(true);
       });
 
       {
         std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
-        impl_->client_threads.push_back(std::move(client_worker));
+        impl_->client_threads.push_back(PipeClientWorkerEntry{std::move(client_worker), std::move(finished_flag)});
       }
     }
 
@@ -363,6 +410,22 @@ bool PipeServer::Start(const std::string& pipe_name, PipeRequestHandler handler,
     CloseHandle(ready_event);
   }
 
+  if (!first_pipe_ok->load()) {
+    if (impl_->listener_thread.joinable()) {
+      impl_->listener_thread.join();
+    }
+    if (impl_->stop_event != NULL) {
+      CloseHandle(impl_->stop_event);
+      impl_->stop_event = NULL;
+    }
+    impl_->running.store(false);
+    if (error_message) {
+      *error_message = "Failed to create named pipe '" + impl_->full_pipe_path + "' (Error " +
+                       std::to_string(first_pipe_err->load()) + ")";
+    }
+    return false;
+  }
+
   return true;
 }
 
@@ -370,6 +433,9 @@ void PipeServer::Stop() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
 
   if (!impl_->running.load() && impl_->stop_event == NULL) {
+    if (impl_->listener_thread.joinable()) {
+      impl_->listener_thread.join();
+    }
     return;
   }
 
@@ -384,7 +450,7 @@ void PipeServer::Stop() {
     std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
     for (HANDLE pipe : impl_->active_pipes) {
       if (pipe != INVALID_HANDLE_VALUE && pipe != NULL) {
-        CancelIo(pipe);
+        CancelIoEx(pipe, nullptr);
         DisconnectNamedPipe(pipe);
       }
     }
@@ -395,15 +461,16 @@ void PipeServer::Stop() {
   }
 
   // Join all client threads safely
+  std::vector<PipeClientWorkerEntry> threads_to_join;
   {
     std::lock_guard<std::mutex> clients_lock(impl_->clients_mutex);
-    for (auto& th : impl_->client_threads) {
-      if (th.joinable()) {
-        th.join();
-      }
-    }
-    impl_->client_threads.clear();
+    threads_to_join = std::move(impl_->client_threads);
     impl_->active_pipes.clear();
+  }
+  for (auto& entry : threads_to_join) {
+    if (entry.thread.joinable()) {
+      entry.thread.join();
+    }
   }
 
   if (impl_->stop_event != NULL) {

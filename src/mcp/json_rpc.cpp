@@ -546,8 +546,9 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
           "read_only_mode",
           "Tool '" + tool_name +
               "' is disabled because the server is running in read-only mode (WINDBG_MCP_READONLY is set).",
-          "Use read-only tools (get_context, read_memory, disassemble, dx, eval with inspection commands). Ask "
-          "the user to restart WinDbg without WINDBG_MCP_READONLY if target changes are required.");
+          "Use read-only tools (get_context, get_modules, get_breakpoints, get_threads, read_memory, read_string, "
+          "disassemble, resolve, dx, ttd_position without position). Ask the user to restart WinDbg without "
+          "WINDBG_MCP_READONLY if target changes are required.");
       return outcome;
     }
   }
@@ -575,6 +576,13 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     if (!json::TryGetStringField(arguments_fields, "expression", &expression) || expression.empty()) {
       outcome.error_code = -32602;
       outcome.error_message = "Invalid params: expression must be a non-empty string";
+      return outcome;
+    }
+    std::string dx_error;
+    if (!ValidateDxExpression(expression, &dx_error)) {
+      outcome.ok = true;
+      outcome.result_json = BuildRefusalResult(
+          "command_blocked", dx_error, "Use windbg.eval to execute debugger commands, or query read-only Data Model objects.");
       return outcome;
     }
     int max_depth = 5;
@@ -790,11 +798,26 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     std::string syntypes_path = "%TEMP%\\SynTypes.js";
     json::TryGetStringField(arguments_fields, "syntypes_path", &syntypes_path);
 
+    std::string arg_error;
+    if (!ValidateCommandArgument(syntypes_path, &arg_error) || !ValidateCommandArgument(header_path, &arg_error) ||
+        !ValidateCommandArgument(struct_name, &arg_error) || !ValidateCommandArgument(module_name, &arg_error) ||
+        !ValidateCommandArgument(address_str, &arg_error)) {
+      outcome.error_code = -32602;
+      outcome.error_message = arg_error;
+      return outcome;
+    }
+
     // Expand environment variables dynamically in syntypes_path (e.g. %TEMP% to C:\Users\...)
-    char expanded_syntypes[MAX_PATH];
+    char expanded_syntypes[MAX_PATH] = {0};
     DWORD syntypes_size = ExpandEnvironmentStringsA(syntypes_path.c_str(), expanded_syntypes, MAX_PATH);
     std::string resolved_syntypes =
         (syntypes_size > 0 && syntypes_size <= MAX_PATH) ? std::string(expanded_syntypes) : syntypes_path;
+
+    if (!ValidateCommandArgument(resolved_syntypes, &arg_error)) {
+      outcome.error_code = -32602;
+      outcome.error_message = arg_error;
+      return outcome;
+    }
 
     // 1. Automatically unpack/write the embedded SynTypes.js script onto the Windows guest filesystem
     try {
@@ -815,24 +838,18 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     executor->Execute(".scriptload \"" + resolved_syntypes + "\"");
 
     // Expand environment variables dynamically in header_path
-    char expanded_header_path[MAX_PATH];
+    char expanded_header_path[MAX_PATH] = {0};
     DWORD header_size = ExpandEnvironmentStringsA(header_path.c_str(), expanded_header_path, MAX_PATH);
     std::string resolved_header =
         (header_size > 0 && header_size <= MAX_PATH) ? std::string(expanded_header_path) : header_path;
 
-    // 2. Escape backslashes in resolved_header for the JS string literal inside evaluate model
-    std::string escaped_header = "";
-    for (char c : resolved_header) {
-      if (c == '\\') {
-        escaped_header += "\\\\";
-      } else {
-        escaped_header += c;
-      }
-    }
+    const std::string escaped_header = EscapeJsString(resolved_header);
+    const std::string escaped_module = EscapeJsString(module_name);
+    const std::string escaped_struct = EscapeJsString(struct_name);
 
     // 3. Read the header file definition
     std::string read_expr =
-        "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + module_name + "\")";
+        "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + escaped_module + "\")";
     executor->EvaluateModel(read_expr);
 
     // Resolve address expression to numeric hex if not already a 0x hex literal
@@ -845,7 +862,7 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
 
     // 4. Create the synthetic structure instance and serialize it to structured JSON
     std::string instance_expr =
-        "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + struct_name + "\", " + address_str + ")";
+        "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + escaped_struct + "\", " + address_str + ")";
     execution = executor->EvaluateModel(instance_expr);
     is_json_output = true;
   } else if (tool_name == "windbg.apply_struct") {
@@ -860,11 +877,19 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     std::string module_name = "bootmgr";
     json::TryGetStringField(arguments_fields, "module_name", &module_name);
 
+    std::string arg_error;
+    if (!ValidateCommandArgument(struct_name, &arg_error) || !ValidateCommandArgument(module_name, &arg_error) ||
+        !ValidateCommandArgument(address_str, &arg_error)) {
+      outcome.error_code = -32602;
+      outcome.error_message = arg_error;
+      return outcome;
+    }
+
     // 1. Resolve unique %TEMP%\synthetic_inline_<PID>_<SEQ>.h path on guest
     static std::atomic<uint64_t> s_inline_header_seq{0};
     std::string temp_var = "%TEMP%\\synthetic_inline_" + std::to_string(GetCurrentProcessId()) + "_" +
                            std::to_string(++s_inline_header_seq) + ".h";
-    char expanded_temp[MAX_PATH];
+    char expanded_temp[MAX_PATH] = {0};
     DWORD temp_size = ExpandEnvironmentStringsA(temp_var.c_str(), expanded_temp, MAX_PATH);
     std::string inline_h_path =
         (temp_size > 0 && temp_size <= MAX_PATH) ? std::string(expanded_temp) : "C:\\temp\\synthetic_inline.h";
@@ -890,7 +915,7 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     }
 
     // 3. Resolve %TEMP%\SynTypes.js path on guest
-    char expanded_syntypes[MAX_PATH];
+    char expanded_syntypes[MAX_PATH] = {0};
     DWORD syntypes_size = ExpandEnvironmentStringsA("%TEMP%\\SynTypes.js", expanded_syntypes, MAX_PATH);
     std::string resolved_syntypes =
         (syntypes_size > 0 && syntypes_size <= MAX_PATH) ? std::string(expanded_syntypes) : "C:\\temp\\SynTypes.js";
@@ -912,19 +937,13 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     // 5. Try to load SynTypes.js (ignore failure if already loaded)
     executor->Execute(".scriptload \"" + resolved_syntypes + "\"");
 
-    // 6. Escape backslashes in inline_h_path for the JS string literal inside evaluate model
-    std::string escaped_header = "";
-    for (char c : inline_h_path) {
-      if (c == '\\') {
-        escaped_header += "\\\\";
-      } else {
-        escaped_header += c;
-      }
-    }
+    const std::string escaped_header = EscapeJsString(inline_h_path);
+    const std::string escaped_module = EscapeJsString(module_name);
+    const std::string escaped_struct = EscapeJsString(struct_name);
 
     // 7. Read the header file definition
     std::string read_expr =
-        "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + module_name + "\")";
+        "Debugger.Utility.Analysis.SyntheticTypes.ReadHeader(\"" + escaped_header + "\", \"" + escaped_module + "\")";
     executor->EvaluateModel(read_expr);
 
     // Clean up temporary inline header file from disk
@@ -941,7 +960,7 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
 
     // 8. Create the synthetic structure instance and serialize it to structured JSON
     std::string instance_expr =
-        "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + struct_name + "\", " + address_str + ")";
+        "Debugger.Utility.Analysis.SyntheticTypes.CreateInstance(\"" + escaped_struct + "\", " + address_str + ")";
     execution = executor->EvaluateModel(instance_expr);
     is_json_output = true;
   } else if (tool_name == "windbg.write_file") {
@@ -954,7 +973,7 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     }
 
     // Resolve any Windows environment variables dynamically (e.g. %TEMP%)
-    char expanded_path[MAX_PATH];
+    char expanded_path[MAX_PATH] = {0};
     DWORD size = ExpandEnvironmentStringsA(path_str.c_str(), expanded_path, MAX_PATH);
     std::string target_path = (size > 0 && size <= MAX_PATH) ? std::string(expanded_path) : path_str;
 
@@ -999,7 +1018,9 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     }
     int count = 10;
     json::TryGetIntField(arguments_fields, "count", &count);
-    execution = executor->Disassemble(*addr_opt, (uint32_t)count);
+    if (count < 1)
+      count = 10;
+    execution = executor->Disassemble(*addr_opt, static_cast<uint32_t>(count));
     is_json_output = true;
   } else if (tool_name == "windbg.read_string") {
     std::string addr_str;
@@ -1016,9 +1037,11 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     }
     int max_length = 256;
     json::TryGetIntField(arguments_fields, "max_length", &max_length);
+    if (max_length < 1)
+      max_length = 256;
     bool wide = false;
     json::TryGetBoolField(arguments_fields, "wide", &wide);
-    execution = executor->ReadString(*addr_opt, (uint32_t)max_length, wide);
+    execution = executor->ReadString(*addr_opt, static_cast<uint32_t>(max_length), wide);
     is_json_output = true;
   } else if (tool_name == "windbg.step") {
     bool step_over = true;
@@ -1029,6 +1052,8 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     json::TryGetIntField(arguments_fields, "count", &count);
     if (count < 1)
       count = 1;
+    if (count > 1000)
+      count = 1000;
     execution = executor->Step(step_over, reverse, static_cast<std::uint32_t>(count));
   } else if (tool_name == "windbg.continue") {
     bool reverse = false;
@@ -1041,10 +1066,22 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
       outcome.error_message = "Invalid params: expression is required";
       return outcome;
     }
+    std::string arg_error;
+    if (!ValidateCommandArgument(expr, &arg_error)) {
+      outcome.error_code = -32602;
+      outcome.error_message = arg_error;
+      return outcome;
+    }
     execution = executor->SetBreakpoint(expr);
   } else if (tool_name == "windbg.clear_breakpoint") {
     std::string id = "*";
     json::TryGetStringField(arguments_fields, "id", &id);
+    std::string id_error;
+    if (!ValidateBreakpointId(id, &id_error)) {
+      outcome.error_code = -32602;
+      outcome.error_message = id_error;
+      return outcome;
+    }
     execution = executor->ClearBreakpoint(id);
     is_json_output = true;
   } else if (tool_name == "windbg.resolve") {
@@ -1062,6 +1099,12 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
   } else if (tool_name == "windbg.ttd_position" || tool_name == "windbg.time_travel") {
     std::string position;
     json::TryGetStringField(arguments_fields, "position", &position);
+    std::string pos_error;
+    if (!ValidateTTDPosition(position, &pos_error)) {
+      outcome.error_code = -32602;
+      outcome.error_message = pos_error;
+      return outcome;
+    }
     execution = executor->GetOrSetTTDPosition(position);
     is_json_output = true;
   } else {
@@ -1086,6 +1129,9 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
 MethodOutcome DispatchMethod(std::string_view method, const json::FieldMap& root_fields,
                              windbg::IWinDbgCommandExecutor* executor) {
   if (method.rfind("notifications/", 0) == 0 || method == "initialized") {
+    return HandleInitializedNotification();
+  }
+  if (method == "ping") {
     return HandleInitializedNotification();
   }
   if (method == "initialize") {

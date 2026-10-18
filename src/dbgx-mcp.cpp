@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -49,6 +51,11 @@ struct ExtensionState {
   std::vector<std::string> active_transports;
   // Bearer token required on the HTTP transport. Empty => no auth (loopback only).
   std::string auth_token;
+
+  std::mutex register_cv_mutex;
+  std::condition_variable register_cv;
+  bool stop_register = false;
+  std::thread register_thread;
 };
 
 DWORD g_MainThreadId = 0;
@@ -147,61 +154,78 @@ std::string GetRegistryDir() {
   return path.string();
 }
 
-void RegisterSession(std::uint16_t port, const std::string& pipe_name, const std::vector<std::string>& transports,
-                     const std::string& auth_token) {
+std::string ReadEnvString(const char* name) {
+  const DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
+  if (needed == 0) {
+    return "";
+  }
+  std::string buf(needed, '\0');
+  const DWORD written = GetEnvironmentVariableA(name, buf.data(), needed);
+  if (written == 0 || written >= needed) {
+    return "";
+  }
+  buf.resize(written);
+  return buf;
+}
+
+void WriteSessionRegistryFile(std::uint16_t port, const std::string& pipe_name,
+                              const std::vector<std::string>& transports, const std::string& auth_token,
+                              const dbgx::windbg::SessionMetadata& meta, std::string* out_registered_path) {
   std::string dir = GetRegistryDir();
   if (dir.empty())
     return;
 
-  std::thread([port, pipe_name, transports, dir, auth_token]() {
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    ExtensionState& state = State();
-    dbgx::windbg::SessionMetadata meta;
-    {
-      std::lock_guard<std::mutex> lock(state.mutex);
-      if (state.executor) {
-        meta = state.executor->GetSessionMetadata();
-      }
+  std::string filename =
+      (port != 0 ? std::to_string(port) : ("pipe_" + std::to_string(GetCurrentProcessId()))) + ".json";
+  std::filesystem::path file_path = std::filesystem::path(dir) / filename;
+  std::filesystem::path tmp_path = std::filesystem::path(dir) / (filename + ".tmp");
+  std::ofstream f(tmp_path, std::ios::out | std::ios::trunc);
+  if (f.is_open()) {
+    f << "{\"port\":" << port << ",\"pipe_name\":\"" << dbgx::json::Escape(pipe_name) << "\""
+      << ",\"transports\":[";
+    for (size_t i = 0; i < transports.size(); ++i) {
+      if (i > 0)
+        f << ",";
+      f << "\"" << dbgx::json::Escape(transports[i]) << "\"";
     }
-
-    std::string filename =
-        (port != 0 ? std::to_string(port) : ("pipe_" + std::to_string(GetCurrentProcessId()))) + ".json";
-    std::filesystem::path file_path = std::filesystem::path(dir) / filename;
-    std::ofstream f(file_path);
-    if (f.is_open()) {
-      f << "{\"port\":" << port << ",\"pipe_name\":\"" << dbgx::json::Escape(pipe_name) << "\""
-        << ",\"transports\":[";
-      for (size_t i = 0; i < transports.size(); ++i) {
-        if (i > 0)
-          f << ",";
-        f << "\"" << dbgx::json::Escape(transports[i]) << "\"";
-      }
-      f << "]";
-      if (!auth_token.empty()) {
-        f << ",\"token\":\"" << dbgx::json::Escape(auth_token) << "\"";
-      }
-      f << ",\"pid\":" << GetCurrentProcessId() << ",\"target_pid\":" << meta.process_id << ",\"executable\":\""
-        << dbgx::json::Escape(meta.executable_name.empty() ? "WinDbg Session" : meta.executable_name) << "\""
-        << ",\"info\":\"" << dbgx::json::Escape(meta.target_info.empty() ? "Live Session" : meta.target_info) << "\""
-        << ",\"architecture\":\"" << dbgx::json::Escape(meta.architecture.empty() ? "unknown" : meta.architecture)
-        << "\""
-        << ",\"debuggee_class\":\"" << dbgx::json::Escape(meta.debuggee_class.empty() ? "user" : meta.debuggee_class)
-        << "\""
-        << ",\"is_ttd\":" << (meta.is_ttd ? "true" : "false")
-        << ",\"target_type\":\"" << dbgx::json::Escape(meta.target_type.empty() ? "unknown" : meta.target_type) << "\""
-        << "}";
-      std::lock_guard<std::mutex> lock(state.mutex);
-      state.registered_file_path = file_path.string();
+    f << "]";
+    if (!auth_token.empty()) {
+      f << ",\"token\":\"" << dbgx::json::Escape(auth_token) << "\"";
     }
-  }).detach();
+    f << ",\"pid\":" << GetCurrentProcessId() << ",\"target_pid\":" << meta.process_id << ",\"executable\":\""
+      << dbgx::json::Escape(meta.executable_name.empty() ? "WinDbg Session" : meta.executable_name) << "\""
+      << ",\"info\":\"" << dbgx::json::Escape(meta.target_info.empty() ? "Live Session" : meta.target_info) << "\""
+      << ",\"architecture\":\"" << dbgx::json::Escape(meta.architecture.empty() ? "unknown" : meta.architecture)
+      << "\""
+      << ",\"debuggee_class\":\"" << dbgx::json::Escape(meta.debuggee_class.empty() ? "user" : meta.debuggee_class)
+      << "\""
+      << ",\"is_ttd\":" << (meta.is_ttd ? "true" : "false")
+      << ",\"target_type\":\"" << dbgx::json::Escape(meta.target_type.empty() ? "unknown" : meta.target_type) << "\""
+      << "}";
+    f.close();
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, file_path, ec);
+    if (ec) {
+      std::filesystem::copy_file(tmp_path, file_path, std::filesystem::copy_options::overwrite_existing, ec);
+      std::filesystem::remove(tmp_path, ec);
+    }
+    if (out_registered_path != nullptr) {
+      *out_registered_path = file_path.string();
+    }
+  }
 }
 
 void UnregisterSession() {
   ExtensionState& state = State();
-  if (!state.registered_file_path.empty()) {
-    std::error_code ec;
-    std::filesystem::remove(state.registered_file_path, ec);
+  std::string path_to_remove;
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    path_to_remove = std::move(state.registered_file_path);
     state.registered_file_path.clear();
+  }
+  if (!path_to_remove.empty()) {
+    std::error_code ec;
+    std::filesystem::remove(path_to_remove, ec);
   }
 }
 
@@ -310,6 +334,7 @@ bool IsProcessAlive(DWORD pid) {
 }
 
 dbgx::mcp::HttpResponse HandleSessionsRequest(const dbgx::mcp::HttpRequest& request) {
+  (void)request;
   dbgx::mcp::HttpResponse response;
   response.status_code = 200;
   response.content_type = "application/json";
@@ -319,33 +344,27 @@ dbgx::mcp::HttpResponse HandleSessionsRequest(const dbgx::mcp::HttpRequest& requ
   bool first = true;
 
   if (!dir.empty() && std::filesystem::exists(dir)) {
-    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    std::error_code iter_ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, iter_ec)) {
       if (entry.path().extension() == ".json") {
         std::ifstream f(entry.path());
         if (f.is_open()) {
           std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
           f.close();
 
-          size_t pid_pos = content.find("\"pid\":");
-          while (pid_pos != std::string::npos) {
-            if (pid_pos == 0 || content[pid_pos - 1] != '_') {
-              break;
-            }
-            pid_pos = content.find("\"pid\":", pid_pos + 6);
+          dbgx::json::FieldMap parsed_session;
+          std::string parse_err;
+          if (!dbgx::json::ParseObjectFields(content, &parsed_session, &parse_err)) {
+            continue;
           }
 
-          if (pid_pos != std::string::npos) {
-            size_t val_start = pid_pos + 6;
-            size_t val_end = content.find_first_not_of("0123456789", val_start);
-            if (val_end != std::string::npos && val_end > val_start) {
-              std::string pid_str = content.substr(val_start, val_end - val_start);
-              DWORD host_pid = static_cast<DWORD>(std::stoul(pid_str));
-
-              if (!IsProcessAlive(host_pid)) {
-                std::error_code ec;
-                std::filesystem::remove(entry.path(), ec);
-                continue;
-              }
+          int host_pid_int = 0;
+          if (dbgx::json::TryGetIntField(parsed_session, "pid", &host_pid_int) && host_pid_int > 0) {
+            DWORD host_pid = static_cast<DWORD>(host_pid_int);
+            if (!IsProcessAlive(host_pid)) {
+              std::error_code ec;
+              std::filesystem::remove(entry.path(), ec);
+              continue;
             }
           }
 
@@ -362,7 +381,19 @@ dbgx::mcp::HttpResponse HandleSessionsRequest(const dbgx::mcp::HttpRequest& requ
   return response;
 }
 
+bool IsSupportedProtocolHeader(std::string_view version) {
+  return version == "2024-11-05" || version == "2025-03-26" || version == "2025-06-18" || version == "2025-11-25";
+}
+
 dbgx::mcp::HttpResponse HandleHttpRequest(const dbgx::mcp::HttpRequest& request) {
+  const auto origin_it = request.headers.find("origin");
+  if (origin_it != request.headers.end() && !dbgx::mcp::IsOriginAllowed(origin_it->second)) {
+    dbgx::mcp::HttpResponse response;
+    response.status_code = 403;
+    response.body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Forbidden origin\"}}";
+    return response;
+  }
+
   // Bearer-token gate (applies to /mcp and /sessions alike when a token is configured).
   {
     std::string expected_token;
@@ -396,17 +427,10 @@ dbgx::mcp::HttpResponse HandleHttpRequest(const dbgx::mcp::HttpRequest& request)
 
   LogRequestEcho(request, trace_state);
 
-  const auto origin_it = request.headers.find("origin");
-  if (origin_it != request.headers.end() && !dbgx::mcp::IsOriginAllowed(origin_it->second)) {
-    response.status_code = 403;
-    response.body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"Forbidden origin\"}}";
-    return FinishMcpRequest(std::move(response), trace_state);
-  }
-
   const auto protocol_header_it = request.headers.find("mcp-protocol-version");
-  if (protocol_header_it != request.headers.end()) {
+  if (protocol_header_it != request.headers.end() && !protocol_header_it->second.empty()) {
     const std::string& protocol = protocol_header_it->second;
-    if (protocol != "2025-11-25" && protocol != "2025-03-26") {
+    if (!IsSupportedProtocolHeader(protocol)) {
       response.status_code = 400;
       response.body =
           "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Unsupported MCP protocol "
@@ -474,29 +498,52 @@ std::string HandlePipeJsonRpcRequest(const std::string& request_line) {
 
 void Cleanup() {
   ExtensionState& state = State();
-  std::lock_guard<std::mutex> lock(state.mutex);
-
-  if (state.pipe_server != nullptr) {
-    state.pipe_server->Stop();
-    state.pipe_server.reset();
+  {
+    std::lock_guard<std::mutex> cv_lock(state.register_cv_mutex);
+    state.stop_register = true;
+  }
+  state.register_cv.notify_all();
+  if (state.register_thread.joinable()) {
+    state.register_thread.join();
   }
 
-  if (state.http_server != nullptr) {
-    state.http_server->Stop();
-    state.http_server.reset();
+  std::unique_ptr<dbgx::mcp::PipeServer> pipe_server;
+  std::unique_ptr<dbgx::mcp::HttpServer> http_server;
+  std::unique_ptr<dbgx::mcp::JsonRpcRouter> router;
+  std::unique_ptr<dbgx::windbg::DbgEngCommandExecutor> executor;
+
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    pipe_server = std::move(state.pipe_server);
+    http_server = std::move(state.http_server);
+    state.active_transports.clear();
+    state.auth_token.clear();
   }
 
-  state.router.reset();
-  state.executor.reset();
-  state.active_transports.clear();
-  state.auth_token.clear();
+  // Stop servers outside state.mutex so in-flight request handlers acquiring state.mutex cannot deadlock
+  if (pipe_server != nullptr) {
+    pipe_server->Stop();
+    pipe_server.reset();
+  }
+
+  if (http_server != nullptr) {
+    http_server->Stop();
+    http_server.reset();
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    router = std::move(state.router);
+    executor = std::move(state.executor);
+  }
+
+  router.reset();
+  executor.reset();
 }
 
 }  // namespace
 
 extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flags) {
-  g_MainThreadId = GetCurrentThreadId();
-
   if (version != nullptr) {
     *version = DEBUG_EXTENSION_VERSION(1, 0);
   }
@@ -505,54 +552,62 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
   }
 
   ExtensionState& state = State();
-  std::lock_guard<std::mutex> lock(state.mutex);
+  std::unique_lock<std::mutex> lock(state.mutex);
 
   if ((state.http_server != nullptr && state.http_server->IsRunning()) ||
       (state.pipe_server != nullptr && state.pipe_server->IsRunning())) {
     return S_OK;
   }
 
+  g_MainThreadId = GetCurrentThreadId();
+
   state.executor = std::make_unique<dbgx::windbg::DbgEngCommandExecutor>();
   state.router = std::make_unique<dbgx::mcp::JsonRpcRouter>(state.executor.get());
 
   // Determine requested transport: "http", "pipe", or "both" (default: "both")
-  char transport_buf[64] = {0};
-  std::string transport_mode = "both";
-  if (GetEnvironmentVariableA("WINDBG_MCP_TRANSPORT", transport_buf, sizeof(transport_buf)) > 0) {
-    transport_mode = transport_buf;
+  std::string transport_mode = ReadEnvString("WINDBG_MCP_TRANSPORT");
+  if (transport_mode.empty()) {
+    transport_mode = "both";
+  } else {
     std::transform(transport_mode.begin(), transport_mode.end(), transport_mode.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   }
 
   bool enable_http = (transport_mode == "http" || transport_mode == "both" || transport_mode == "all");
   bool enable_pipe = (transport_mode == "pipe" || transport_mode == "both" || transport_mode == "all");
+  if (!enable_http && !enable_pipe) {
+    LogMessage("Invalid WINDBG_MCP_TRANSPORT='" + transport_mode + "'; expected 'http', 'pipe', or 'both'.");
+    state.router.reset();
+    state.executor.reset();
+    return E_FAIL;
+  }
 
   std::uint16_t initial_port = kDefaultPort;
-  char port_buf[32] = {0};
-  if (GetEnvironmentVariableA("WINDBG_MCP_PORT", port_buf, sizeof(port_buf)) > 0) {
+  const std::string port_str = ReadEnvString("WINDBG_MCP_PORT");
+  if (!port_str.empty()) {
     try {
-      initial_port = static_cast<std::uint16_t>(std::stoul(port_buf));
+      std::size_t idx = 0;
+      unsigned long parsed = std::stoul(port_str, &idx, 10);
+      if (idx == port_str.size() && parsed >= 1 && parsed <= 65535) {
+        initial_port = static_cast<std::uint16_t>(parsed);
+      } else {
+        LogMessage("Invalid WINDBG_MCP_PORT='" + port_str + "'; falling back to " + std::to_string(kDefaultPort));
+      }
     } catch (...) {
+      LogMessage("Invalid WINDBG_MCP_PORT='" + port_str + "'; falling back to " + std::to_string(kDefaultPort));
     }
   }
 
-  char bind_addr_buf[256];
-  std::string bind_host = "127.0.0.1";
-  if (GetEnvironmentVariableA("WINDBG_MCP_BIND", bind_addr_buf, sizeof(bind_addr_buf)) > 0) {
-    bind_host = bind_addr_buf;
+  std::string bind_host = ReadEnvString("WINDBG_MCP_BIND");
+  if (bind_host.empty()) {
+    bind_host = "127.0.0.1";
   }
 
   // HTTP authentication is opt-in: set WINDBG_MCP_TOKEN=<secret> (on both WinDbg and the
   // bridge) to require `Authorization: Bearer <secret>` on /mcp and /sessions. Without it the
   // Origin check and the named-pipe ACL are the only access controls, which is adequate for
   // loopback and host-only VM networks.
-  state.auth_token.clear();
-  {
-    char token_buf[256] = {0};
-    if (GetEnvironmentVariableA("WINDBG_MCP_TOKEN", token_buf, sizeof(token_buf)) > 0) {
-      state.auth_token = token_buf;
-    }
-  }
+  state.auth_token = ReadEnvString("WINDBG_MCP_TOKEN");
 
   state.active_transports.clear();
   state.bound_port = 0;
@@ -588,11 +643,8 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
   // 2. Start Named Pipe Server if enabled
   if (enable_pipe) {
     state.pipe_server = std::make_unique<dbgx::mcp::PipeServer>();
-    std::string pipe_name;
-    char pipe_buf[256] = {0};
-    if (GetEnvironmentVariableA("WINDBG_MCP_PIPE_NAME", pipe_buf, sizeof(pipe_buf)) > 0) {
-      pipe_name = pipe_buf;
-    } else {
+    std::string pipe_name = ReadEnvString("WINDBG_MCP_PIPE_NAME");
+    if (pipe_name.empty()) {
       std::uint16_t port_id = (state.bound_port != 0) ? state.bound_port : initial_port;
       pipe_name = "dbgx-mcp-" + std::to_string(port_id);
     }
@@ -606,6 +658,10 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
       LogMessage("Named Pipe server start failed: " + pipe_error);
       if (!enable_http || state.active_transports.empty()) {
         state.pipe_server.reset();
+        if (state.http_server != nullptr) {
+          state.http_server->Stop();
+          state.http_server.reset();
+        }
         state.router.reset();
         state.executor.reset();
         return E_FAIL;
@@ -613,7 +669,49 @@ extern "C" HRESULT CALLBACK DebugExtensionInitialize(PULONG version, PULONG flag
     }
   }
 
-  RegisterSession(state.bound_port, state.bound_pipe_name, state.active_transports, state.auth_token);
+  // Write initial session registry entry immediately without calling into DbgEng (since
+  // DebugExtensionInitialize holds the DbgEng engine lock until it returns).
+  dbgx::windbg::SessionMetadata initial_meta;
+  initial_meta.process_id = GetCurrentProcessId();
+  WriteSessionRegistryFile(state.bound_port, state.bound_pipe_name, state.active_transports, state.auth_token,
+                           initial_meta, &state.registered_file_path);
+
+  const std::uint16_t bound_port = state.bound_port;
+  const std::string bound_pipe_name = state.bound_pipe_name;
+  const std::vector<std::string> active_transports = state.active_transports;
+  const std::string auth_token = state.auth_token;
+
+  if (state.register_thread.joinable()) {
+    state.register_thread.join();
+  }
+  {
+    std::lock_guard<std::mutex> cv_lock(state.register_cv_mutex);
+    state.stop_register = false;
+  }
+  state.register_thread = std::thread([bound_port, bound_pipe_name, active_transports, auth_token]() {
+    ExtensionState& st = State();
+    {
+      std::unique_lock<std::mutex> cv_lock(st.register_cv_mutex);
+      if (st.register_cv.wait_for(cv_lock, std::chrono::milliseconds(500), [&st] { return st.stop_register; })) {
+        return;
+      }
+    }
+    dbgx::windbg::IWinDbgCommandExecutor* exec = nullptr;
+    {
+      std::lock_guard<std::mutex> st_lock(st.mutex);
+      exec = st.executor.get();
+    }
+    if (exec == nullptr) {
+      return;
+    }
+    dbgx::windbg::SessionMetadata enriched_meta = exec->GetSessionMetadata();
+    std::string reg_path;
+    WriteSessionRegistryFile(bound_port, bound_pipe_name, active_transports, auth_token, enriched_meta, &reg_path);
+    if (!reg_path.empty()) {
+      std::lock_guard<std::mutex> st_lock(st.mutex);
+      st.registered_file_path = std::move(reg_path);
+    }
+  });
 
   LogMessage("  * Background request logs are written to %TEMP%\\dbgx-mcp-extension.log to prevent UI deadlocks.");
   LogMessage("  * AI background tool executions will display '[Background Job]' status indicators in this window.");

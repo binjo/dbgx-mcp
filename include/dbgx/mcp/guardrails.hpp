@@ -34,6 +34,22 @@ std::string NormalizeToolName(std::string_view tool_name);
 bool ValidateDebuggerCommandDetail(std::string_view command, std::string* blocked_token,
                                    std::string* error_message);
 
+// Validates a single command argument (e.g., breakpoint expression) to prevent
+// command injection via ';', newlines, or command-file sourcing.
+bool ValidateCommandArgument(std::string_view arg, std::string* error_message);
+
+// Validates breakpoint ID argument ('*' or space-separated digits).
+bool ValidateBreakpointId(std::string_view id, std::string* error_message);
+
+// Validates TTD position format (e.g., "1B:0", "max", "min").
+bool ValidateTTDPosition(std::string_view position, std::string* error_message);
+
+// Validates a Data Model (dx) expression to reject ExecuteCommand or script invocation.
+bool ValidateDxExpression(std::string_view expression, std::string* error_message);
+
+// Escapes a string so it can be safely embedded inside a double-quoted JS/dx literal.
+std::string EscapeJsString(std::string_view input);
+
 // What the agent should do instead of a blocked command token. Empty if unknown.
 std::string GuardrailAlternative(std::string_view blocked_token);
 

@@ -69,9 +69,9 @@ set_target_properties(dbgx-mcp PROPERTIES
 if(MSVC)
   # CMake 3.12 doesn't have target_link_options (added in 3.13)
   set_target_properties(dbgx-mcp PROPERTIES
-    LINK_FLAGS "/DEF:\"${WINDBG_EXTENSION_DEF_FILE}\" /DEBUG /OPT:REF /OPT:ICF"
+    LINK_FLAGS "/DEF:\"${WINDBG_EXTENSION_DEF_FILE}\" /DEBUG /OPT:REF /OPT:ICF /DYNAMICBASE /NXCOMPAT"
   )
-  target_compile_options(dbgx-mcp PRIVATE /Zi)
+  target_compile_options(dbgx-mcp PRIVATE /Zi /utf-8 /W3 /GS)
 endif()
 
 target_include_directories(dbgx-mcp PRIVATE include)
@@ -113,10 +113,19 @@ add_executable(unit_tests
   tests/unit_tests.cpp
 )
 
+if(MSVC)
+  target_compile_options(unit_tests PRIVATE /utf-8 /W3 /GS)
+  set_target_properties(unit_tests PROPERTIES
+    LINK_FLAGS "/DYNAMICBASE /NXCOMPAT"
+  )
+endif()
+
 target_include_directories(unit_tests PRIVATE include)
 target_link_libraries(unit_tests PRIVATE ws2_32 advapi32)
 
 target_compile_definitions(unit_tests PRIVATE
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
   DBGX_VERSION_STRING="${DBGX_VERSION}"
 )
 

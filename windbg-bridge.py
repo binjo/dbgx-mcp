@@ -296,27 +296,51 @@ def get_cache_ttl(command: str) -> float:
     return ttl
 
 
+def _strip_thread_execute_prefix(subcommand: str) -> str:
+    """Strips leading thread/process execute prefixes like '~*e ', '~0e ', '|0e '."""
+    s = subcommand.lstrip()
+    while True:
+        m = re.match(r"^[~|](?:[0-9a-fA-F.*#]+|\[[^\]]*\])[eE]\s*(.*)$", s)
+        if not m:
+            break
+        s = m.group(1).lstrip()
+    return s
+
+
 def split_commands_safe(command: str) -> list[str]:
-    """Splits commands by semicolon while respecting single and double quotes."""
+    """Splits commands by semicolon, braces, and newlines while respecting single and double quotes."""
     parts = []
     current = []
     in_quote = None
-    for c in command:
+    i = 0
+    n = len(command)
+    while i < n:
+        c = command[i]
         if in_quote:
+            if c == "\\" and in_quote == '"' and i + 1 < n:
+                current.append(c)
+                current.append(command[i + 1])
+                i += 2
+                continue
             if c == in_quote:
                 in_quote = None
             current.append(c)
         elif c in ('"', "'"):
             in_quote = c
             current.append(c)
-        elif c == ';':
-            parts.append("".join(current).strip())
+        elif c in (";", "{", "}", "\r", "\n"):
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
             current = []
         else:
             current.append(c)
+        i += 1
     if current:
-        parts.append("".join(current).strip())
-    return [p for p in parts if p]
+        part = "".join(current).strip()
+        if part:
+            parts.append(part)
+    return parts
 
 
 def validate_command_detail(command: str) -> dict | None:
@@ -332,9 +356,10 @@ def validate_command_detail(command: str) -> dict | None:
             "alternative": GUARDRAIL_ALTERNATIVES["$<"],
         }
 
-    # Split by semicolon to check each individual subcommand
+    # Split by semicolon/braces/newlines to check each individual subcommand
     for sub in split_commands_safe(command):
-        base_cmd = _first_token(sub)
+        unwrapped = _strip_thread_execute_prefix(sub)
+        base_cmd = _first_token(unwrapped)
         if base_cmd in DANGEROUS_COMMANDS:
             return {
                 "blocked": base_cmd,
