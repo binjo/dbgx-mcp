@@ -576,6 +576,42 @@ void TestToolsCallGetSessionMetadata(int* failures) {
   Expect(Contains(result.body, "user"), "get_session_metadata should return user debuggee_class", failures);
 }
 
+void ExpectDebuggeeClassification(std::uint32_t debug_class, std::uint32_t qualifier,
+                                  const std::string& expected_class, const std::string& expected_type,
+                                  bool expected_ttd, int* failures) {
+  const auto got = dbgx::windbg::ClassifyDebuggee(debug_class, qualifier);
+  const std::string label =
+      "ClassifyDebuggee(Type=" + std::to_string(debug_class) + ", Qual=" + std::to_string(qualifier) + ")";
+  Expect(got.debuggee_class == expected_class,
+         label + " debuggee_class should be '" + expected_class + "' but was '" + got.debuggee_class + "'", failures);
+  Expect(got.target_type == expected_type,
+         label + " target_type should be '" + expected_type + "' but was '" + got.target_type + "'", failures);
+  Expect(got.is_ttd == expected_ttd, label + " is_ttd mismatch", failures);
+}
+
+void TestClassifyDebuggeeTargetType(int* failures) {
+  // DEBUG_CLASS_USER_WINDOWS (2)
+  ExpectDebuggeeClassification(2, 0, "user", "live_user", false, failures);     // DEBUG_USER_WINDOWS_PROCESS
+  ExpectDebuggeeClassification(2, 1, "user", "live_user", false, failures);     // ..._PROCESS_SERVER
+  ExpectDebuggeeClassification(2, 2, "user", "ttd_trace", true, failures);      // DEBUG_USER_WINDOWS_IDNA
+  ExpectDebuggeeClassification(2, 1023, "user", "live_user", false, failures);  // just below the dump range
+  ExpectDebuggeeClassification(2, 1024, "user", "dump_user", false, failures);  // DEBUG_USER_WINDOWS_SMALL_DUMP
+  ExpectDebuggeeClassification(2, 1025, "user", "dump_user", false, failures);
+  ExpectDebuggeeClassification(2, 1026, "user", "dump_user", false, failures);
+
+  // DEBUG_CLASS_KERNEL (1)
+  ExpectDebuggeeClassification(1, 0, "kernel", "live_kernel", false, failures);  // DEBUG_KERNEL_CONNECTION
+  ExpectDebuggeeClassification(1, 1, "kernel", "live_kernel", false, failures);  // DEBUG_KERNEL_LOCAL
+  ExpectDebuggeeClassification(1, 2, "kernel", "live_kernel", false, failures);  // Qual 2 is TTD only for user mode
+  ExpectDebuggeeClassification(1, 1024, "kernel", "dump_kernel", false, failures);
+  ExpectDebuggeeClassification(1, 1026, "kernel", "dump_kernel", false, failures);
+  ExpectDebuggeeClassification(1, 1030, "kernel", "dump_kernel", false, failures);
+
+  // Anything else (e.g. DEBUG_CLASS_UNINITIALIZED = 0, DEBUG_CLASS_IMAGE_FILE = 3)
+  ExpectDebuggeeClassification(0, 0, "other (0)", "other", false, failures);
+  ExpectDebuggeeClassification(3, 1024, "other (3)", "other", false, failures);
+}
+
 void TestToolsCallWriteMemory(int* failures) {
   FakeExecutor executor;
   dbgx::mcp::JsonRpcRouter router(&executor);
@@ -1123,6 +1159,7 @@ int main() {
   TestIoEchoBlockingLocatabilityStageOrder(&failures);
   TestCatalogSearch(&failures);
   TestToolsCallGetSessionMetadata(&failures);
+  TestClassifyDebuggeeTargetType(&failures);
   TestToolsCallWriteMemory(&failures);
   TestToolsCallCarvePE(&failures);
   TestToolsCallGetThreads(&failures);

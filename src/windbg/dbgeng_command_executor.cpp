@@ -1696,21 +1696,11 @@ SessionMetadata DbgEngCommandExecutor::GetSessionMetadata() {
               ULONG qual = 0;
               if (SUCCEEDED(control->GetDebuggeeType(&type, &qual))) {
                 metadata.target_info = "Type=" + std::to_string(type) + ", Qual=" + std::to_string(qual);
-                if (type == DEBUG_CLASS_USER_WINDOWS) {
-                  metadata.debuggee_class = "user";
-                  if (qual == 2) {
-                    metadata.is_ttd = true;
-                    metadata.target_type = "ttd_trace";
-                  } else {
-                    metadata.target_type = "live_user";
-                  }
-                } else if (type == DEBUG_CLASS_KERNEL) {
-                  metadata.debuggee_class = "kernel";
-                  metadata.target_type = "live_kernel";
-                } else {
-                  metadata.debuggee_class = "other (" + std::to_string(type) + ")";
-                  metadata.target_type = "other";
-                }
+                // Dumps (Qual >= 1024, e.g. DEBUG_USER_WINDOWS_SMALL_DUMP) must not be reported as live targets.
+                const DebuggeeClassification classification = ClassifyDebuggee(type, qual);
+                metadata.debuggee_class = classification.debuggee_class;
+                metadata.target_type = classification.target_type;
+                metadata.is_ttd = classification.is_ttd;
               }
 
               ULONG proc_type = 0;

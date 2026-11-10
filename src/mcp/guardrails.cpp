@@ -92,27 +92,43 @@ std::string_view FirstToken(std::string_view text) {
   return text.substr(0, end);
 }
 
-// Strips thread/process prefix (e.g., "~*e q", "~0s", "|1s") and returns the inner command if 'e' is used.
+// Strips thread/process prefix (e.g., "~*e q", "~0e .shell", "|0e .detach", "|0e ~*e q")
+// and returns the inner command when the 'e' execute qualifier is used.
 std::string_view StripThreadExecutePrefix(std::string_view sub) {
-  sub = Trim(sub);
-  if (sub.empty() || (sub.front() != '~' && sub.front() != '|')) {
+  while (true) {
+    sub = Trim(sub);
+    if (sub.empty() || (sub.front() != '~' && sub.front() != '|')) {
+      return sub;
+    }
+    std::size_t i = 1;
+    while (i < sub.size() && std::isspace(static_cast<unsigned char>(sub[i]))) {
+      ++i;
+    }
+    if (i < sub.size() && sub[i] == '[') {
+      const std::size_t close = sub.find(']', i + 1);
+      if (close == std::string_view::npos) {
+        return sub;
+      }
+      i = close + 1;
+    } else {
+      while (i < sub.size() && (std::isdigit(static_cast<unsigned char>(sub[i])) || sub[i] == '*' ||
+                                sub[i] == '.' || sub[i] == '#')) {
+        ++i;
+      }
+    }
+    while (i < sub.size() && std::isspace(static_cast<unsigned char>(sub[i]))) {
+      ++i;
+    }
+    if (i < sub.size() && (sub[i] == 'e' || sub[i] == 'E')) {
+      const std::size_t after_e = i + 1;
+      if (after_e == sub.size() || std::isspace(static_cast<unsigned char>(sub[after_e])) ||
+          sub[after_e] == '.' || sub[after_e] == '!') {
+        sub = Trim(sub.substr(after_e));
+        continue;
+      }
+    }
     return sub;
   }
-  std::size_t i = 1;
-  while (i < sub.size() && (std::isalnum(static_cast<unsigned char>(sub[i])) || sub[i] == '*' || sub[i] == '.' ||
-                           sub[i] == '#' || sub[i] == '[' || sub[i] == ']')) {
-    ++i;
-  }
-  while (i < sub.size() && std::isspace(static_cast<unsigned char>(sub[i]))) {
-    ++i;
-  }
-  if (i < sub.size() && (sub[i] == 'e' || sub[i] == 'E')) {
-    std::size_t after_e = i + 1;
-    if (after_e == sub.size() || std::isspace(static_cast<unsigned char>(sub[after_e]))) {
-      return Trim(sub.substr(after_e));
-    }
-  }
-  return sub;
 }
 
 }  // namespace

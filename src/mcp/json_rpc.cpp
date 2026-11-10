@@ -1068,8 +1068,10 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     }
     std::string arg_error;
     if (!ValidateCommandArgument(expr, &arg_error)) {
-      outcome.error_code = -32602;
-      outcome.error_message = arg_error;
+      outcome.ok = true;
+      outcome.result_json = BuildRefusalResult(
+          "command_blocked", arg_error,
+          "Pass a single symbol or hex address expression to windbg.set_breakpoint without ';' or script operators.");
       return outcome;
     }
     execution = executor->SetBreakpoint(expr);
@@ -1078,8 +1080,9 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     json::TryGetStringField(arguments_fields, "id", &id);
     std::string id_error;
     if (!ValidateBreakpointId(id, &id_error)) {
-      outcome.error_code = -32602;
-      outcome.error_message = id_error;
+      outcome.ok = true;
+      outcome.result_json =
+          BuildRefusalResult("command_blocked", id_error, "Pass '*' or numeric breakpoint ID(s) to windbg.clear_breakpoint.");
       return outcome;
     }
     execution = executor->ClearBreakpoint(id);
@@ -1101,8 +1104,10 @@ MethodOutcome HandleToolsCall(const json::FieldMap& root_fields, windbg::IWinDbg
     json::TryGetStringField(arguments_fields, "position", &position);
     std::string pos_error;
     if (!ValidateTTDPosition(position, &pos_error)) {
-      outcome.error_code = -32602;
-      outcome.error_message = pos_error;
+      outcome.ok = true;
+      outcome.result_json = BuildRefusalResult(
+          "command_blocked", pos_error,
+          "Pass a TTD position such as '1B:0', '50%', 'min', or 'max' without ';' or extra commands.");
       return outcome;
     }
     execution = executor->GetOrSetTTDPosition(position);
